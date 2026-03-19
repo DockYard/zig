@@ -519,26 +519,20 @@ pub const FuncBody = struct {
     /// instruction for the arg body (Sema requires arg body instructions to
     /// be distinct from the function body).
     pub fn addCallRef(self: *FuncBody, callee: Zir.Inst.Ref, args: []const Zir.Inst.Ref) !Zir.Inst.Ref {
-        // Clone each arg as a non-body instruction for the arg body.
+        // Pre-compute call instruction index (it goes after N break_inline instructions).
+        const call_inst_idx: u32 = @intCast(self.builder.tags.items.len + args.len);
+
+        // Each arg body is a single break_inline carrying the value.
         var arg_inst_indices = std.ArrayListUnmanaged(u32).empty;
         defer arg_inst_indices.deinit(self.builder.gpa);
 
-        const ref_base = @intFromEnum(Zir.Inst.Index.ref_start_index);
         for (args) |arg| {
-            const ref_int = @intFromEnum(arg);
-            if (ref_int >= ref_base) {
-                // Clone the original instruction
-                const orig_idx = ref_int - ref_base;
-                const tag: Zir.Inst.Tag = @enumFromInt(self.builder.tags.items[orig_idx]);
-                const data = self.builder.data.items[orig_idx];
-                const clone_idx = try self.builder.addInst(tag, data);
-                try arg_inst_indices.append(self.builder.gpa, clone_idx);
-            } else {
-                // Named ref — emit a no-op that Sema can evaluate
-                // Use break_inline with the ref as operand
-                const clone_idx = try self.builder.addInst(.break_inline, Builder.encodeBreak(arg, 0));
-                try arg_inst_indices.append(self.builder.gpa, clone_idx);
-            }
+            const brk_payload = try self.builder.addExtraSlice(&.{
+                @bitCast(@as(i32, std.math.maxInt(i32))), // operand_src_node = none
+                call_inst_idx, // block_inst = call instruction
+            });
+            const brk_idx = try self.builder.addInst(.break_inline, Builder.encodeBreak(arg, brk_payload));
+            try arg_inst_indices.append(self.builder.gpa, brk_idx);
         }
 
         // Call payload
@@ -548,8 +542,9 @@ pub const FuncBody = struct {
         try self.builder.extra.append(self.builder.gpa, flags);
         try self.builder.extra.append(self.builder.gpa, @intFromEnum(callee));
 
+        // arg_end: each arg body is 1 instruction (break_inline)
         for (0..args.len) |i| {
-            try self.builder.extra.append(self.builder.gpa, @as(u32, @intCast(i + 1)));
+            try self.builder.extra.append(self.builder.gpa, @as(u32, @intCast(args_len + i + 1)));
         }
 
         for (arg_inst_indices.items) |idx| {
@@ -565,23 +560,20 @@ pub const FuncBody = struct {
         const name_start = try self.builder.internString(callee_name);
         const callee_ref = try self.emitBodyInst(.decl_val, Builder.encodeStrTok(name_start, .zero));
 
-        // Clone each arg as a non-body instruction for the arg body
+        // Pre-compute call instruction index (after decl_val + N break_inline instructions)
+        const call_inst_idx: u32 = @intCast(self.builder.tags.items.len + @as(u32, @intCast(args.len)));
+
+        // Each arg body = single break_inline carrying the value
         var arg_inst_indices = std.ArrayListUnmanaged(u32).empty;
         defer arg_inst_indices.deinit(self.builder.gpa);
 
-        const ref_base = @intFromEnum(Zir.Inst.Index.ref_start_index);
         for (args) |arg| {
-            const ref_int = @intFromEnum(arg);
-            if (ref_int >= ref_base) {
-                const orig_idx = ref_int - ref_base;
-                const tag: Zir.Inst.Tag = @enumFromInt(self.builder.tags.items[orig_idx]);
-                const data = self.builder.data.items[orig_idx];
-                const clone_idx = try self.builder.addInst(tag, data);
-                try arg_inst_indices.append(self.builder.gpa, clone_idx);
-            } else {
-                const clone_idx = try self.builder.addInst(.break_inline, Builder.encodeBreak(arg, 0));
-                try arg_inst_indices.append(self.builder.gpa, clone_idx);
-            }
+            const brk_payload = try self.builder.addExtraSlice(&.{
+                @bitCast(@as(i32, std.math.maxInt(i32))),
+                call_inst_idx,
+            });
+            const brk_idx = try self.builder.addInst(.break_inline, Builder.encodeBreak(arg, brk_payload));
+            try arg_inst_indices.append(self.builder.gpa, brk_idx);
         }
 
         const payload_idx: u32 = @intCast(self.builder.extra.items.len);
@@ -590,8 +582,9 @@ pub const FuncBody = struct {
         try self.builder.extra.append(self.builder.gpa, flags);
         try self.builder.extra.append(self.builder.gpa, @intFromEnum(callee_ref));
 
+        // arg_end: each arg body is 1 instruction (break_inline)
         for (0..args.len) |i| {
-            try self.builder.extra.append(self.builder.gpa, @as(u32, @intCast(i + 1)));
+            try self.builder.extra.append(self.builder.gpa, @as(u32, @intCast(args_len + i + 1)));
         }
 
         for (arg_inst_indices.items) |idx| {
@@ -989,7 +982,7 @@ test "Builder: addCall" {
 
     const result = try builder.finalize();
 
-    // extended, declaration, restore_err_ret, int(42), decl_val("some_func"), int(42 clone), call, ret_implicit, func, break_inline
+    // extended, declaration, restore_err_ret, int(42), decl_val("some_func"), break_inline(arg), call, ret_implicit, func, break_inline
     try std.testing.expectEqual(@as(u32, 10), result.instructions_len);
     try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.decl_val), result.instructions_tags[4]);
     try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.call), result.instructions_tags[6]);
@@ -1176,7 +1169,7 @@ test "Builder: addCallRef" {
 
     const result = try builder.finalize();
 
-    // extended, declaration, restore_err_ret, import, field_val, int(42), int(42 clone), call, ret_implicit, func, break_inline
+    // extended, declaration, restore_err_ret, import, field_val, int(42), break_inline(arg), call, ret_implicit, func, break_inline
     try std.testing.expectEqual(@as(u32, 11), result.instructions_len);
 
     try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.import), result.instructions_tags[3]);
