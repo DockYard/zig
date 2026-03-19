@@ -335,6 +335,13 @@ pub const Builder = struct {
         } };
     }
 
+    fn encodePlTok(src_tok: Ast.TokenOffset, payload_index: u32) Zir.Inst.Data {
+        return .{ .pl_tok = .{
+            .src_tok = src_tok,
+            .payload_index = payload_index,
+        } };
+    }
+
     fn encodeExtended(opcode: u16, small: u16, operand: u32) Zir.Inst.Data {
         return .{ .extended = .{
             .opcode = @enumFromInt(opcode),
@@ -457,6 +464,78 @@ pub const FuncBody = struct {
     /// Add boolean NOT. Returns a Ref to the result.
     pub fn addBoolNot(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
         return self.emitBodyInst(.bool_not, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit `@import("module_name")`. Returns a Ref to the imported module.
+    /// Uses the `.import` instruction with `.pl_tok` data and `Import` payload.
+    pub fn addImport(self: *FuncBody, module_name: []const u8) !Zir.Inst.Ref {
+        const path_idx = try self.builder.internString(module_name);
+        // Import payload in extra: { res_ty: Ref, path: NullTerminatedString }
+        const payload_idx: u32 = @intCast(self.builder.extra.items.len);
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(Zir.Inst.Ref.none)); // res_ty = .none
+        try self.builder.extra.append(self.builder.gpa, path_idx); // path
+        return self.emitBodyInst(.import, Builder.encodePlTok(.zero, payload_idx));
+    }
+
+    /// Emit field access on an object (a.b syntax). Returns a Ref to the field value.
+    /// Uses the `.field_val` instruction with `.pl_node` data and `Field` payload.
+    pub fn addFieldVal(self: *FuncBody, object: Zir.Inst.Ref, field_name: []const u8) !Zir.Inst.Ref {
+        const name_idx = try self.builder.internString(field_name);
+        // Field payload in extra: { lhs: Ref, field_name_start: NullTerminatedString }
+        const payload_idx: u32 = @intCast(self.builder.extra.items.len);
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(object));
+        try self.builder.extra.append(self.builder.gpa, name_idx);
+        return self.emitBodyInst(.field_val, Builder.encodePlNode(.zero, payload_idx));
+    }
+
+    /// Emit an anonymous struct initialization (for building aggregates/tuples).
+    /// `field_names` and `field_values` must have the same length.
+    /// Uses the `.struct_init_anon` instruction with `.pl_node` data and `StructInitAnon` payload.
+    pub fn addStructInitAnon(self: *FuncBody, field_names: []const []const u8, field_values: []const Zir.Inst.Ref) !Zir.Inst.Ref {
+        std.debug.assert(field_names.len == field_values.len);
+        const fields_len: u32 = @intCast(field_names.len);
+
+        // StructInitAnon payload in extra: { abs_node: Ast.Node.Index, abs_line: u32, fields_len: u32 }
+        // Trailing: for each field: { field_name: NullTerminatedString, init: Ref }
+        const payload_idx: u32 = @intCast(self.builder.extra.items.len);
+        try self.builder.extra.append(self.builder.gpa, 0); // abs_node = 0
+        try self.builder.extra.append(self.builder.gpa, 0); // abs_line = 0
+        try self.builder.extra.append(self.builder.gpa, fields_len);
+
+        // Trailing items: { field_name: NullTerminatedString, init: Ref } per field
+        for (0..field_names.len) |i| {
+            const name_idx = try self.builder.internString(field_names[i]);
+            try self.builder.extra.append(self.builder.gpa, name_idx);
+            try self.builder.extra.append(self.builder.gpa, @intFromEnum(field_values[i]));
+        }
+
+        return self.emitBodyInst(.struct_init_anon, Builder.encodePlNode(.zero, payload_idx));
+    }
+
+    /// Emit a call using a Ref as the callee (e.g. from import + field access).
+    /// Returns a Ref to the result.
+    pub fn addCallRef(self: *FuncBody, callee: Zir.Inst.Ref, args: []const Zir.Inst.Ref) !Zir.Inst.Ref {
+        // Call payload in extra: { flags: Flags(u32), callee: Ref }
+        // Then trailing: arg_end for each arg
+        const payload_idx: u32 = @intCast(self.builder.extra.items.len);
+
+        // flags: packed_modifier=auto(0), ensure_result_used=false, pop_error_return_trace=false, args_len
+        const args_len: u32 = @intCast(args.len);
+        const flags: u32 = args_len << 5; // args_len is top 27 bits
+        try self.builder.extra.append(self.builder.gpa, flags);
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(callee));
+
+        // Trailing arg_end values
+        for (0..args.len) |i| {
+            try self.builder.extra.append(self.builder.gpa, @as(u32, @intCast(args_len + i + 1)));
+        }
+
+        // Then the actual arg refs
+        for (args) |arg| {
+            try self.builder.extra.append(self.builder.gpa, @intFromEnum(arg));
+        }
+
+        return self.emitBodyInst(.call, Builder.encodePlNode(.zero, payload_idx));
     }
 
     /// Add a function call by name. Returns a Ref to the result.
@@ -895,4 +974,123 @@ test "Builder: function with u8 return type" {
     try std.testing.expectEqual(@as(u32, 1), result.extra[2]);
     // Verify trailing return type Ref is u8_type
     try std.testing.expectEqual(@intFromEnum(Zir.Inst.Ref.u8_type), result.extra[5]);
+}
+
+test "Builder: addImport" {
+    var builder = try Builder.init(std.testing.allocator);
+    defer builder.deinit();
+
+    const body = try builder.beginFunction("test_import", .void);
+    const std_mod = try body.addImport("std");
+    _ = std_mod;
+    try builder.endFunction(body);
+
+    const result = try builder.finalize();
+
+    // extended, declaration, restore_err_ret, import, ret_implicit, func, break_inline
+    try std.testing.expectEqual(@as(u32, 7), result.instructions_len);
+
+    // Verify the import instruction is at index 3
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.import), result.instructions_tags[3]);
+
+    // Verify import payload in extra
+    // extra[2] = Import.res_ty = Ref.none (0xFFFFFFFF)
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Ref.none), result.extra[2]);
+    // extra[3] = Import.path = string index of "std"
+    const path_idx = result.extra[3];
+    try std.testing.expectEqualStrings("std", result.string_bytes[path_idx .. path_idx + 3]);
+}
+
+test "Builder: addFieldVal" {
+    var builder = try Builder.init(std.testing.allocator);
+    defer builder.deinit();
+
+    const body = try builder.beginFunction("test_field", .void);
+    const obj = try body.addInt(42);
+    const field = try body.addFieldVal(obj, "some_field");
+    _ = field;
+    try builder.endFunction(body);
+
+    const result = try builder.finalize();
+
+    // extended, declaration, restore_err_ret, int(42), field_val, ret_implicit, func, break_inline
+    try std.testing.expectEqual(@as(u32, 8), result.instructions_len);
+
+    // Verify the field_val instruction is at index 4
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.field_val), result.instructions_tags[4]);
+
+    // Verify Field payload in extra
+    // The payload starts at extra[2]:
+    // extra[2] = Field.lhs = Ref of int(42) instruction
+    try std.testing.expectEqual(@intFromEnum(obj), result.extra[2]);
+    // extra[3] = Field.field_name_start = string index of "some_field"
+    const name_idx = result.extra[3];
+    try std.testing.expectEqualStrings("some_field", result.string_bytes[name_idx .. name_idx + 10]);
+}
+
+test "Builder: addStructInitAnon" {
+    var builder = try Builder.init(std.testing.allocator);
+    defer builder.deinit();
+
+    const body = try builder.beginFunction("test_struct", .void);
+    const val_a = try body.addInt(1);
+    const val_b = try body.addInt(2);
+    const init = try body.addStructInitAnon(
+        &.{ "x", "y" },
+        &.{ val_a, val_b },
+    );
+    _ = init;
+    try builder.endFunction(body);
+
+    const result = try builder.finalize();
+
+    // extended, declaration, restore_err_ret, int(1), int(2), struct_init_anon, ret_implicit, func, break_inline
+    try std.testing.expectEqual(@as(u32, 9), result.instructions_len);
+
+    // Verify the struct_init_anon instruction is at index 5
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.struct_init_anon), result.instructions_tags[5]);
+
+    // Verify StructInitAnon payload in extra
+    // extra[2] = abs_node = 0
+    try std.testing.expectEqual(@as(u32, 0), result.extra[2]);
+    // extra[3] = abs_line = 0
+    try std.testing.expectEqual(@as(u32, 0), result.extra[3]);
+    // extra[4] = fields_len = 2
+    try std.testing.expectEqual(@as(u32, 2), result.extra[4]);
+
+    // Trailing items:
+    // extra[5] = field_name "x" string index
+    const name_x_idx = result.extra[5];
+    try std.testing.expectEqualStrings("x", result.string_bytes[name_x_idx .. name_x_idx + 1]);
+    // extra[6] = init Ref for val_a
+    try std.testing.expectEqual(@intFromEnum(val_a), result.extra[6]);
+    // extra[7] = field_name "y" string index
+    const name_y_idx = result.extra[7];
+    try std.testing.expectEqualStrings("y", result.string_bytes[name_y_idx .. name_y_idx + 1]);
+    // extra[8] = init Ref for val_b
+    try std.testing.expectEqual(@intFromEnum(val_b), result.extra[8]);
+}
+
+test "Builder: addCallRef" {
+    var builder = try Builder.init(std.testing.allocator);
+    defer builder.deinit();
+
+    const body = try builder.beginFunction("test_call_ref", .void);
+    const mod = try body.addImport("std");
+    const func_ref = try body.addFieldVal(mod, "debug");
+    const arg = try body.addInt(42);
+    const call_result = try body.addCallRef(func_ref, &.{arg});
+    _ = call_result;
+    try builder.endFunction(body);
+
+    const result = try builder.finalize();
+
+    // extended, declaration, restore_err_ret, import, field_val, int(42), call, ret_implicit, func, break_inline
+    try std.testing.expectEqual(@as(u32, 10), result.instructions_len);
+
+    // Verify instruction tags
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.import), result.instructions_tags[3]);
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.field_val), result.instructions_tags[4]);
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.int), result.instructions_tags[5]);
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.call), result.instructions_tags[6]);
 }

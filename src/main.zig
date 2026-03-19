@@ -60,7 +60,14 @@ comptime {
     _ = &zir_api.zir_builder_emit_call;
     _ = &zir_api.zir_builder_emit_ret;
     _ = &zir_api.zir_builder_emit_ret_void;
+    _ = &zir_api.zir_builder_emit_import;
+    _ = &zir_api.zir_builder_emit_field_val;
+    _ = &zir_api.zir_builder_emit_struct_init_anon;
+    _ = &zir_api.zir_builder_emit_call_ref;
     _ = &zir_api.zir_builder_inject;
+
+    // Module management
+    _ = &zir_api.zir_compilation_add_module;
 }
 
 test {

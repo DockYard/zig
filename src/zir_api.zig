@@ -127,6 +127,19 @@ pub export fn zir_compilation_print_errors(ctx: *ZirContext) void {
     }, stderr) catch {};
 }
 
+/// Add a named module dependency so the root module can @import it.
+/// `name` is the import name (e.g., "zap_runtime").
+/// `source_path` is the full path to the .zig source file.
+/// Returns 0 on success, -1 on error.
+pub export fn zir_compilation_add_module(
+    ctx: *ZirContext,
+    name: [*:0]const u8,
+    source_path: [*:0]const u8,
+) callconv(.c) i32 {
+    addModuleImpl(ctx, mem.sliceTo(name, 0), mem.sliceTo(source_path, 0)) catch return -1;
+    return 0;
+}
+
 /// Destroy the compilation context and free all resources.
 pub export fn zir_compilation_destroy(ctx: *ZirContext) void {
     const gpa = ctx.gpa;
@@ -142,6 +155,35 @@ pub export fn zir_compilation_destroy(ctx: *ZirContext) void {
 // ---------------------------------------------------------------------------
 // Internal: compilation creation
 // ---------------------------------------------------------------------------
+
+fn addModuleImpl(ctx: *ZirContext, name: []const u8, source_path: []const u8) !void {
+    const ar = ctx.arena();
+
+    // Separate directory and filename from the source path.
+    const dir_path = std.fs.path.dirname(source_path) orelse ".";
+    const file_name = std.fs.path.basename(source_path);
+
+    // Resolve the module root directory.
+    const mod_root = Compilation.Path.fromUnresolved(ar, ctx.dirs, &.{dir_path}) catch
+        return error.OutOfMemory;
+
+    // Create the module as a child of the root module (inherits config).
+    const mod = Package.Module.create(ar, .{
+        .paths = .{
+            .root = mod_root,
+            .root_src_path = try ar.dupe(u8, file_name),
+        },
+        .fully_qualified_name = try ar.dupe(u8, name),
+        .cc_argv = &.{},
+        .inherited = .{},
+        .global = ctx.compilation.config,
+        .parent = ctx.root_mod,
+    }) catch return error.OutOfMemory;
+
+    // Register as a dependency of the root module.
+    const name_duped = try ar.dupe(u8, name);
+    try ctx.root_mod.deps.put(ar, name_duped, mod);
+}
 
 fn logErr(comptime fmt: []const u8, args: anytype) void {
     const stderr = std.debug.lockStderrWriter(&.{});
@@ -587,6 +629,90 @@ pub export fn zir_builder_emit_ret_void(handle: ?*ZirBuilderHandle) callconv(.c)
     const body = b.active_body orelse return -1;
     body.addRetImplicit() catch return -1;
     return 0;
+}
+
+/// Emit `@import("module_name")`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_import(
+    handle: ?*ZirBuilderHandle,
+    name_ptr: [*]const u8,
+    name_len: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const ref = body.addImport(name_ptr[0..name_len]) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit field access (a.b syntax). Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_field_val(
+    handle: ?*ZirBuilderHandle,
+    object: u32,
+    field_ptr: [*]const u8,
+    field_len: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const object_ref: Zir.Inst.Ref = @enumFromInt(object);
+    const ref = body.addFieldVal(object_ref, field_ptr[0..field_len]) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit an anonymous struct initialization.
+/// `names_ptr` is a packed array of (ptr, len) pairs for field names.
+/// `values_ptr` is an array of u32 Ref values.
+/// `fields_len` is the number of fields.
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_struct_init_anon(
+    handle: ?*ZirBuilderHandle,
+    names_ptrs: [*]const [*]const u8,
+    names_lens: [*]const u32,
+    values_ptr: [*]const u32,
+    fields_len: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const gpa = b.gpa;
+
+    // Convert C arrays to Zig slices
+    const names = gpa.alloc([]const u8, fields_len) catch return 0xFFFFFFFF;
+    defer gpa.free(names);
+    for (0..fields_len) |i| {
+        names[i] = names_ptrs[i][0..names_lens[i]];
+    }
+
+    const refs = gpa.alloc(Zir.Inst.Ref, fields_len) catch return 0xFFFFFFFF;
+    defer gpa.free(refs);
+    for (0..fields_len) |i| {
+        refs[i] = @enumFromInt(values_ptr[i]);
+    }
+
+    const ref = body.addStructInitAnon(names, refs) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit a function call using a Ref as the callee (e.g. from @import + field access).
+/// `args_ptr` points to an array of `u32` Ref values, `args_len` is the count.
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_call_ref(
+    handle: ?*ZirBuilderHandle,
+    callee: u32,
+    args_ptr: [*]const u32,
+    args_len: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const gpa = b.gpa;
+
+    const callee_ref: Zir.Inst.Ref = @enumFromInt(callee);
+
+    const refs = gpa.alloc(Zir.Inst.Ref, args_len) catch return 0xFFFFFFFF;
+    defer gpa.free(refs);
+    for (0..args_len) |i| {
+        refs[i] = @enumFromInt(args_ptr[i]);
+    }
+
+    const ref = body.addCallRef(callee_ref, refs) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
 }
 
 /// Finalize the builder and inject its ZIR into a compilation context.
