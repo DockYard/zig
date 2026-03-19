@@ -437,6 +437,11 @@ fn addZirImpl(ctx: *ZirContext, name: []const u8, data: *const ZirData) !void {
 
     // Mark as ZIR-injected so the pipeline skips AstGen for this file.
     file.zir_injected = true;
+
+    // Ensure the file has its module set (needed by doImport for @import resolution).
+    if (file.mod == null) {
+        file.mod = ctx.root_mod;
+    }
 }
 
 // ---------------------------------------------------------------------------

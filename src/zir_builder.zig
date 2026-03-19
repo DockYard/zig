@@ -584,6 +584,69 @@ pub const FuncBody = struct {
         try self.emitBodyInstVoid(.ret_implicit, Builder.encodeUnTok(.zero, .void_value));
         self.has_explicit_return = true;
     }
+
+    /// Add an if-then-else expression. Both branches must produce a value.
+    /// Returns a Ref to the result of whichever branch is taken.
+    ///
+    /// Emits the ZIR pattern:
+    ///   %block = block_inline(body_len=1) {
+    ///       condbr_inline(condition, then_body_len=1, else_body_len=1)
+    ///           then: [break_inline(%block, then_value)]
+    ///           else: [break_inline(%block, else_value)]
+    ///   }
+    pub fn addIfElse(
+        self: *FuncBody,
+        condition: Zir.Inst.Ref,
+        then_value: Zir.Inst.Ref,
+        else_value: Zir.Inst.Ref,
+    ) !Zir.Inst.Ref {
+        const b = self.builder;
+        const gpa = b.gpa;
+
+        // 1. Emit block_inline with a placeholder payload (fix up below).
+        const block_payload_idx: u32 = @intCast(b.extra.items.len);
+        // Reserve space for Block { body_len: u32 } + 1 body index
+        try b.extra.append(gpa, 1); // body_len = 1 (the condbr_inline)
+        const block_body_slot: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, 0); // placeholder for condbr_inline index
+
+        // The block_inline is a body instruction of the function.
+        const block_idx = try b.addInst(.block_inline, Builder.encodePlNode(.zero, block_payload_idx));
+        try self.body_inst_indices.append(gpa, block_idx);
+
+        // 2. Emit the two break_inline instructions (NOT body instructions).
+        //    They reference the block_inline by instruction index.
+
+        // Break payload for then branch
+        const break_then_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @bitCast(@as(i32, std.math.maxInt(i32)))); // operand_src_node = none
+        try b.extra.append(gpa, block_idx); // block_inst = block_inline
+        const break_then_idx = try b.addInst(.break_inline, Builder.encodeBreak(then_value, break_then_payload_idx));
+
+        // Break payload for else branch
+        const break_else_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @bitCast(@as(i32, std.math.maxInt(i32)))); // operand_src_node = none
+        try b.extra.append(gpa, block_idx); // block_inst = block_inline
+        const break_else_idx = try b.addInst(.break_inline, Builder.encodeBreak(else_value, break_else_payload_idx));
+
+        // 3. Emit condbr_inline (NOT a body instruction).
+        //    CondBr payload: { condition: Ref, then_body_len: u32, else_body_len: u32 }
+        //    Trailing: then body indices..., else body indices...
+        const condbr_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @intFromEnum(condition)); // condition
+        try b.extra.append(gpa, 1); // then_body_len = 1
+        try b.extra.append(gpa, 1); // else_body_len = 1
+        try b.extra.append(gpa, break_then_idx); // then body[0]
+        try b.extra.append(gpa, break_else_idx); // else body[0]
+        const condbr_idx = try b.addInst(.condbr_inline, Builder.encodePlNode(.zero, condbr_payload_idx));
+
+        // 4. Fix up block_inline's body to point to condbr_inline.
+        b.extra.items[block_body_slot] = condbr_idx;
+
+        // The block_inline instruction result is the value produced by
+        // whichever break_inline executes.
+        return Builder.instRef(block_idx);
+    }
 };
 
 pub const FinalizedZir = struct {
@@ -1093,4 +1156,81 @@ test "Builder: addCallRef" {
     try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.field_val), result.instructions_tags[4]);
     try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.int), result.instructions_tags[5]);
     try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.call), result.instructions_tags[6]);
+}
+
+test "Builder: addIfElse" {
+    var builder = try Builder.init(std.testing.allocator);
+    defer builder.deinit();
+
+    const body = try builder.beginFunction("test_if", .u8_type);
+    const cond = body.addBoolTrue();
+    const then_val = try body.addInt(1);
+    const else_val = try body.addInt(0);
+    const result_ref = try body.addIfElse(cond, then_val, else_val);
+    try body.addRetNode(result_ref);
+    try builder.endFunction(body);
+
+    const result = try builder.finalize();
+
+    // Instructions layout:
+    // 0: extended(struct_decl)
+    // 1: declaration
+    // 2: restore_err_ret_index_unconditional
+    // 3: int(1)
+    // 4: int(0)
+    // 5: block_inline        <- body instruction
+    // 6: break_inline (then) <- NOT a body instruction, referenced from condbr extra
+    // 7: break_inline (else) <- NOT a body instruction, referenced from condbr extra
+    // 8: condbr_inline       <- NOT a body instruction, referenced from block extra
+    // 9: ret_node
+    // 10: func
+    // 11: break_inline (func)
+    try std.testing.expectEqual(@as(u32, 12), result.instructions_len);
+
+    // Verify instruction tags
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.int), result.instructions_tags[3]);
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.int), result.instructions_tags[4]);
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.block_inline), result.instructions_tags[5]);
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.break_inline), result.instructions_tags[6]);
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.break_inline), result.instructions_tags[7]);
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.condbr_inline), result.instructions_tags[8]);
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.ret_node), result.instructions_tags[9]);
+
+    // Verify block_inline's extra payload
+    const data_items: []const Zir.Inst.Data = @alignCast(std.mem.bytesAsSlice(Zir.Inst.Data, result.instructions_data));
+    const block_data = data_items[5].pl_node;
+    const block_payload_idx = block_data.payload_index;
+
+    // Block payload: { body_len: u32 } + body indices
+    try std.testing.expectEqual(@as(u32, 1), result.extra[block_payload_idx]); // body_len = 1
+    try std.testing.expectEqual(@as(u32, 8), result.extra[block_payload_idx + 1]); // body[0] = condbr_inline at index 8
+
+    // Verify condbr_inline's extra payload
+    const condbr_data = data_items[8].pl_node;
+    const condbr_payload_idx = condbr_data.payload_index;
+
+    // CondBr payload: { condition: Ref, then_body_len: u32, else_body_len: u32 }
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Ref.bool_true), result.extra[condbr_payload_idx]); // condition
+    try std.testing.expectEqual(@as(u32, 1), result.extra[condbr_payload_idx + 1]); // then_body_len = 1
+    try std.testing.expectEqual(@as(u32, 1), result.extra[condbr_payload_idx + 2]); // else_body_len = 1
+    try std.testing.expectEqual(@as(u32, 6), result.extra[condbr_payload_idx + 3]); // then body[0] = break_inline at index 6
+    try std.testing.expectEqual(@as(u32, 7), result.extra[condbr_payload_idx + 4]); // else body[0] = break_inline at index 7
+
+    // Verify break_inline (then) carries then_val
+    const break_then_data = data_items[6].@"break";
+    try std.testing.expectEqual(then_val, break_then_data.operand);
+
+    // Verify break_inline (else) carries else_val
+    const break_else_data = data_items[7].@"break";
+    try std.testing.expectEqual(else_val, break_else_data.operand);
+
+    // Both break_inline Break payloads should reference the block_inline instruction
+    const break_then_payload_idx = break_then_data.payload_index;
+    try std.testing.expectEqual(@as(u32, 5), result.extra[break_then_payload_idx + 1]); // block_inst = 5
+
+    const break_else_payload_idx = break_else_data.payload_index;
+    try std.testing.expectEqual(@as(u32, 5), result.extra[break_else_payload_idx + 1]); // block_inst = 5
+
+    // The result Ref should point to the block_inline instruction
+    try std.testing.expectEqual(Builder.instRef(5), result_ref);
 }
