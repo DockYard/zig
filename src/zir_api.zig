@@ -184,8 +184,70 @@ fn addModuleImpl(ctx: *ZirContext, name: []const u8, source_path: []const u8) !v
     const name_duped = try ar.dupe(u8, name);
     try ctx.root_mod.deps.put(ar, name_duped, mod);
 
-    logErr("addModule: registered '{s}' from '{s}' (deps count: {d})", .{
-        name, source_path, ctx.root_mod.deps.count(),
+    // Register the new module in module_roots so doImport can find its file.
+    // We can't re-call populateModuleRootTable because it overwrites existing
+    // entries with undefined values. Instead, manually add just this module.
+    const zcu = ctx.compilation.zcu orelse return error.OutOfMemory;
+    const gpa = zcu.gpa;
+
+    // Build the path for the new module's source file.
+    const path = try mod.root.join(gpa, ctx.dirs, mod.root_src_path);
+    errdefer path.deinit(gpa);
+
+    // Check if this file is already in the import table.
+    const gop = try zcu.import_table.getOrPutAdapted(gpa, path, Zcu.ImportTableAdapter{ .zcu = zcu });
+
+    if (gop.found_existing) {
+        path.deinit(gpa);
+        try zcu.module_roots.put(gpa, mod, gop.key_ptr.*.toOptional());
+        logErr("addModule: file already exists in import table", .{});
+    } else {
+        logErr("addModule: creating new file entry", .{});
+        // Create a new File for this module.
+        const new_file = try gpa.create(Zcu.File);
+        const pt: Zcu.PerThread = .activate(zcu, .main);
+        defer pt.deactivate();
+        const new_file_index = try zcu.intern_pool.createFile(gpa, pt.tid, .{
+            .bin_digest = path.digest(),
+            .file = new_file,
+            .root_type = .none,
+        });
+        gop.key_ptr.* = new_file_index;
+        new_file.* = .{
+            .status = .never_loaded,
+            .path = path,
+            .stat = undefined,
+            .is_builtin = false,
+            .source = null,
+            .tree = null,
+            .zir = null,
+            .zoir = null,
+            .mod = mod,
+            .sub_file_path = try gpa.dupe(u8, file_name),
+            .module_changed = false,
+            .prev_zir = null,
+            .zoir_invalidated = false,
+        };
+        try zcu.module_roots.put(gpa, mod, new_file_index.toOptional());
+    }
+
+    // Ensure all files in module_roots have sub_file_path set.
+    // Files created by populateModuleRootTable leave sub_file_path undefined,
+    // and updateAliveFiles may not run for dynamically-added modules.
+    for (zcu.module_roots.keys(), zcu.module_roots.values()) |m, opt_file_idx| {
+        if (opt_file_idx.unwrap()) |file_idx| {
+            const f = zcu.fileByIndex(file_idx);
+            // Check if sub_file_path is undefined (pointer is sentinel value)
+            const ptr_val = @intFromPtr(f.sub_file_path.ptr);
+            if (ptr_val == 0 or ptr_val == 0x5555555555555555 or ptr_val == 0xaaaaaaaaaaaaaaaa) {
+                f.sub_file_path = m.root_src_path;
+                if (f.mod == null) f.mod = m;
+            }
+        }
+    }
+
+    logErr("addModule: registered '{s}' from '{s}' (deps count: {d}, roots: {d})", .{
+        name, source_path, ctx.root_mod.deps.count(), zcu.module_roots.count(),
     });
 }
 
