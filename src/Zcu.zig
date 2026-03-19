@@ -968,6 +968,11 @@ pub const File = struct {
     /// we invalidate the corresponding `zon_file` dependency, and reset it to `false`.
     zoir_invalidated: bool,
 
+    /// When true, this file's ZIR was injected externally (via the ZIR API)
+    /// rather than produced by AstGen. The pipeline should skip AstGen for
+    /// this file and use the pre-built ZIR directly.
+    zir_injected: bool = false,
+
     pub const Path = struct {
         root: enum {
             cwd,

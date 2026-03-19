@@ -5516,6 +5516,9 @@ fn workerUpdateFile(
     prog_node: std.Progress.Node,
     wg: *WaitGroup,
 ) void {
+    // Skip the entire update pipeline for ZIR-injected files.
+    if (file.zir_injected) return;
+
     const child_prog_node = prog_node.start(fs.path.basename(file.path.sub_path), 0);
     defer child_prog_node.end();
 

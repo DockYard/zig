@@ -87,6 +87,13 @@ pub fn updateFile(
     const comp = zcu.comp;
     const gpa = zcu.gpa;
 
+    // If ZIR was injected externally (via the ZIR API), skip AstGen entirely.
+    // The pre-built ZIR is already in file.zir with status = .success.
+    if (file.zir_injected) {
+        log.debug("skipping AstGen for ZIR-injected file", .{});
+        return;
+    }
+
     // In any case we need to examine the stat of the file to determine the course of action.
     var source_file = f: {
         const dir, const sub_path = file.path.openInfo(comp.dirs);

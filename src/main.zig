@@ -34,6 +34,16 @@ const Zcu = @import("Zcu.zig");
 const mingw = @import("libs/mingw.zig");
 const dev = @import("dev.zig");
 
+/// ZIR library API — exported C-ABI functions for injecting pre-built ZIR.
+/// The comptime block forces analysis so that `export` symbols are emitted.
+pub const zir_api = @import("zir_api.zig");
+comptime {
+    _ = &zir_api.zir_compilation_create;
+    _ = &zir_api.zir_compilation_add_zir;
+    _ = &zir_api.zir_compilation_update;
+    _ = &zir_api.zir_compilation_destroy;
+}
+
 test {
     _ = Package;
     _ = @import("codegen.zig");

@@ -374,6 +374,87 @@ pub fn build(b: *std.Build) !void {
         }
     }
 
+    // ZIR API static library — `zig build lib` produces libzig_compiler.a
+    // Pass -Denable-llvm -Dstatic-llvm to build with LLVM backend for real binaries.
+    {
+        const lib = addCompilerLibStep(b, .{
+            .optimize = optimize,
+            .target = target,
+            .strip = strip,
+            .valgrind = valgrind,
+            .sanitize_thread = sanitize_thread,
+            .single_threaded = single_threaded,
+        });
+
+        const lib_options = b.addOptions();
+        lib.root_module.addOptions("build_options", lib_options);
+        lib_options.addOption(u32, "mem_leak_frames", mem_leak_frames);
+        lib_options.addOption(bool, "skip_non_native", false);
+        lib_options.addOption(bool, "have_llvm", enable_llvm);
+        lib_options.addOption(bool, "llvm_has_m68k", llvm_has_m68k);
+        lib_options.addOption(bool, "llvm_has_csky", llvm_has_csky);
+        lib_options.addOption(bool, "llvm_has_arc", llvm_has_arc);
+        lib_options.addOption(bool, "llvm_has_xtensa", llvm_has_xtensa);
+        lib_options.addOption(bool, "debug_gpa", debug_gpa);
+        lib_options.addOption(DevEnv, "dev", .full);
+        lib_options.addOption(ValueInterpretMode, "value_interpret_mode", value_interpret_mode);
+        lib_options.addOption([:0]const u8, "version", version);
+        lib_options.addOption(std.SemanticVersion, "semver", semver);
+        lib_options.addOption(bool, "enable_debug_extensions", enable_debug_extensions);
+        lib_options.addOption(bool, "enable_logging", enable_logging);
+        lib_options.addOption(bool, "enable_link_snapshots", false);
+        lib_options.addOption(bool, "enable_tracy", false);
+        lib_options.addOption(bool, "enable_tracy_callstack", false);
+        lib_options.addOption(bool, "enable_tracy_allocation", false);
+        lib_options.addOption(u32, "tracy_callstack_depth", 10);
+        lib_options.addOption(bool, "value_tracing", false);
+
+        if (enable_llvm) {
+            // For the static library, we need the zigcpp bridge code but NOT
+            // the LLVM/Clang/LLD libraries themselves — those are linked when
+            // the consumer builds the final executable.
+            const lib_cmake_cfg = if (static_llvm) null else blk: {
+                if (findConfigH(b, config_h_path_option)) |config_h_path| {
+                    const file_contents = fs.cwd().readFileAlloc(b.allocator, config_h_path, max_config_h_bytes) catch unreachable;
+                    break :blk parseConfigH(b, file_contents);
+                } else {
+                    break :blk null;
+                }
+            };
+
+            if (lib_cmake_cfg) |cfg| {
+                // Add the cmake-built zigcpp object file (compiled from C++ bridge sources).
+                lib.root_module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{
+                    cfg.cmake_binary_dir,
+                    "zigcpp",
+                    b.fmt("{s}{s}{s}", .{
+                        cfg.cmake_static_library_prefix,
+                        "zigcpp",
+                        cfg.cmake_static_library_suffix,
+                    }),
+                }) });
+                // Add include paths so Zig can find LLD/LLVM headers if needed.
+                assert(cfg.lld_include_dir.len != 0);
+                lib.root_module.addIncludePath(.{ .cwd_relative = cfg.lld_include_dir });
+                lib.root_module.addIncludePath(.{ .cwd_relative = cfg.llvm_include_dir });
+                lib.root_module.addLibraryPath(.{ .cwd_relative = cfg.llvm_lib_dir });
+                // Note: LLVM/Clang/LLD .a files are NOT added here — they must
+                // be linked by the downstream consumer (e.g. Zap's build.zig).
+            } else {
+                try addStaticLlvmOptionsToModule(lib.root_module, .{
+                    .llvm_has_m68k = llvm_has_m68k,
+                    .llvm_has_csky = llvm_has_csky,
+                    .llvm_has_arc = llvm_has_arc,
+                    .llvm_has_xtensa = llvm_has_xtensa,
+                });
+            }
+        }
+
+        const install_lib = b.addInstallArtifact(lib, .{});
+        const lib_build_step = b.step("lib", "Build the Zig compiler as a static library with ZIR API");
+        lib_build_step.dependOn(&install_lib.step);
+    }
+
     const test_filters = b.option([]const []const u8, "test-filter", "Skip tests that do not match any filter") orelse &[0][]const u8{};
     const test_target_filters = b.option([]const []const u8, "test-target-filter", "Skip tests whose target triple do not match any filter") orelse &[0][]const u8{};
     const test_extra_targets = b.option(bool, "test-extra-targets", "Enable running module tests for additional targets") orelse false;
@@ -744,6 +825,42 @@ fn addCompilerStep(b: *std.Build, options: AddCompilerModOptions) *std.Build.Ste
     exe.stack_size = stack_size;
 
     return exe;
+}
+
+fn addCompilerLibStep(b: *std.Build, options: AddCompilerModOptions) *std.Build.Step.Compile {
+    // Use zir_api.zig as the library root instead of main.zig.
+    // This prevents the compiler's `pub fn main()` from being exported,
+    // which would conflict with any binary linking this library.
+    const lib_mod = b.createModule(.{
+        .root_source_file = b.path("src/zir_api.zig"),
+        .target = options.target,
+        .optimize = options.optimize,
+        .strip = options.strip,
+        .sanitize_thread = options.sanitize_thread,
+        .single_threaded = options.single_threaded,
+        .valgrind = options.valgrind,
+    });
+
+    // The zir_api.zig module needs the same imports as the compiler module.
+    const aro_mod = b.createModule(.{
+        .root_source_file = b.path("lib/compiler/aro/aro.zig"),
+    });
+    const aro_translate_c_mod = b.createModule(.{
+        .root_source_file = b.path("lib/compiler/aro_translate_c.zig"),
+    });
+    aro_translate_c_mod.addImport("aro", aro_mod);
+    lib_mod.addImport("aro", aro_mod);
+    lib_mod.addImport("aro_translate_c", aro_translate_c_mod);
+
+    const lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "zig_compiler",
+        .max_rss = 7_800_000_000,
+        .root_module = lib_mod,
+    });
+    lib.stack_size = stack_size;
+
+    return lib;
 }
 
 const exe_cflags = [_][]const u8{
