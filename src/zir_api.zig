@@ -404,15 +404,19 @@ pub export fn zir_builder_destroy(handle: ?*ZirBuilderHandle) callconv(.c) void 
 
 /// Begin a function declaration.
 /// `name_ptr` + `name_len` specify the function name.
+/// `ret_type` is 0 for void, or a `Zir.Inst.Ref` value for the return type
+/// (e.g. `@intFromEnum(Zir.Inst.Ref.i64_type)`).
 /// Returns 0 on success, -1 on error.
 pub export fn zir_builder_begin_func(
     handle: ?*ZirBuilderHandle,
     name_ptr: [*]const u8,
     name_len: u32,
+    ret_type: u32,
 ) callconv(.c) i32 {
     const b = getBuilder(handle) orelse return -1;
     const name = name_ptr[0..name_len];
-    _ = b.beginFunction(name) catch return -1;
+    const rt: zir_builder.ReturnType = @enumFromInt(ret_type);
+    _ = b.beginFunction(name, rt) catch return -1;
     return 0;
 }
 

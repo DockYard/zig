@@ -97,7 +97,7 @@ pub const Builder = struct {
     /// then emit restore_err_ret_index_unconditional. Body instructions are emitted
     /// eagerly into the builder's instruction arrays so that we can return valid Refs.
     /// endFunction then emits func, break_inline, and the extra payloads.
-    pub fn beginFunction(self: *Builder, name: []const u8) !*FuncBody {
+    pub fn beginFunction(self: *Builder, name: []const u8, ret_type: ReturnType) !*FuncBody {
         std.debug.assert(self.active_body == null);
 
         // Emit placeholder declaration instruction (fix up in endFunction)
@@ -117,6 +117,7 @@ pub const Builder = struct {
             .decl_inst = decl_inst,
             .restore_inst = restore_inst,
             .has_explicit_return = false,
+            .ret_type = ret_type,
         };
 
         // Track restore_err_ret as first body instruction
@@ -142,15 +143,26 @@ pub const Builder = struct {
 
         // Build Func payload in extra
         // Func struct: ret_ty (u32), param_block (Index), body_len (u32)
-        // Trailing: body indices, SrcLocs (3 u32s), proto_hash (4 u32s)
+        // Trailing: [return type Ref if ret_ty.body_len==1], body indices, SrcLocs (3 u32s), proto_hash (4 u32s)
         const func_payload_idx: u32 = @intCast(self.extra.items.len);
 
-        // ret_ty: body_len=0 means void, is_generic=false
-        try self.extra.append(self.gpa, 0);
+        // ret_ty: packed RetTy { body_len: u31, is_generic: bool }
+        if (body.ret_type == .void) {
+            // body_len=0 means void, is_generic=false → u32 value 0
+            try self.extra.append(self.gpa, 0);
+        } else {
+            // body_len=1 means simple Ref, is_generic=false → u32 value 1
+            try self.extra.append(self.gpa, 1);
+        }
         // param_block: the declaration instruction
         try self.extra.append(self.gpa, decl_inst);
         // body_len
         try self.extra.append(self.gpa, body_len);
+
+        // Trailing return type Ref (if ret_ty.body_len == 1)
+        if (body.ret_type != .void) {
+            try self.extra.append(self.gpa, @intFromEnum(body.ret_type));
+        }
 
         // body instruction indices
         for (body.body_inst_indices.items) |idx| {
@@ -339,6 +351,27 @@ pub const Builder = struct {
     }
 };
 
+/// Return type for a function, mapping to Zir.Inst.Ref values.
+/// The void variant uses body_len=0 encoding; all others use body_len=1
+/// with a trailing Ref.
+pub const ReturnType = enum(u32) {
+    void = 0,
+    bool_type = @intFromEnum(Zir.Inst.Ref.bool_type),
+    u8_type = @intFromEnum(Zir.Inst.Ref.u8_type),
+    i8_type = @intFromEnum(Zir.Inst.Ref.i8_type),
+    u16_type = @intFromEnum(Zir.Inst.Ref.u16_type),
+    i16_type = @intFromEnum(Zir.Inst.Ref.i16_type),
+    u32_type = @intFromEnum(Zir.Inst.Ref.u32_type),
+    i32_type = @intFromEnum(Zir.Inst.Ref.i32_type),
+    u64_type = @intFromEnum(Zir.Inst.Ref.u64_type),
+    i64_type = @intFromEnum(Zir.Inst.Ref.i64_type),
+    usize_type = @intFromEnum(Zir.Inst.Ref.usize_type),
+    isize_type = @intFromEnum(Zir.Inst.Ref.isize_type),
+    f16_type = @intFromEnum(Zir.Inst.Ref.f16_type),
+    f32_type = @intFromEnum(Zir.Inst.Ref.f32_type),
+    f64_type = @intFromEnum(Zir.Inst.Ref.f64_type),
+};
+
 /// Accumulates function body instructions. Instructions are emitted eagerly
 /// into the Builder's instruction arrays so that valid Refs can be returned
 /// for use by subsequent instructions.
@@ -350,6 +383,7 @@ pub const FuncBody = struct {
     decl_inst: u32,
     restore_inst: u32,
     has_explicit_return: bool,
+    ret_type: ReturnType,
 
     /// Emit an instruction into the builder and track it as a body instruction.
     /// Returns the Ref pointing to this instruction.
@@ -491,7 +525,7 @@ test "Builder: void main produces valid ZIR" {
     var builder = try Builder.init(std.testing.allocator);
     defer builder.deinit();
 
-    const body = try builder.beginFunction("main");
+    const body = try builder.beginFunction("main", .void);
     // Don't add explicit return - endFunction will add ret_implicit
     try builder.endFunction(body);
 
@@ -582,7 +616,7 @@ test "Builder: function with int constant" {
     var builder = try Builder.init(std.testing.allocator);
     defer builder.deinit();
 
-    const body = try builder.beginFunction("main");
+    const body = try builder.beginFunction("main", .void);
     const val = try body.addInt(42);
     _ = val; // unused for now, just verify it doesn't crash
     try builder.endFunction(body);
@@ -604,7 +638,7 @@ test "Builder: addInt returns valid Ref" {
     var builder = try Builder.init(std.testing.allocator);
     defer builder.deinit();
 
-    const body = try builder.beginFunction("add_test");
+    const body = try builder.beginFunction("add_test", .void);
     const a = try body.addInt(10);
     const b = try body.addInt(20);
 
@@ -629,7 +663,7 @@ test "Builder: addFloat" {
     var builder = try Builder.init(std.testing.allocator);
     defer builder.deinit();
 
-    const body = try builder.beginFunction("float_test");
+    const body = try builder.beginFunction("float_test", .void);
     const val = try body.addFloat(3.14);
     _ = val;
     try builder.endFunction(body);
@@ -645,7 +679,7 @@ test "Builder: addStr" {
     var builder = try Builder.init(std.testing.allocator);
     defer builder.deinit();
 
-    const body = try builder.beginFunction("str_test");
+    const body = try builder.beginFunction("str_test", .void);
     const val = try body.addStr("hello");
     _ = val;
     try builder.endFunction(body);
@@ -664,7 +698,7 @@ test "Builder: addBoolTrue and addBoolFalse return named refs" {
     var builder = try Builder.init(std.testing.allocator);
     defer builder.deinit();
 
-    const body = try builder.beginFunction("bool_test");
+    const body = try builder.beginFunction("bool_test", .void);
     const t = body.addBoolTrue();
     const f = body.addBoolFalse();
     const v = body.addVoidValue();
@@ -681,7 +715,7 @@ test "Builder: addNegate and addBoolNot" {
     var builder = try Builder.init(std.testing.allocator);
     defer builder.deinit();
 
-    const body = try builder.beginFunction("unary_test");
+    const body = try builder.beginFunction("unary_test", .void);
     const val = try body.addInt(42);
     const neg = try body.addNegate(val);
     _ = neg;
@@ -702,7 +736,7 @@ test "Builder: explicit return with value" {
     var builder = try Builder.init(std.testing.allocator);
     defer builder.deinit();
 
-    const body = try builder.beginFunction("ret_test");
+    const body = try builder.beginFunction("ret_test", .void);
     const val = try body.addInt(99);
     try body.addRetNode(val);
     try builder.endFunction(body);
@@ -719,10 +753,10 @@ test "Builder: multiple functions" {
     var builder = try Builder.init(std.testing.allocator);
     defer builder.deinit();
 
-    const body1 = try builder.beginFunction("foo");
+    const body1 = try builder.beginFunction("foo", .void);
     try builder.endFunction(body1);
 
-    const body2 = try builder.beginFunction("bar");
+    const body2 = try builder.beginFunction("bar", .void);
     try builder.endFunction(body2);
 
     const result = try builder.finalize();
@@ -744,7 +778,7 @@ test "Builder: addEnumLiteral" {
     var builder = try Builder.init(std.testing.allocator);
     defer builder.deinit();
 
-    const body = try builder.beginFunction("enum_test");
+    const body = try builder.beginFunction("enum_test", .void);
     const lit = try body.addEnumLiteral("ok");
     _ = lit;
     try builder.endFunction(body);
@@ -759,7 +793,7 @@ test "Builder: struct_decl extended encoding" {
     var builder = try Builder.init(std.testing.allocator);
     defer builder.deinit();
 
-    const body = try builder.beginFunction("main");
+    const body = try builder.beginFunction("main", .void);
     try builder.endFunction(body);
     const result = try builder.finalize();
 
@@ -777,7 +811,7 @@ test "Builder: addCall" {
     var builder = try Builder.init(std.testing.allocator);
     defer builder.deinit();
 
-    const body = try builder.beginFunction("call_test");
+    const body = try builder.beginFunction("call_test", .void);
     const arg = try body.addInt(42);
     const call_result = try body.addCall("some_func", &.{arg});
     _ = call_result;
@@ -789,4 +823,76 @@ test "Builder: addCall" {
     try std.testing.expectEqual(@as(u32, 9), result.instructions_len);
     try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.decl_val), result.instructions_tags[4]);
     try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.call), result.instructions_tags[5]);
+}
+
+test "Builder: function with i64 return type" {
+    var builder = try Builder.init(std.testing.allocator);
+    defer builder.deinit();
+
+    const body = try builder.beginFunction("get_value", .i64_type);
+    const val = try body.addInt(42);
+    try body.addRetNode(val);
+    try builder.endFunction(body);
+
+    const result = try builder.finalize();
+
+    // Should produce 7 instructions:
+    // 0: extended(struct_decl)
+    // 1: declaration
+    // 2: restore_err_ret_index_unconditional
+    // 3: int(42)
+    // 4: ret_node
+    // 5: func
+    // 6: break_inline
+    try std.testing.expectEqual(@as(u32, 7), result.instructions_len);
+
+    // Func payload starts at extra[2]
+    // extra[2] = ret_ty = 1 (body_len=1, is_generic=false)
+    try std.testing.expectEqual(@as(u32, 1), result.extra[2]);
+    // extra[3] = param_block = 1 (declaration inst)
+    try std.testing.expectEqual(@as(u32, 1), result.extra[3]);
+    // extra[4] = body_len = 3 (restore_err_ret, int(42), ret_node)
+    try std.testing.expectEqual(@as(u32, 3), result.extra[4]);
+
+    // extra[5] = trailing return type Ref (i64_type)
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Ref.i64_type), result.extra[5]);
+
+    // extra[6] = body[0] = 2 (restore_err_ret_index_unconditional)
+    try std.testing.expectEqual(@as(u32, 2), result.extra[6]);
+    // extra[7] = body[1] = 3 (int(42))
+    try std.testing.expectEqual(@as(u32, 3), result.extra[7]);
+    // extra[8] = body[2] = 4 (ret_node)
+    try std.testing.expectEqual(@as(u32, 4), result.extra[8]);
+
+    // SrcLocs at extra[9..11]
+    try std.testing.expectEqual(@as(u32, 0), result.extra[9]);
+    try std.testing.expectEqual(@as(u32, 0), result.extra[10]);
+    try std.testing.expectEqual(@as(u32, 0), result.extra[11]);
+
+    // proto_hash at extra[12..15]
+    try std.testing.expectEqual(@as(u32, 0), result.extra[12]);
+    try std.testing.expectEqual(@as(u32, 0), result.extra[13]);
+    try std.testing.expectEqual(@as(u32, 0), result.extra[14]);
+    try std.testing.expectEqual(@as(u32, 0), result.extra[15]);
+
+    // Break payload at extra[16] (shifted by 1 compared to void case due to ret type Ref)
+    try std.testing.expectEqual(@as(u32, 0x7FFFFFFF), result.extra[16]);
+    try std.testing.expectEqual(@as(u32, 1), result.extra[17]);
+}
+
+test "Builder: function with u8 return type" {
+    var builder = try Builder.init(std.testing.allocator);
+    defer builder.deinit();
+
+    const body = try builder.beginFunction("get_byte", .u8_type);
+    const val = try body.addInt(255);
+    try body.addRetNode(val);
+    try builder.endFunction(body);
+
+    const result = try builder.finalize();
+
+    // Verify ret_ty is 1 (body_len=1, non-generic)
+    try std.testing.expectEqual(@as(u32, 1), result.extra[2]);
+    // Verify trailing return type Ref is u8_type
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Ref.u8_type), result.extra[5]);
 }
