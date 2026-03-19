@@ -13,6 +13,7 @@ const Allocator = mem.Allocator;
 const fs = std.fs;
 const assert = std.debug.assert;
 
+const zir_builder = @import("zir_builder.zig");
 const Compilation = @import("Compilation.zig");
 const Zcu = @import("Zcu.zig");
 const Package = @import("Package.zig");
@@ -292,6 +293,19 @@ fn createImpl(
 // Internal: ZIR injection
 // ---------------------------------------------------------------------------
 
+fn addZirFromFinalized(ctx: *ZirContext, fzir: zir_builder.FinalizedZir) !void {
+    const zir_data = ZirData{
+        .instructions_tags = @constCast(fzir.instructions_tags.ptr),
+        .instructions_data = @constCast(fzir.instructions_data.ptr),
+        .instructions_len = fzir.instructions_len,
+        .string_bytes = @constCast(fzir.string_bytes.ptr),
+        .string_bytes_len = fzir.string_bytes_len,
+        .extra = @constCast(fzir.extra.ptr),
+        .extra_len = fzir.extra_len,
+    };
+    return addZirImpl(ctx, "root", &zir_data);
+}
+
 fn addZirImpl(ctx: *ZirContext, name: []const u8, data: *const ZirData) !void {
     _ = name;
     const gpa = ctx.gpa;
@@ -355,4 +369,217 @@ fn addZirImpl(ctx: *ZirContext, name: []const u8, data: *const ZirData) !void {
 
     // Mark as ZIR-injected so the pipeline skips AstGen for this file.
     file.zir_injected = true;
+}
+
+// ---------------------------------------------------------------------------
+// C-ABI exports: ZIR Builder
+// ---------------------------------------------------------------------------
+
+/// Opaque handle type for the ZIR builder, used across the C ABI boundary.
+pub const ZirBuilderHandle = opaque {};
+
+/// Recover a `*zir_builder.Builder` from an opaque handle.
+fn getBuilder(handle: ?*ZirBuilderHandle) ?*zir_builder.Builder {
+    const h = handle orelse return null;
+    return @ptrCast(@alignCast(h));
+}
+
+/// Create a new ZIR builder. Returns null on failure.
+pub export fn zir_builder_create() callconv(.c) ?*ZirBuilderHandle {
+    const gpa = std.heap.page_allocator;
+    const b = gpa.create(zir_builder.Builder) catch return null;
+    b.* = zir_builder.Builder.init(gpa) catch {
+        gpa.destroy(b);
+        return null;
+    };
+    return @ptrCast(b);
+}
+
+/// Destroy a ZIR builder and free all resources.
+pub export fn zir_builder_destroy(handle: ?*ZirBuilderHandle) callconv(.c) void {
+    const b = getBuilder(handle) orelse return;
+    b.deinit();
+    std.heap.page_allocator.destroy(b);
+}
+
+/// Begin a function declaration.
+/// `name_ptr` + `name_len` specify the function name.
+/// Returns 0 on success, -1 on error.
+pub export fn zir_builder_begin_func(
+    handle: ?*ZirBuilderHandle,
+    name_ptr: [*]const u8,
+    name_len: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const name = name_ptr[0..name_len];
+    _ = b.beginFunction(name) catch return -1;
+    return 0;
+}
+
+/// End the current function declaration.
+/// Returns 0 on success, -1 on error.
+pub export fn zir_builder_end_func(handle: ?*ZirBuilderHandle) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    b.endFunction(body) catch return -1;
+    return 0;
+}
+
+/// Emit an integer literal. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_int(handle: ?*ZirBuilderHandle, value: i64) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const ref = body.addInt(value) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit a float literal. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_float(handle: ?*ZirBuilderHandle, value: f64) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const ref = body.addFloat(value) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit a string literal. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_str(
+    handle: ?*ZirBuilderHandle,
+    ptr: [*]const u8,
+    len: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const ref = body.addStr(ptr[0..len]) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit a boolean literal. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_bool(handle: ?*ZirBuilderHandle, value: bool) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    if (value) {
+        return @intFromEnum(body.addBoolTrue());
+    } else {
+        return @intFromEnum(body.addBoolFalse());
+    }
+}
+
+/// Emit a void value. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_void(handle: ?*ZirBuilderHandle) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    return @intFromEnum(body.addVoidValue());
+}
+
+/// Emit an enum literal. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_enum_literal(
+    handle: ?*ZirBuilderHandle,
+    name_ptr: [*]const u8,
+    name_len: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const ref = body.addEnumLiteral(name_ptr[0..name_len]) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit a binary operation.
+/// `tag` is the `u8` value of `Zir.Inst.Tag` (e.g. add, sub, mul, ...).
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_binop(
+    handle: ?*ZirBuilderHandle,
+    tag: u8,
+    lhs: u32,
+    rhs: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const zig_tag: Zir.Inst.Tag = @enumFromInt(tag);
+    const lhs_ref: Zir.Inst.Ref = @enumFromInt(lhs);
+    const rhs_ref: Zir.Inst.Ref = @enumFromInt(rhs);
+    const ref = body.addBinOp(zig_tag, lhs_ref, rhs_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit arithmetic negation. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_negate(handle: ?*ZirBuilderHandle, operand: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addNegate(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit boolean NOT. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_bool_not(handle: ?*ZirBuilderHandle, operand: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addBoolNot(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit a function call by name.
+/// `args_ptr` points to an array of `u32` Ref values, `args_len` is the count.
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_call(
+    handle: ?*ZirBuilderHandle,
+    name_ptr: [*]const u8,
+    name_len: u32,
+    args_ptr: [*]const u32,
+    args_len: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+
+    // Convert u32 args to Zir.Inst.Ref slice using stack buffer or heap.
+    const gpa = b.gpa;
+    const refs = gpa.alloc(Zir.Inst.Ref, args_len) catch return 0xFFFFFFFF;
+    defer gpa.free(refs);
+    for (0..args_len) |i| {
+        refs[i] = @enumFromInt(args_ptr[i]);
+    }
+
+    const ref = body.addCall(name_ptr[0..name_len], refs) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit an explicit return with a value.
+/// Returns 0 on success, -1 on error.
+pub export fn zir_builder_emit_ret(handle: ?*ZirBuilderHandle, operand: u32) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    body.addRetNode(operand_ref) catch return -1;
+    return 0;
+}
+
+/// Emit an implicit void return.
+/// Returns 0 on success, -1 on error.
+pub export fn zir_builder_emit_ret_void(handle: ?*ZirBuilderHandle) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    body.addRetImplicit() catch return -1;
+    return 0;
+}
+
+/// Finalize the builder and inject its ZIR into a compilation context.
+/// After this call the builder is consumed; the handle must not be reused
+/// (call `zir_builder_destroy` is not needed — resources are freed here).
+/// Returns 0 on success, -1 on error.
+pub export fn zir_builder_inject(
+    builder_handle: ?*ZirBuilderHandle,
+    compilation_handle: ?*ZirContext,
+) callconv(.c) i32 {
+    const b = getBuilder(builder_handle) orelse return -1;
+    const ctx = compilation_handle orelse return -1;
+
+    const fzir = b.finalize() catch return -1;
+    addZirFromFinalized(ctx, fzir) catch return -1;
+
+    // Clean up the builder — it has been consumed.
+    b.deinit();
+    std.heap.page_allocator.destroy(b);
+
+    return 0;
 }

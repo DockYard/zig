@@ -42,6 +42,25 @@ comptime {
     _ = &zir_api.zir_compilation_add_zir;
     _ = &zir_api.zir_compilation_update;
     _ = &zir_api.zir_compilation_destroy;
+
+    // ZIR Builder C-ABI exports
+    _ = &zir_api.zir_builder_create;
+    _ = &zir_api.zir_builder_destroy;
+    _ = &zir_api.zir_builder_begin_func;
+    _ = &zir_api.zir_builder_end_func;
+    _ = &zir_api.zir_builder_emit_int;
+    _ = &zir_api.zir_builder_emit_float;
+    _ = &zir_api.zir_builder_emit_str;
+    _ = &zir_api.zir_builder_emit_bool;
+    _ = &zir_api.zir_builder_emit_void;
+    _ = &zir_api.zir_builder_emit_enum_literal;
+    _ = &zir_api.zir_builder_emit_binop;
+    _ = &zir_api.zir_builder_emit_negate;
+    _ = &zir_api.zir_builder_emit_bool_not;
+    _ = &zir_api.zir_builder_emit_call;
+    _ = &zir_api.zir_builder_emit_ret;
+    _ = &zir_api.zir_builder_emit_ret_void;
+    _ = &zir_api.zir_builder_inject;
 }
 
 test {
