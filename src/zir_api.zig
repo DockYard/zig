@@ -106,10 +106,18 @@ pub export fn zir_compilation_update(ctx: *ZirContext) i32 {
 
 /// Print compilation errors to stderr.
 pub export fn zir_compilation_print_errors(ctx: *ZirContext) void {
-    var error_bundle = ctx.compilation.getAllErrorsAlloc() catch return;
+    var error_bundle = ctx.compilation.getAllErrorsAlloc() catch |err| {
+        logErr("getAllErrorsAlloc failed: {s}", .{@errorName(err)});
+        return;
+    };
     defer error_bundle.deinit(ctx.gpa);
-    if (error_bundle.errorMessageCount() == 0) return;
+    const count = error_bundle.errorMessageCount();
+    if (count == 0) {
+        logErr("anyErrors() true but errorMessageCount=0", .{});
+        return;
+    }
 
+    logErr("error count: {d}", .{count});
     const stderr = std.debug.lockStderrWriter(&.{});
     defer std.debug.unlockStderrWriter();
     error_bundle.renderToWriter(.{
@@ -213,7 +221,7 @@ fn createImpl(
         .is_test = false,
         .have_zcu = true,
         .emit_bin = true,
-        .root_optimize_mode = .Debug,
+        .root_optimize_mode = .ReleaseFast, // TODO: make configurable; Debug triggers safety checks that need proper source locations
         .root_strip = false,
         .link_libc = true,
         .lto = .none,
@@ -227,23 +235,27 @@ fn createImpl(
     // Write a stub source file to the cwd. The path uses .none root (cwd-relative)
     // so that module-level imports resolve correctly against the cwd.
     const root_name_z = try ar.dupeZ(u8, root_name_str);
-    const stub_filename = try std.fmt.allocPrint(ar, ".zap-cache/{s}.zig", .{root_name_str});
+    // Create a subdirectory for the stub source so that the root path (directory)
+    // and root_src_path (filename within it) are separate.
+    const stub_dir = try std.fmt.allocPrint(ar, ".zap-cache/{s}.zig", .{root_name_str});
+    const stub_src_name = try std.fmt.allocPrint(ar, "{s}.zig", .{root_name_str});
 
     const stub_source = "pub fn main() void {}\n";
-    fs.cwd().makePath(".zap-cache") catch {};
+    fs.cwd().makePath(stub_dir) catch {};
+    const stub_full = try std.fmt.allocPrint(ar, "{s}/{s}", .{ stub_dir, stub_src_name });
     fs.cwd().writeFile(.{
-        .sub_path = stub_filename,
+        .sub_path = stub_full,
         .data = stub_source,
     }) catch return error.OutOfMemory;
 
     // Resolve the path canonically using the Compilation's directory system.
-    const root_path = Compilation.Path.fromUnresolved(ar, ctx.dirs, &.{stub_filename}) catch
+    const root_path = Compilation.Path.fromUnresolved(ar, ctx.dirs, &.{stub_dir}) catch
         return error.OutOfMemory;
 
     const root_mod = Package.Module.create(ar, .{
         .paths = .{
             .root = root_path,
-            .root_src_path = std.fs.path.basename(stub_filename),
+            .root_src_path = stub_src_name,
         },
         .fully_qualified_name = "root",
         .cc_argv = &.{},
@@ -359,6 +371,16 @@ fn addZirImpl(ctx: *ZirContext, name: []const u8, data: *const ZirData) !void {
     const file_index = root_file_opt.unwrap() orelse
         return error.OutOfMemory;
     const file = zcu.fileByIndex(file_index);
+
+    // Parse the stub source so that error reporting has a valid AST tree.
+    // Without this, SrcLoc.span crashes when Sema tries to format errors.
+    if (file.source == null) {
+        const stub_source = "pub fn main() void {}\n";
+        const source = try gpa.allocSentinel(u8, stub_source.len, 0);
+        @memcpy(source, stub_source);
+        file.source = source;
+        file.tree = try std.zig.Ast.parse(gpa, source, .zig);
+    }
 
     // Free any previous ZIR.
     if (file.zir) |*old_zir| old_zir.deinit(gpa);

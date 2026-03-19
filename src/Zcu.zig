@@ -1254,6 +1254,11 @@ pub const SrcLoc = struct {
     pub const Span = Ast.Span;
 
     pub fn span(src_loc: SrcLoc, zcu: *const Zcu) !Span {
+        // For ZIR-injected files, source locations may not be valid.
+        // Return a safe dummy span to avoid crashing during error reporting.
+        if (src_loc.file_scope.zir_injected) {
+            return Span{ .start = 0, .end = 1, .main = 0 };
+        }
         switch (src_loc.lazy) {
             .unneeded => unreachable,
 
