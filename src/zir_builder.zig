@@ -6,7 +6,7 @@ const Allocator = std.mem.Allocator;
 pub const Builder = struct {
     gpa: Allocator,
     tags: std.ArrayListUnmanaged(u8),
-    data: std.ArrayListUnmanaged([2]u32),
+    data: std.ArrayListUnmanaged(Zir.Inst.Data),
     extra: std.ArrayListUnmanaged(u32),
     string_bytes: std.ArrayListUnmanaged(u8),
 
@@ -37,7 +37,7 @@ pub const Builder = struct {
         // Emit placeholder instruction 0: extended(struct_decl)
         // Will be fixed up in finalize()
         try self.tags.append(gpa, @intFromEnum(Zir.Inst.Tag.extended));
-        try self.data.append(gpa, .{ 0, 0 });
+        try self.data.append(gpa, encodeExtended(0, 0, 0));
 
         return self;
     }
@@ -70,10 +70,10 @@ pub const Builder = struct {
     }
 
     /// Append a single instruction, return its index.
-    pub fn addInst(self: *Builder, tag: Zir.Inst.Tag, data_words: [2]u32) !u32 {
+    pub fn addInst(self: *Builder, tag: Zir.Inst.Tag, inst_data: Zir.Inst.Data) !u32 {
         const index: u32 = @intCast(self.tags.items.len);
         try self.tags.append(self.gpa, @intFromEnum(tag));
-        try self.data.append(self.gpa, data_words);
+        try self.data.append(self.gpa, inst_data);
         return index;
     }
 
@@ -101,7 +101,7 @@ pub const Builder = struct {
         std.debug.assert(self.active_body == null);
 
         // Emit placeholder declaration instruction (fix up in endFunction)
-        const decl_inst = try self.addInst(.declaration, .{ 0, 0 });
+        const decl_inst = try self.addInst(.declaration, encodeDeclaration(0, 0));
 
         // Emit restore_err_ret_index_unconditional as first body instruction
         const restore_inst = try self.addInst(
@@ -213,7 +213,7 @@ pub const Builder = struct {
         try self.extra.append(self.gpa, break_inst);
 
         // Fix up declaration instruction with real payload index
-        self.data.items[decl_inst] = .{ 0, decl_payload_idx };
+        self.data.items[decl_inst] = encodeDeclaration(0, decl_payload_idx);
 
         // Track this declaration for the root struct_decl
         try self.decl_indices.append(self.gpa, decl_inst);
@@ -251,14 +251,12 @@ pub const Builder = struct {
         }
 
         // Fix up instruction 0 (struct_decl) with real extended data
-        // Extended.InstData: { opcode: Extended(u16), small: u16, operand: u32 }
-        // In memory as [2]u32: first = (small << 16) | opcode, second = operand
-        const opcode: u16 = @intFromEnum(Zir.Inst.Extended.struct_decl);
         const small: u16 = 0x0004; // StructDecl.Small with has_decls_len = true (bit 2)
-        self.data.items[0] = .{
-            @as(u32, small) << 16 | @as(u32, opcode),
+        self.data.items[0] = encodeExtended(
+            @intFromEnum(Zir.Inst.Extended.struct_decl),
+            small,
             struct_payload_idx,
-        };
+        );
 
         const inst_count: u32 = @intCast(self.tags.items.len);
 
@@ -275,48 +273,69 @@ pub const Builder = struct {
 
     // ---- Data encoding helpers ----
 
-    fn encodeUnNode(src_node: Ast.Node.Offset, operand: Zir.Inst.Ref) [2]u32 {
-        return .{
-            @bitCast(@intFromEnum(src_node)),
-            @intFromEnum(operand),
-        };
+    fn encodeUnNode(src_node: Ast.Node.Offset, operand: Zir.Inst.Ref) Zir.Inst.Data {
+        return .{ .un_node = .{
+            .src_node = src_node,
+            .operand = operand,
+        } };
     }
 
-    fn encodeUnTok(src_tok: Ast.TokenOffset, operand: Zir.Inst.Ref) [2]u32 {
-        return .{
-            @bitCast(@intFromEnum(src_tok)),
-            @intFromEnum(operand),
-        };
+    fn encodeUnTok(src_tok: Ast.TokenOffset, operand: Zir.Inst.Ref) Zir.Inst.Data {
+        return .{ .un_tok = .{
+            .src_tok = src_tok,
+            .operand = operand,
+        } };
     }
 
-    fn encodePlNode(src_node: Ast.Node.Offset, payload_index: u32) [2]u32 {
-        return .{
-            @bitCast(@intFromEnum(src_node)),
-            payload_index,
-        };
+    fn encodePlNode(src_node: Ast.Node.Offset, payload_index: u32) Zir.Inst.Data {
+        return .{ .pl_node = .{
+            .src_node = src_node,
+            .payload_index = payload_index,
+        } };
     }
 
-    fn encodeBreak(operand: Zir.Inst.Ref, payload_index: u32) [2]u32 {
-        return .{
-            @intFromEnum(operand),
-            payload_index,
-        };
+    fn encodeBreak(operand: Zir.Inst.Ref, payload_index: u32) Zir.Inst.Data {
+        return .{ .@"break" = .{
+            .operand = operand,
+            .payload_index = payload_index,
+        } };
     }
 
-    fn encodeInt(value: u64) [2]u32 {
-        return @bitCast(value);
+    fn encodeInt(value: u64) Zir.Inst.Data {
+        return .{ .int = value };
     }
 
-    fn encodeFloat(value: f64) [2]u32 {
-        return @bitCast(value);
+    fn encodeFloat(value: f64) Zir.Inst.Data {
+        return .{ .float = value };
     }
 
-    fn encodeStr(start: u32, len: u32) [2]u32 {
-        return .{ start, len };
+    fn encodeStr(start: u32, len: u32) Zir.Inst.Data {
+        return .{ .str = .{
+            .start = @enumFromInt(start),
+            .len = len,
+        } };
     }
 
-    fn encodeStrTok(start: u32, src_tok: Ast.TokenOffset) [2]u32 {
-        return .{ start, @bitCast(@intFromEnum(src_tok)) };
+    fn encodeStrTok(start: u32, src_tok: Ast.TokenOffset) Zir.Inst.Data {
+        return .{ .str_tok = .{
+            .start = @enumFromInt(start),
+            .src_tok = src_tok,
+        } };
+    }
+
+    fn encodeExtended(opcode: u16, small: u16, operand: u32) Zir.Inst.Data {
+        return .{ .extended = .{
+            .opcode = @enumFromInt(opcode),
+            .small = small,
+            .operand = operand,
+        } };
+    }
+
+    fn encodeDeclaration(src_node: u32, payload_index: u32) Zir.Inst.Data {
+        return .{ .declaration = .{
+            .src_node = @enumFromInt(src_node),
+            .payload_index = payload_index,
+        } };
     }
 };
 
@@ -334,15 +353,15 @@ pub const FuncBody = struct {
 
     /// Emit an instruction into the builder and track it as a body instruction.
     /// Returns the Ref pointing to this instruction.
-    fn emitBodyInst(self: *FuncBody, tag: Zir.Inst.Tag, data_words: [2]u32) !Zir.Inst.Ref {
-        const idx = try self.builder.addInst(tag, data_words);
+    fn emitBodyInst(self: *FuncBody, tag: Zir.Inst.Tag, inst_data: Zir.Inst.Data) !Zir.Inst.Ref {
+        const idx = try self.builder.addInst(tag, inst_data);
         try self.body_inst_indices.append(self.builder.gpa, idx);
         return Builder.instRef(idx);
     }
 
     /// Emit an instruction into the builder body but don't return a Ref (for void ops).
-    fn emitBodyInstVoid(self: *FuncBody, tag: Zir.Inst.Tag, data_words: [2]u32) !void {
-        const idx = try self.builder.addInst(tag, data_words);
+    fn emitBodyInstVoid(self: *FuncBody, tag: Zir.Inst.Tag, inst_data: Zir.Inst.Data) !void {
+        const idx = try self.builder.addInst(tag, inst_data);
         try self.body_inst_indices.append(self.builder.gpa, idx);
     }
 
@@ -577,10 +596,8 @@ test "Builder: function with int constant" {
     try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.int), result.instructions_tags[3]);
 
     // Verify the int value is 42 in the data
-    const data_u32s: []const [2]u32 = @alignCast(std.mem.bytesAsSlice([2]u32, result.instructions_data));
-    const int_data = data_u32s[3];
-    const int_value: u64 = @bitCast(int_data);
-    try std.testing.expectEqual(@as(u64, 42), int_value);
+    const data_items: []const Zir.Inst.Data = @alignCast(std.mem.bytesAsSlice(Zir.Inst.Data, result.instructions_data));
+    try std.testing.expectEqual(@as(u64, 42), data_items[3].int);
 }
 
 test "Builder: addInt returns valid Ref" {
@@ -747,19 +764,13 @@ test "Builder: struct_decl extended encoding" {
     const result = try builder.finalize();
 
     // Verify instruction 0 data encodes Extended.InstData correctly
-    const data_u32s: []const [2]u32 = @alignCast(std.mem.bytesAsSlice([2]u32, result.instructions_data));
-    const ext_data = data_u32s[0];
+    const data_items: []const Zir.Inst.Data = @alignCast(std.mem.bytesAsSlice(Zir.Inst.Data, result.instructions_data));
+    const ext = data_items[0].extended;
 
-    // First u32: lower 16 = opcode (struct_decl = 0), upper 16 = small (0x0004)
-    const opcode_bits: u16 = @truncate(ext_data[0]);
-    const small_bits: u16 = @truncate(ext_data[0] >> 16);
-    try std.testing.expectEqual(@as(u16, @intFromEnum(Zir.Inst.Extended.struct_decl)), opcode_bits);
-    try std.testing.expectEqual(@as(u16, 0x0004), small_bits);
-
-    // Second u32: operand = payload index pointing to StructDecl in extra
-    const payload_idx = ext_data[1];
+    try std.testing.expectEqual(Zir.Inst.Extended.struct_decl, ext.opcode);
+    try std.testing.expectEqual(@as(u16, 0x0004), ext.small);
     // StructDecl payload should be at index 26 (after all func/decl payloads)
-    try std.testing.expectEqual(@as(u32, 26), payload_idx);
+    try std.testing.expectEqual(@as(u32, 26), ext.operand);
 }
 
 test "Builder: addCall" {
