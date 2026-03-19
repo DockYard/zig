@@ -642,6 +642,49 @@ pub const FuncBody = struct {
         return self.emitBodyInst(.call, Builder.encodePlNode(.zero, payload_idx));
     }
 
+    /// Add element access by immediate index (tuple/array indexing).
+    /// ZIR tag: `.elem_val_imm`, data field: `elem_val_imm`.
+    pub fn addElemValImm(self: *FuncBody, operand: Zir.Inst.Ref, index: u32) !Zir.Inst.Ref {
+        return self.emitBodyInst(.elem_val_imm, .{ .elem_val_imm = .{
+            .operand = operand,
+            .idx = index,
+        } });
+    }
+
+    /// Add an anonymous array initialization (creates a tuple type).
+    /// ZIR tag: `.array_init_anon`, data: `pl_node`, payload: `MultiOp` + trailing Refs.
+    pub fn addArrayInitAnon(self: *FuncBody, elements: []const Zir.Inst.Ref) !Zir.Inst.Ref {
+        const b = self.builder;
+        const gpa = b.gpa;
+
+        // MultiOp payload: { operands_len: u32 }
+        // Trailing: operand Refs (as u32)
+        const payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @intCast(elements.len)); // operands_len
+
+        // Trailing operand Refs
+        for (elements) |elem| {
+            try b.extra.append(gpa, @intFromEnum(elem));
+        }
+
+        return self.emitBodyInst(.array_init_anon, Builder.encodePlNode(.zero, payload_idx));
+    }
+
+    /// Mark a value as used (prevents "result not used" compile error for void calls).
+    /// ZIR tag: `.ensure_result_used`, data field: `un_node`.
+    pub fn addEnsureResultUsed(self: *FuncBody, operand: Zir.Inst.Ref) !void {
+        try self.emitBodyInstVoid(.ensure_result_used, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Add a debug statement with line/column info.
+    /// ZIR tag: `.dbg_stmt`, data field: `dbg_stmt` (LineColumn).
+    pub fn addDbgStmt(self: *FuncBody, line: u32, column: u32) !void {
+        try self.emitBodyInstVoid(.dbg_stmt, .{ .dbg_stmt = .{
+            .line = line,
+            .column = column,
+        } });
+    }
+
     /// Add explicit ret_node (return with a value).
     pub fn addRetNode(self: *FuncBody, operand: Zir.Inst.Ref) !void {
         try self.emitBodyInstVoid(.ret_node, Builder.encodeUnNode(.zero, operand));
@@ -1301,4 +1344,106 @@ test "Builder: addIfElse" {
 
     // The result Ref should point to the block_inline instruction
     try std.testing.expectEqual(Builder.instRef(5), result_ref);
+}
+
+test "Builder: addElemValImm" {
+    var builder = try Builder.init(std.testing.allocator);
+    defer builder.deinit();
+
+    const body = try builder.beginFunction("test_elem", .void);
+    const tuple = try body.addInt(0); // placeholder for a tuple value
+    const elem = try body.addElemValImm(tuple, 2);
+    _ = elem;
+    try builder.endFunction(body);
+
+    const result = try builder.finalize();
+
+    // extended, declaration, restore_err_ret, int(0), elem_val_imm, ret_implicit, func, break_inline
+    try std.testing.expectEqual(@as(u32, 8), result.instructions_len);
+
+    // Verify the elem_val_imm instruction is at index 4
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.elem_val_imm), result.instructions_tags[4]);
+
+    // Verify elem_val_imm data fields
+    const data_items: []const Zir.Inst.Data = @alignCast(std.mem.bytesAsSlice(Zir.Inst.Data, result.instructions_data));
+    const elem_data = data_items[4].elem_val_imm;
+    try std.testing.expectEqual(tuple, elem_data.operand);
+    try std.testing.expectEqual(@as(u32, 2), elem_data.idx);
+}
+
+test "Builder: addArrayInitAnon" {
+    var builder = try Builder.init(std.testing.allocator);
+    defer builder.deinit();
+
+    const body = try builder.beginFunction("test_array", .void);
+    const val_a = try body.addInt(10);
+    const val_b = try body.addInt(20);
+    const val_c = try body.addInt(30);
+    const arr = try body.addArrayInitAnon(&.{ val_a, val_b, val_c });
+    _ = arr;
+    try builder.endFunction(body);
+
+    const result = try builder.finalize();
+
+    // extended, declaration, restore_err_ret, int(10), int(20), int(30), array_init_anon, ret_implicit, func, break_inline
+    try std.testing.expectEqual(@as(u32, 10), result.instructions_len);
+
+    // Verify the array_init_anon instruction is at index 6
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.array_init_anon), result.instructions_tags[6]);
+
+    // Verify MultiOp payload in extra
+    // extra[2] = operands_len = 3
+    try std.testing.expectEqual(@as(u32, 3), result.extra[2]);
+    // extra[3] = Ref for val_a
+    try std.testing.expectEqual(@intFromEnum(val_a), result.extra[3]);
+    // extra[4] = Ref for val_b
+    try std.testing.expectEqual(@intFromEnum(val_b), result.extra[4]);
+    // extra[5] = Ref for val_c
+    try std.testing.expectEqual(@intFromEnum(val_c), result.extra[5]);
+}
+
+test "Builder: addEnsureResultUsed" {
+    var builder = try Builder.init(std.testing.allocator);
+    defer builder.deinit();
+
+    const body = try builder.beginFunction("test_ensure", .void);
+    const val = try body.addInt(42);
+    try body.addEnsureResultUsed(val);
+    try builder.endFunction(body);
+
+    const result = try builder.finalize();
+
+    // extended, declaration, restore_err_ret, int(42), ensure_result_used, ret_implicit, func, break_inline
+    try std.testing.expectEqual(@as(u32, 8), result.instructions_len);
+
+    // Verify the ensure_result_used instruction is at index 4
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.ensure_result_used), result.instructions_tags[4]);
+
+    // Verify un_node data
+    const data_items: []const Zir.Inst.Data = @alignCast(std.mem.bytesAsSlice(Zir.Inst.Data, result.instructions_data));
+    const ensure_data = data_items[4].un_node;
+    try std.testing.expectEqual(val, ensure_data.operand);
+}
+
+test "Builder: addDbgStmt" {
+    var builder = try Builder.init(std.testing.allocator);
+    defer builder.deinit();
+
+    const body = try builder.beginFunction("test_dbg", .void);
+    try body.addDbgStmt(10, 5);
+    try builder.endFunction(body);
+
+    const result = try builder.finalize();
+
+    // extended, declaration, restore_err_ret, dbg_stmt, ret_implicit, func, break_inline
+    try std.testing.expectEqual(@as(u32, 7), result.instructions_len);
+
+    // Verify the dbg_stmt instruction is at index 3
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.dbg_stmt), result.instructions_tags[3]);
+
+    // Verify dbg_stmt data (LineColumn)
+    const data_items: []const Zir.Inst.Data = @alignCast(std.mem.bytesAsSlice(Zir.Inst.Data, result.instructions_data));
+    const dbg_data = data_items[3].dbg_stmt;
+    try std.testing.expectEqual(@as(u32, 10), dbg_data.line);
+    try std.testing.expectEqual(@as(u32, 5), dbg_data.column);
 }

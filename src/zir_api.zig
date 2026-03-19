@@ -786,6 +786,68 @@ pub export fn zir_builder_emit_call_ref(
     return @intFromEnum(ref);
 }
 
+/// Emit element access by immediate index (tuple/array indexing).
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_elem_val_imm(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+    index: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addElemValImm(operand_ref, index) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit an anonymous array initialization (creates a tuple type).
+/// `values_ptr` points to an array of `u32` Ref values, `values_len` is the count.
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_array_init_anon(
+    handle: ?*ZirBuilderHandle,
+    values_ptr: [*]const u32,
+    values_len: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const gpa = b.gpa;
+
+    const refs = gpa.alloc(Zir.Inst.Ref, values_len) catch return 0xFFFFFFFF;
+    defer gpa.free(refs);
+    for (0..values_len) |i| {
+        refs[i] = @enumFromInt(values_ptr[i]);
+    }
+
+    const ref = body.addArrayInitAnon(refs) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Mark a value as used (prevents "result not used" compile error).
+/// Returns 0 on success, -1 on error.
+pub export fn zir_builder_emit_ensure_result_used(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    body.addEnsureResultUsed(operand_ref) catch return -1;
+    return 0;
+}
+
+/// Emit a debug statement with line/column info.
+/// Returns 0 on success, -1 on error.
+pub export fn zir_builder_emit_dbg_stmt(
+    handle: ?*ZirBuilderHandle,
+    line: u32,
+    column: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    body.addDbgStmt(line, column) catch return -1;
+    return 0;
+}
+
 /// Emit an if-then-else expression.
 /// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
 pub export fn zir_builder_emit_if_else(
