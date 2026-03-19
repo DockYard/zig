@@ -528,23 +528,14 @@ pub const FuncBody = struct {
         var arg_inst_indices = std.ArrayListUnmanaged(u32).empty;
         defer arg_inst_indices.deinit(self.builder.gpa);
 
-        const ref_base = @intFromEnum(Zir.Inst.Index.ref_start_index);
         for (args) |arg| {
-            const ref_int = @intFromEnum(arg);
-            // Clone the value instruction (or emit int(0) as placeholder for named refs)
-            const val_idx = if (ref_int >= ref_base) blk: {
-                const orig_idx = ref_int - ref_base;
-                const tag: Zir.Inst.Tag = @enumFromInt(self.builder.tags.items[orig_idx]);
-                const data = self.builder.data.items[orig_idx];
-                break :blk try self.builder.addInst(tag, data);
-            } else blk: {
-                // Named ref (bool_true, void_value etc) — emit as int(0) placeholder
-                break :blk try self.builder.addInst(.int, Builder.encodeInt(0));
-            };
+            // Emit a fresh int(0) as the arg value instruction.
+            // The break_inline will carry the actual arg value as its operand.
+            const val_idx = try self.builder.addInst(.int, Builder.encodeInt(0));
             try arg_inst_indices.append(self.builder.gpa, val_idx);
 
-            // break_inline targeting the call, returning the value
-            const val_ref = if (ref_int >= ref_base) Builder.instRef(val_idx) else arg;
+            // break_inline targeting the call, returning the ORIGINAL arg value
+            const val_ref = arg;
             const brk_payload = try self.builder.addExtraSlice(&.{
                 0, // operand_src_node (can be 0 for synthetic ZIR)
                 call_inst_idx, // block_inst = call instruction
@@ -570,7 +561,35 @@ pub const FuncBody = struct {
             try self.builder.extra.append(self.builder.gpa, idx);
         }
 
-        return self.emitBodyInst(.call, Builder.encodePlNode(.zero, payload_idx));
+        const call_idx_u32: u32 = @intCast(self.builder.tags.items.len);
+        const call_result = try self.emitBodyInst(.call, Builder.encodePlNode(.zero, payload_idx));
+        // Debug: dump arg body layout
+        std.debug.print("addCallRef: call_inst={d} call_inst_precomputed={d} args_len={d}\n", .{ call_idx_u32, call_inst_idx, args_len });
+        for (arg_inst_indices.items, 0..) |idx, j| {
+            const t: Zir.Inst.Tag = @enumFromInt(self.builder.tags.items[idx]);
+            std.debug.print("  arg_body[{d}]: inst[{d}] tag={s}\n", .{ j, idx, @tagName(t) });
+        }
+        std.debug.print("  extra payload at {d}: flags={d} callee={d} total_extra={d}\n", .{ payload_idx, self.builder.extra.items[payload_idx], self.builder.extra.items[payload_idx + 1], self.builder.extra.items.len });
+        // Dump extra around payload
+        {
+            var ei: u32 = payload_idx;
+            while (ei < @min(payload_idx + 10, self.builder.extra.items.len)) : (ei += 1) {
+                std.debug.print("  extra[{d}]={d}\n", .{ ei, self.builder.extra.items[ei] });
+            }
+        }
+        // Also dump all instruction tags
+        std.debug.print("  Total instructions: {d}\n", .{self.builder.tags.items.len});
+        for (self.builder.tags.items, 0..) |t, ti| {
+            const tag: Zir.Inst.Tag = @enumFromInt(t);
+            std.debug.print("  inst[{d}]: {s}\n", .{ ti, @tagName(tag) });
+        }
+        for (0..args.len) |ai| {
+            std.debug.print("  arg_end[{d}]={d}\n", .{ ai, self.builder.extra.items[payload_idx + 2 + ai] });
+        }
+        for (0..arg_inst_indices.items.len) |ai| {
+            std.debug.print("  trailing[{d}]={d}\n", .{ ai, self.builder.extra.items[payload_idx + 2 + args.len + ai] });
+        }
+        return call_result;
     }
 
     /// Add a function call by name. Returns a Ref to the result.
