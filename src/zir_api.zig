@@ -183,6 +183,10 @@ fn addModuleImpl(ctx: *ZirContext, name: []const u8, source_path: []const u8) !v
     // Register as a dependency of the root module.
     const name_duped = try ar.dupe(u8, name);
     try ctx.root_mod.deps.put(ar, name_duped, mod);
+
+    logErr("addModule: registered '{s}' from '{s}' (deps count: {d})", .{
+        name, source_path, ctx.root_mod.deps.count(),
+    });
 }
 
 fn logErr(comptime fmt: []const u8, args: anytype) void {
@@ -712,6 +716,23 @@ pub export fn zir_builder_emit_call_ref(
     }
 
     const ref = body.addCallRef(callee_ref, refs) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit an if-then-else expression.
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_if_else(
+    handle: ?*ZirBuilderHandle,
+    condition: u32,
+    then_value: u32,
+    else_value: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const cond_ref: Zir.Inst.Ref = @enumFromInt(condition);
+    const then_ref: Zir.Inst.Ref = @enumFromInt(then_value);
+    const else_ref: Zir.Inst.Ref = @enumFromInt(else_value);
+    const ref = body.addIfElse(cond_ref, then_ref, else_ref) catch return 0xFFFFFFFF;
     return @intFromEnum(ref);
 }
 

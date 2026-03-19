@@ -4361,7 +4361,15 @@ pub fn addModuleErrorMsg(
 ) Allocator.Error!void {
     const gpa = eb.gpa;
     const ip = &zcu.intern_pool;
-    const err_src_loc = module_err_msg.src_loc.upgrade(zcu);
+    const err_src_loc = module_err_msg.src_loc.upgradeOrLost(zcu) orelse {
+        // Source location lost (e.g. ZIR-injected file). Emit a generic error.
+        try eb.addRootErrorMessage(.{
+            .msg = @intCast(try eb.addString(module_err_msg.msg)),
+            .src_loc = .none,
+            .notes_len = 0,
+        });
+        return;
+    };
     const err_source = err_src_loc.file_scope.getSource(zcu) catch |err| {
         return unableToLoadZcuFile(zcu, eb, err_src_loc.file_scope, err);
     };
@@ -4457,7 +4465,7 @@ pub fn addModuleErrorMsg(
 
     var last_note_loc: ?std.zig.Loc = null;
     for (module_err_msg.notes) |module_note| {
-        const note_src_loc = module_note.src_loc.upgrade(zcu);
+        const note_src_loc = module_note.src_loc.upgradeOrLost(zcu) orelse continue;
         const source = note_src_loc.file_scope.getSource(zcu) catch |err| {
             return unableToLoadZcuFile(zcu, eb, note_src_loc.file_scope, err);
         };
@@ -4510,7 +4518,7 @@ fn addReferenceTraceFrame(
     inlined: bool,
 ) error{ OutOfMemory, AlreadyReported }!void {
     const gpa = zcu.gpa;
-    const src = lazy_src.upgrade(zcu);
+    const src = lazy_src.upgradeOrLost(zcu) orelse return;
     const source = src.file_scope.getSource(zcu) catch |err| {
         try unableToLoadZcuFile(zcu, eb, src.file_scope, err);
         return error.AlreadyReported;
