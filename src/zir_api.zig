@@ -564,6 +564,24 @@ pub export fn zir_builder_end_func(handle: ?*ZirBuilderHandle) callconv(.c) i32 
     return 0;
 }
 
+/// Emit a function parameter declaration.
+/// `name_ptr` + `name_len` specify the parameter name.
+/// `type_ref` is a `Zir.Inst.Ref` value for the parameter type
+/// (e.g. `@intFromEnum(Zir.Inst.Ref.i64_type)`), or 0 for anytype.
+/// Returns `@intFromEnum(Ref)` to the param instruction, or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_param(
+    handle: ?*ZirBuilderHandle,
+    name_ptr: [*]const u8,
+    name_len: u32,
+    type_ref: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const tr: Zir.Inst.Ref = @enumFromInt(type_ref);
+    const ref = body.addParam(name_ptr[0..name_len], tr) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
 /// Emit an integer literal. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
 pub export fn zir_builder_emit_int(handle: ?*ZirBuilderHandle, value: i64) callconv(.c) u32 {
     const b = getBuilder(handle) orelse return 0xFFFFFFFF;
@@ -883,6 +901,100 @@ pub export fn zir_builder_emit_if_else(
     const then_ref: Zir.Inst.Ref = @enumFromInt(then_value);
     const else_ref: Zir.Inst.Ref = @enumFromInt(else_value);
     const ref = body.addIfElse(cond_ref, then_ref, else_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Enable or disable body tracking for the active function body.
+/// When disabled, emitted instructions are NOT added to the function's
+/// body_inst_indices — they exist in the instruction array but are only
+/// reachable from sub-body payloads (e.g. condbr_inline branches).
+pub export fn zir_builder_set_body_tracking(
+    handle: ?*ZirBuilderHandle,
+    enabled: bool,
+) callconv(.c) void {
+    const b = getBuilder(handle) orelse return;
+    const body = b.active_body orelse return;
+    body.body_tracking = enabled;
+}
+
+/// Return the current instruction count in the builder.
+/// Used to track instruction index ranges when body tracking is off.
+pub export fn zir_builder_get_inst_count(
+    handle: ?*ZirBuilderHandle,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0;
+    const body = b.active_body orelse return 0;
+    return body.getInstCount();
+}
+
+/// Thread-local capture buffer used by begin_capture / end_capture.
+/// Only one capture session at a time per builder.
+var capture_buf: std.ArrayListUnmanaged(u32) = .{};
+
+/// Begin capturing would-be-body instruction indices. Disables body tracking
+/// and directs top-level instruction indices into an internal capture buffer.
+/// Call `zir_builder_end_capture` to retrieve the collected indices and
+/// re-enable body tracking.
+pub export fn zir_builder_begin_capture(
+    handle: ?*ZirBuilderHandle,
+) callconv(.c) void {
+    const b = getBuilder(handle) orelse return;
+    const body = b.active_body orelse return;
+    capture_buf.clearRetainingCapacity();
+    body.body_tracking = false;
+    body.non_body_capture = &capture_buf;
+}
+
+/// End capture mode: re-enables body tracking and returns a pointer to the
+/// captured instruction indices. The returned pointer is valid until the
+/// next call to `zir_builder_begin_capture`.
+/// `out_len` receives the number of captured indices.
+pub export fn zir_builder_end_capture(
+    handle: ?*ZirBuilderHandle,
+    out_len: *u32,
+) callconv(.c) [*]const u32 {
+    const b = getBuilder(handle) orelse {
+        out_len.* = 0;
+        return @as([*]const u32, @ptrCast(&capture_buf.items));
+    };
+    const body = b.active_body orelse {
+        out_len.* = 0;
+        return @as([*]const u32, @ptrCast(&capture_buf.items));
+    };
+    body.body_tracking = true;
+    body.non_body_capture = null;
+    out_len.* = @intCast(capture_buf.items.len);
+    return capture_buf.items.ptr;
+}
+
+/// Emit an if-then-else with full branch instruction bodies.
+/// `then_insts_ptr`/`then_insts_len` specify raw instruction indices for the
+/// then branch (emitted with body tracking off). `else_insts_ptr`/`else_insts_len`
+/// do the same for the else branch. Only the taken branch's instructions are
+/// analyzed by Sema.
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_if_else_bodies(
+    handle: ?*ZirBuilderHandle,
+    condition: u32,
+    then_insts_ptr: [*]const u32,
+    then_insts_len: u32,
+    then_result: u32,
+    else_insts_ptr: [*]const u32,
+    else_insts_len: u32,
+    else_result: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const cond_ref: Zir.Inst.Ref = @enumFromInt(condition);
+    const then_ref: Zir.Inst.Ref = @enumFromInt(then_result);
+    const else_ref: Zir.Inst.Ref = @enumFromInt(else_result);
+    const ref = body.addIfElseWithBodies(
+        cond_ref,
+        then_insts_ptr[0..then_insts_len],
+        then_ref,
+        else_insts_ptr[0..else_insts_len],
+        else_ref,
+    ) catch return 0xFFFFFFFF;
     return @intFromEnum(ref);
 }
 

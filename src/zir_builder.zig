@@ -50,6 +50,7 @@ pub const Builder = struct {
         self.decl_indices.deinit(self.gpa);
         if (self.active_body) |body| {
             body.body_inst_indices.deinit(self.gpa);
+            body.param_inst_indices.deinit(self.gpa);
             self.gpa.destroy(body);
         }
     }
@@ -113,6 +114,7 @@ pub const Builder = struct {
         body.* = FuncBody{
             .builder = self,
             .body_inst_indices = .{},
+            .param_inst_indices = .{},
             .name = name,
             .decl_inst = decl_inst,
             .restore_inst = restore_inst,
@@ -215,13 +217,19 @@ pub const Builder = struct {
         const name_idx = try self.internString(body.name);
         try self.extra.append(self.gpa, name_idx);
 
-        // value_body_len: 2 (func + break_inline)
-        try self.extra.append(self.gpa, 2);
+        // value_body_len: num_params + 2 (params... + func + break_inline)
+        const num_params: u32 = @intCast(body.param_inst_indices.items.len);
+        try self.extra.append(self.gpa, num_params + 2);
 
-        // value_body[0]: func instruction index
+        // value_body: param instructions first, then func and break_inline
+        for (body.param_inst_indices.items) |param_idx| {
+            try self.extra.append(self.gpa, param_idx);
+        }
+
+        // value_body[num_params]: func instruction index
         try self.extra.append(self.gpa, func_inst);
 
-        // value_body[1]: break_inline instruction index
+        // value_body[num_params+1]: break_inline instruction index
         try self.extra.append(self.gpa, break_inst);
 
         // Fix up declaration instruction with real payload index
@@ -232,6 +240,7 @@ pub const Builder = struct {
 
         // Clean up
         body.body_inst_indices.deinit(self.gpa);
+        body.param_inst_indices.deinit(self.gpa);
         self.gpa.destroy(body);
         self.active_body = null;
     }
@@ -377,6 +386,8 @@ pub const ReturnType = enum(u32) {
     f16_type = @intFromEnum(Zir.Inst.Ref.f16_type),
     f32_type = @intFromEnum(Zir.Inst.Ref.f32_type),
     f64_type = @intFromEnum(Zir.Inst.Ref.f64_type),
+    slice_const_u8_type = @intFromEnum(Zir.Inst.Ref.slice_const_u8_type),
+    _,
 };
 
 /// Accumulates function body instructions. Instructions are emitted eagerly
@@ -386,24 +397,47 @@ pub const FuncBody = struct {
     builder: *Builder,
     /// Tracks which instruction indices belong to this function's body
     body_inst_indices: std.ArrayListUnmanaged(u32),
+    /// Tracks param instruction indices for the declaration value body
+    param_inst_indices: std.ArrayListUnmanaged(u32),
     name: []const u8,
     decl_inst: u32,
     restore_inst: u32,
     has_explicit_return: bool,
     ret_type: ReturnType,
+    /// When false, emitBodyInst/emitBodyInstVoid still emit instructions via
+    /// addInst but do NOT append the index to body_inst_indices. This allows
+    /// emitting instructions that live inside sub-bodies (e.g. condbr branches)
+    /// without polluting the function's main body.
+    body_tracking: bool = true,
+    /// When non-null AND body_tracking is false, "would-be body" instruction
+    /// indices are captured here instead of being discarded. This lets callers
+    /// collect exactly the top-level instructions for a branch body, excluding
+    /// internal sub-body instructions (e.g. call arg bodies).
+    non_body_capture: ?*std.ArrayListUnmanaged(u32) = null,
 
-    /// Emit an instruction into the builder and track it as a body instruction.
+    /// Emit an instruction into the builder and track it as a body instruction
+    /// (unless body_tracking is false, in which case it may be captured via
+    /// non_body_capture).
     /// Returns the Ref pointing to this instruction.
     fn emitBodyInst(self: *FuncBody, tag: Zir.Inst.Tag, inst_data: Zir.Inst.Data) !Zir.Inst.Ref {
         const idx = try self.builder.addInst(tag, inst_data);
-        try self.body_inst_indices.append(self.builder.gpa, idx);
+        if (self.body_tracking) {
+            try self.body_inst_indices.append(self.builder.gpa, idx);
+        } else if (self.non_body_capture) |capture| {
+            try capture.append(self.builder.gpa, idx);
+        }
         return Builder.instRef(idx);
     }
 
     /// Emit an instruction into the builder body but don't return a Ref (for void ops).
+    /// Respects body_tracking flag and non_body_capture.
     fn emitBodyInstVoid(self: *FuncBody, tag: Zir.Inst.Tag, inst_data: Zir.Inst.Data) !void {
         const idx = try self.builder.addInst(tag, inst_data);
-        try self.body_inst_indices.append(self.builder.gpa, idx);
+        if (self.body_tracking) {
+            try self.body_inst_indices.append(self.builder.gpa, idx);
+        } else if (self.non_body_capture) |capture| {
+            try capture.append(self.builder.gpa, idx);
+        }
     }
 
     /// Add an integer literal instruction. Returns a Ref to the result.
@@ -438,6 +472,64 @@ pub const FuncBody = struct {
     pub fn addVoidValue(self: *FuncBody) Zir.Inst.Ref {
         _ = self;
         return .void_value;
+    }
+
+    /// Add a function parameter declaration. This emits a `.param` instruction
+    /// that is tracked separately from body instructions — it will be placed
+    /// in the declaration value body (before `func` + `break_inline`).
+    ///
+    /// `name` is the parameter name (e.g. "a").
+    /// `type_ref` is a `Zir.Inst.Ref` for the parameter type (e.g. `.i64_type`).
+    ///   Use `.none` or `.generic_poison` for anytype.
+    /// Returns a Ref to the param instruction, which can be used in the function body.
+    pub fn addParam(self: *FuncBody, name: []const u8, type_ref: Zir.Inst.Ref) !Zir.Inst.Ref {
+        const b = self.builder;
+        const name_idx = try b.internString(name);
+
+        if (type_ref == .none) {
+            // Anytype parameter: use .param_anytype tag with .str_tok data
+            // Data: { start: NullTerminatedString (name), src_tok: TokenOffset }
+            const idx = try b.addInst(.param_anytype, Builder.encodeStrTok(name_idx, .zero));
+
+            // Track as a param instruction (goes in declaration value body, not function body)
+            try self.param_inst_indices.append(b.gpa, idx);
+            return Builder.instRef(idx);
+        }
+
+        // Typed parameter: use .param tag with .pl_tok data.
+        //
+        // The type body is a list of instruction indices that Sema analyzes inline
+        // to produce the type. For a simple built-in type like i64, we emit a single
+        // break_inline instruction that yields the type Ref.
+        //
+        // We pre-compute the param instruction index (it will be emitted after the
+        // break_inline) so the break_inline can reference it.
+        const param_inst_idx: u32 = @intCast(b.tags.items.len + 1); // +1 for the break_inline we emit first
+
+        // Emit the break_inline that yields the type ref.
+        // Break payload in extra: { operand_src_node: OptionalOffset, block_inst: Index }
+        const break_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, @bitCast(@as(i32, std.math.maxInt(i32)))); // operand_src_node = none
+        try b.extra.append(b.gpa, param_inst_idx); // block_inst = the param instruction
+        const break_idx = try b.addInst(.break_inline, Builder.encodeBreak(type_ref, break_payload_idx));
+
+        // Param payload in extra:
+        //   name: NullTerminatedString
+        //   type: Param.Type = packed struct(u32) { body_len: u31, is_generic: bool }
+        //   [trailing instruction indices for the type body]
+        const payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, name_idx); // name
+        try b.extra.append(b.gpa, 1); // type: body_len=1, is_generic=false
+        try b.extra.append(b.gpa, break_idx); // body[0] = break_inline instruction index
+
+        // .param uses .pl_tok data
+        const idx = try b.addInst(.param, Builder.encodePlTok(.zero, payload_idx));
+        std.debug.assert(idx == param_inst_idx);
+
+        // Track as a param instruction (goes in declaration value body, not function body)
+        try self.param_inst_indices.append(b.gpa, idx);
+
+        return Builder.instRef(idx);
     }
 
     /// Add an enum literal instruction. Returns a Ref to the result.
@@ -521,34 +613,28 @@ pub const FuncBody = struct {
     /// Emit a call using a Ref as the callee (e.g. from import + field access).
     /// Returns a Ref to the result.
     ///
-    /// For each arg, clones the original instruction as a separate non-body
-    /// instruction for the arg body (Sema requires arg body instructions to
-    /// be distinct from the function body).
+    /// Each arg body is a single break_inline instruction that yields the arg
+    /// value. The break_inline targets the call instruction.
     pub fn addCallRef(self: *FuncBody, callee: Zir.Inst.Ref, args: []const Zir.Inst.Ref) !Zir.Inst.Ref {
         // Pre-compute where the call instruction will be:
-        // After 2 non-body instructions per arg (value_clone + break_inline)
-        const call_inst_idx: u32 = @intCast(self.builder.tags.items.len + 2 * args.len);
+        // After 1 non-body instruction per arg (break_inline), then 1 dbg_stmt
+        const call_inst_idx: u32 = @intCast(self.builder.tags.items.len + args.len + 1);
 
-        // Each arg body = [value_clone, break_inline(call, value_ref)]
-        // Matching AstGen's exact pattern.
+        // Each arg body = [break_inline(call, arg_value)]
         var arg_inst_indices = std.ArrayListUnmanaged(u32).empty;
         defer arg_inst_indices.deinit(self.builder.gpa);
 
         for (args) |arg| {
-            // Emit a fresh int(0) as the arg value instruction.
-            // The break_inline will carry the actual arg value as its operand.
-            const val_idx = try self.builder.addInst(.int, Builder.encodeInt(0));
-            try arg_inst_indices.append(self.builder.gpa, val_idx);
-
-            // break_inline targeting the call, returning the ORIGINAL arg value
-            const val_ref = arg;
             const brk_payload = try self.builder.addExtraSlice(&.{
-                0, // operand_src_node (can be 0 for synthetic ZIR)
+                @bitCast(@as(i32, std.math.maxInt(i32))), // operand_src_node = none
                 call_inst_idx, // block_inst = call instruction
             });
-            const brk_idx = try self.builder.addInst(.break_inline, Builder.encodeBreak(val_ref, brk_payload));
+            const brk_idx = try self.builder.addInst(.break_inline, Builder.encodeBreak(arg, brk_payload));
             try arg_inst_indices.append(self.builder.gpa, brk_idx);
         }
+
+        // Sema requires a dbg_stmt immediately before the call instruction.
+        try self.emitBodyInstVoid(.dbg_stmt, .{ .dbg_stmt = .{ .line = 0, .column = 0 } });
 
         // Call payload
         const payload_idx: u32 = @intCast(self.builder.extra.items.len);
@@ -557,45 +643,16 @@ pub const FuncBody = struct {
         try self.builder.extra.append(self.builder.gpa, flags);
         try self.builder.extra.append(self.builder.gpa, @intFromEnum(callee));
 
-        // arg_end: cumulative, each arg body has 2 instructions
-        // arg_end[i] = args_len + 2*(i+1)
+        // arg_end: cumulative, each arg body has 1 instruction
         for (0..args.len) |i| {
-            try self.builder.extra.append(self.builder.gpa, @as(u32, @intCast(args_len + 2 * (i + 1))));
+            try self.builder.extra.append(self.builder.gpa, @as(u32, @intCast(args_len + (i + 1))));
         }
 
         for (arg_inst_indices.items) |idx| {
             try self.builder.extra.append(self.builder.gpa, idx);
         }
 
-        const call_idx_u32: u32 = @intCast(self.builder.tags.items.len);
-        const call_result = try self.emitBodyInst(.call, Builder.encodePlNode(.zero, payload_idx));
-        // Debug: dump arg body layout
-        std.debug.print("addCallRef: call_inst={d} call_inst_precomputed={d} args_len={d}\n", .{ call_idx_u32, call_inst_idx, args_len });
-        for (arg_inst_indices.items, 0..) |idx, j| {
-            const t: Zir.Inst.Tag = @enumFromInt(self.builder.tags.items[idx]);
-            std.debug.print("  arg_body[{d}]: inst[{d}] tag={s}\n", .{ j, idx, @tagName(t) });
-        }
-        std.debug.print("  extra payload at {d}: flags={d} callee={d} total_extra={d}\n", .{ payload_idx, self.builder.extra.items[payload_idx], self.builder.extra.items[payload_idx + 1], self.builder.extra.items.len });
-        // Dump extra around payload
-        {
-            var ei: u32 = payload_idx;
-            while (ei < @min(payload_idx + 10, self.builder.extra.items.len)) : (ei += 1) {
-                std.debug.print("  extra[{d}]={d}\n", .{ ei, self.builder.extra.items[ei] });
-            }
-        }
-        // Also dump all instruction tags
-        std.debug.print("  Total instructions: {d}\n", .{self.builder.tags.items.len});
-        for (self.builder.tags.items, 0..) |t, ti| {
-            const tag: Zir.Inst.Tag = @enumFromInt(t);
-            std.debug.print("  inst[{d}]: {s}\n", .{ ti, @tagName(tag) });
-        }
-        for (0..args.len) |ai| {
-            std.debug.print("  arg_end[{d}]={d}\n", .{ ai, self.builder.extra.items[payload_idx + 2 + ai] });
-        }
-        for (0..arg_inst_indices.items.len) |ai| {
-            std.debug.print("  trailing[{d}]={d}\n", .{ ai, self.builder.extra.items[payload_idx + 2 + args.len + ai] });
-        }
-        return call_result;
+        return self.emitBodyInst(.call, Builder.encodePlNode(.zero, payload_idx));
     }
 
     /// Add a function call by name. Returns a Ref to the result.
@@ -604,31 +661,24 @@ pub const FuncBody = struct {
         const name_start = try self.builder.internString(callee_name);
         const callee_ref = try self.emitBodyInst(.decl_val, Builder.encodeStrTok(name_start, .zero));
 
-        // Pre-compute call instruction index (after decl_val + 2*N non-body instructions)
-        const call_inst_idx: u32 = @intCast(self.builder.tags.items.len + 2 * @as(u32, @intCast(args.len)));
+        // Pre-compute call instruction index (after decl_val + N non-body break_inline + 1 dbg_stmt)
+        const call_inst_idx: u32 = @intCast(self.builder.tags.items.len + @as(u32, @intCast(args.len)) + 1);
 
-        // Each arg body = [value_clone, break_inline] matching AstGen pattern
+        // Each arg body = [break_inline(call, arg_value)]
         var arg_inst_indices = std.ArrayListUnmanaged(u32).empty;
         defer arg_inst_indices.deinit(self.builder.gpa);
 
-        const ref_base = @intFromEnum(Zir.Inst.Index.ref_start_index);
         for (args) |arg| {
-            const ref_int = @intFromEnum(arg);
-            const val_idx = if (ref_int >= ref_base) blk: {
-                const orig_idx = ref_int - ref_base;
-                const tag: Zir.Inst.Tag = @enumFromInt(self.builder.tags.items[orig_idx]);
-                const data = self.builder.data.items[orig_idx];
-                break :blk try self.builder.addInst(tag, data);
-            } else blk: {
-                break :blk try self.builder.addInst(.int, Builder.encodeInt(0));
-            };
-            try arg_inst_indices.append(self.builder.gpa, val_idx);
-
-            const val_ref = if (ref_int >= ref_base) Builder.instRef(val_idx) else arg;
-            const brk_payload = try self.builder.addExtraSlice(&.{ 0, call_inst_idx });
-            const brk_idx = try self.builder.addInst(.break_inline, Builder.encodeBreak(val_ref, brk_payload));
+            const brk_payload = try self.builder.addExtraSlice(&.{
+                @bitCast(@as(i32, std.math.maxInt(i32))), // operand_src_node = none
+                call_inst_idx, // block_inst = call instruction
+            });
+            const brk_idx = try self.builder.addInst(.break_inline, Builder.encodeBreak(arg, brk_payload));
             try arg_inst_indices.append(self.builder.gpa, brk_idx);
         }
+
+        // Sema requires a dbg_stmt immediately before the call instruction.
+        try self.emitBodyInstVoid(.dbg_stmt, .{ .dbg_stmt = .{ .line = 0, .column = 0 } });
 
         const payload_idx: u32 = @intCast(self.builder.extra.items.len);
         const args_len: u32 = @intCast(args.len);
@@ -636,9 +686,9 @@ pub const FuncBody = struct {
         try self.builder.extra.append(self.builder.gpa, flags);
         try self.builder.extra.append(self.builder.gpa, @intFromEnum(callee_ref));
 
-        // arg_end: cumulative, 2 instructions per arg
+        // arg_end: cumulative, 1 instruction per arg
         for (0..args.len) |i| {
-            try self.builder.extra.append(self.builder.gpa, @as(u32, @intCast(args_len + 2 * (i + 1))));
+            try self.builder.extra.append(self.builder.gpa, @as(u32, @intCast(args_len + (i + 1))));
         }
 
         for (arg_inst_indices.items) |idx| {
@@ -770,6 +820,83 @@ pub const FuncBody = struct {
         // The block_inline instruction result is the value produced by
         // whichever break_inline executes.
         return Builder.instRef(block_idx);
+    }
+
+    /// Add an if-then-else expression with full branch bodies.
+    /// Unlike addIfElse which only takes final values, this method accepts
+    /// instruction index ranges for each branch. Those instructions are placed
+    /// INSIDE the condbr_inline's then/else bodies so that only the taken
+    /// branch is analyzed by Sema (and thus only the taken branch executes).
+    ///
+    /// `then_insts` / `else_insts` are raw instruction indices (from addInst)
+    /// that were emitted with body_tracking=false. They are NOT in the
+    /// function's body_inst_indices and will only be referenced from within
+    /// the condbr_inline payload.
+    pub fn addIfElseWithBodies(
+        self: *FuncBody,
+        condition: Zir.Inst.Ref,
+        then_insts: []const u32,
+        then_result: Zir.Inst.Ref,
+        else_insts: []const u32,
+        else_result: Zir.Inst.Ref,
+    ) !Zir.Inst.Ref {
+        const b = self.builder;
+        const gpa = b.gpa;
+
+        // then body = then_insts... + break_inline(block, then_result)
+        // else body = else_insts... + break_inline(block, else_result)
+        const then_body_len: u32 = @intCast(then_insts.len + 1);
+        const else_body_len: u32 = @intCast(else_insts.len + 1);
+
+        // 1. Emit block_inline with placeholder payload.
+        const block_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, 1); // body_len = 1 (the condbr_inline)
+        const block_body_slot: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, 0); // placeholder for condbr_inline index
+
+        // block_inline IS a body instruction of the function.
+        const block_idx = try b.addInst(.block_inline, Builder.encodePlNode(.zero, block_payload_idx));
+        try self.body_inst_indices.append(gpa, block_idx);
+
+        // 2. Emit break_inline for then branch (NOT a body instruction).
+        const break_then_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @bitCast(@as(i32, std.math.maxInt(i32)))); // operand_src_node = none
+        try b.extra.append(gpa, block_idx); // block_inst
+        const break_then_idx = try b.addInst(.break_inline, Builder.encodeBreak(then_result, break_then_payload_idx));
+
+        // 3. Emit break_inline for else branch (NOT a body instruction).
+        const break_else_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @bitCast(@as(i32, std.math.maxInt(i32)))); // operand_src_node = none
+        try b.extra.append(gpa, block_idx); // block_inst
+        const break_else_idx = try b.addInst(.break_inline, Builder.encodeBreak(else_result, break_else_payload_idx));
+
+        // 4. Emit condbr_inline with full branch bodies.
+        const condbr_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @intFromEnum(condition)); // condition
+        try b.extra.append(gpa, then_body_len); // then_body_len
+        try b.extra.append(gpa, else_body_len); // else_body_len
+        // then body: branch instructions + break
+        for (then_insts) |idx| {
+            try b.extra.append(gpa, idx);
+        }
+        try b.extra.append(gpa, break_then_idx);
+        // else body: branch instructions + break
+        for (else_insts) |idx| {
+            try b.extra.append(gpa, idx);
+        }
+        try b.extra.append(gpa, break_else_idx);
+        const condbr_idx = try b.addInst(.condbr_inline, Builder.encodePlNode(.zero, condbr_payload_idx));
+
+        // 5. Fix up block_inline's body to point to condbr_inline.
+        b.extra.items[block_body_slot] = condbr_idx;
+
+        return Builder.instRef(block_idx);
+    }
+
+    /// Return the current instruction count in the builder.
+    /// Used by callers to track instruction index ranges for branch bodies.
+    pub fn getInstCount(self: *FuncBody) u32 {
+        return @intCast(self.builder.tags.items.len);
     }
 };
 
@@ -1085,7 +1212,7 @@ test "Builder: addCall" {
 
     const result = try builder.finalize();
 
-    // extended, declaration, restore_err_ret, int(42), decl_val("some_func"), int(clone), break_inline(arg), call, ret_implicit, func, break_inline
+    // extended, declaration, restore_err_ret, int(42), decl_val("some_func"), break_inline(arg), dbg_stmt, call, ret_implicit, func, break_inline
     try std.testing.expectEqual(@as(u32, 11), result.instructions_len);
     try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.decl_val), result.instructions_tags[4]);
     try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.call), result.instructions_tags[7]);
@@ -1272,7 +1399,7 @@ test "Builder: addCallRef" {
 
     const result = try builder.finalize();
 
-    // extended, declaration, restore_err_ret, import, field_val, int(42), int(clone), break_inline(arg), call, ret_implicit, func, break_inline
+    // extended, declaration, restore_err_ret, import, field_val, int(42), break_inline(arg), dbg_stmt, call, ret_implicit, func, break_inline
     try std.testing.expectEqual(@as(u32, 12), result.instructions_len);
 
     try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.import), result.instructions_tags[3]);
