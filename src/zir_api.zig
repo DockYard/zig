@@ -800,6 +800,18 @@ pub export fn zir_builder_emit_elem_val_imm(
     return @intFromEnum(ref);
 }
 
+/// Emit @typeInfo(operand). Returns the type info value.
+pub export fn zir_builder_emit_type_info(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addTypeInfo(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
 /// Emit an anonymous array initialization (creates a tuple type).
 /// `values_ptr` points to an array of `u32` Ref values, `values_len` is the count.
 /// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.

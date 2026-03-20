@@ -648,6 +648,12 @@ pub const FuncBody = struct {
         return self.emitBodyInst(.call, Builder.encodePlNode(.zero, payload_idx));
     }
 
+    /// Emit @typeInfo(operand). Returns a Ref to the type info value.
+    /// ZIR tag: .type_info, data field: .un_node
+    pub fn addTypeInfo(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.type_info, Builder.encodeUnNode(.zero, operand));
+    }
+
     /// Add element access by immediate index (tuple/array indexing).
     /// ZIR tag: `.elem_val_imm`, data field: `elem_val_imm`.
     pub fn addElemValImm(self: *FuncBody, operand: Zir.Inst.Ref, index: u32) !Zir.Inst.Ref {
