@@ -466,6 +466,12 @@ pub const FuncBody = struct {
         return self.emitBodyInst(.bool_not, Builder.encodeUnNode(.zero, operand));
     }
 
+    /// Emit @TypeOf(operand). Returns a Ref to the type.
+    /// ZIR tag: .typeof, data field: .un_node
+    pub fn addTypeOf(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.typeof, Builder.encodeUnNode(.zero, operand));
+    }
+
     /// Emit `@import("module_name")`. Returns a Ref to the imported module.
     /// Uses the `.import` instruction with `.pl_tok` data and `Import` payload.
     pub fn addImport(self: *FuncBody, module_name: []const u8) !Zir.Inst.Ref {
@@ -1446,4 +1452,28 @@ test "Builder: addDbgStmt" {
     const dbg_data = data_items[3].dbg_stmt;
     try std.testing.expectEqual(@as(u32, 10), dbg_data.line);
     try std.testing.expectEqual(@as(u32, 5), dbg_data.column);
+}
+
+test "Builder: addTypeOf" {
+    var builder = try Builder.init(std.testing.allocator);
+    defer builder.deinit();
+
+    const body = try builder.beginFunction("test_typeof", .void);
+    const val = try body.addInt(42);
+    const ty = try body.addTypeOf(val);
+    _ = ty;
+    try builder.endFunction(body);
+
+    const result = try builder.finalize();
+
+    // extended, declaration, restore_err_ret, int(42), typeof, ret_implicit, func, break_inline
+    try std.testing.expectEqual(@as(u32, 8), result.instructions_len);
+
+    // Verify the typeof instruction is at index 4
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.typeof), result.instructions_tags[4]);
+
+    // Verify un_node data — operand should be the int(42) Ref
+    const data_items: []const Zir.Inst.Data = @alignCast(std.mem.bytesAsSlice(Zir.Inst.Data, result.instructions_data));
+    const typeof_data = data_items[4].un_node;
+    try std.testing.expectEqual(val, typeof_data.operand);
 }

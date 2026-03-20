@@ -848,6 +848,15 @@ pub export fn zir_builder_emit_dbg_stmt(
     return 0;
 }
 
+/// Emit @TypeOf(operand). Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_typeof(handle: ?*ZirBuilderHandle, operand: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addTypeOf(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
 /// Emit an if-then-else expression.
 /// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
 pub export fn zir_builder_emit_if_else(
