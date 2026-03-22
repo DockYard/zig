@@ -614,7 +614,7 @@ pub inline fn callMain() u8 {
     // Zap builder mode: if the root module declares zap_builder_entry,
     // call it with a constructed Zap.Env from os_argv and serialize the
     // returned Zap.Manifest to stdout.
-    if (@hasDecl(root, "zap_builder_entry") and @hasDecl(root, "zap_runtime")) {
+    if (comptime @hasDecl(root, "zap_builder_entry")) {
         return callZapBuilder();
     }
 
@@ -657,55 +657,11 @@ pub inline fn callMain() u8 {
     }
 }
 
-/// Zap builder runtime: constructs Zap.Env from os_argv, calls the builder
-/// entry point, and serializes the returned Zap.Manifest to stdout.
-///
-/// The root module must declare:
-///   pub const zap_builder_entry = <function pointer>;
-///
-/// The entry function signature is: fn(env) -> manifest_struct
-/// where env and manifest are anonymous Zig structs with known field names.
+/// Zap builder runtime: calls the ZIR-emitted zap_builder_entry function
+/// which handles env construction, manifest call, and output serialization
+/// internally (since it has access to @import("zap_runtime")).
 inline fn callZapBuilder() u8 {
-    const entry_fn = root.zap_builder_entry;
-    const argv = std.os.argv;
-
-    // Parse argv: builder <target> <os> <arch> [-Dkey=value...]
-    // argv[0] = binary path, argv[1] = target, argv[2] = os, argv[3] = arch
-    const zap_runtime = @import("zap_runtime");
-    const atom_intern = zap_runtime.atomIntern;
-
-    const target_atom = if (argv.len > 1) atom_intern(argv[1], @intCast(std.mem.len(argv[1]))) else 0;
-    const os_atom = if (argv.len > 2) atom_intern(argv[2], @intCast(std.mem.len(argv[2]))) else 0;
-    const arch_atom = if (argv.len > 3) atom_intern(argv[3], @intCast(std.mem.len(argv[3]))) else 0;
-
-    // Construct env struct matching Zap.Env fields
-    const env = .{
-        .target = target_atom,
-        .os = os_atom,
-        .arch = arch_atom,
-    };
-
-    // Call the builder entry point
-    const manifest = entry_fn(env);
-
-    // Serialize manifest fields to stdout as key=value lines
-    const stdout = std.fs.File.stdout().deprecatedWriter();
-    inline for (@typeInfo(@TypeOf(manifest)).@"struct".fields) |field| {
-        const value = @field(manifest, field.name);
-        const T = @TypeOf(value);
-        if (T == []const u8) {
-            stdout.print("{s}={s}\n", .{ field.name, value }) catch {};
-        } else if (T == u32) {
-            // Atom ID — convert to string name
-            const name = zap_runtime.atomToString(value);
-            stdout.print("{s}={s}\n", .{ field.name, name }) catch {};
-        } else if (@typeInfo(T) == .int) {
-            stdout.print("{s}={d}\n", .{ field.name, value }) catch {};
-        } else if (T == bool) {
-            stdout.print("{s}={}\n", .{ field.name, value }) catch {};
-        }
-    }
-
+    root.zap_builder_entry();
     return 0;
 }
 

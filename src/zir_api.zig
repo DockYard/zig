@@ -121,9 +121,40 @@ pub export fn zir_compilation_update(ctx: *ZirContext) i32 {
     defer prog_node.end();
     ctx.compilation.update(prog_node) catch |err| {
         logErr("update failed: {s}", .{@errorName(err)});
+        // Print detailed errors
+        var error_bundle = ctx.compilation.getAllErrorsAlloc() catch |e| {
+            logErr("getAllErrorsAlloc failed: {s}", .{@errorName(e)});
+            return -1;
+        };
+        defer error_bundle.deinit(ctx.gpa);
+        const count = error_bundle.errorMessageCount();
+        logErr("error count from update catch: {d}", .{count});
+        if (count > 0) {
+            const stderr = std.debug.lockStderrWriter(&.{});
+            defer std.debug.unlockStderrWriter();
+            error_bundle.renderToWriter(.{
+                .ttyconf = .no_color,
+                .include_source_line = false,
+                .include_reference_trace = false,
+            }, stderr) catch |render_err| {
+                logErr("renderToWriter failed: {s}", .{@errorName(render_err)});
+            };
+        } else {
+            logErr("no error messages in bundle despite error count", .{});
+        }
         return -1;
     };
-    if (ctx.compilation.anyErrors()) return -1;
+    if (ctx.compilation.anyErrors()) {
+        var error_bundle = ctx.compilation.getAllErrorsAlloc() catch |e| {
+            logErr("getAllErrorsAlloc failed: {s}", .{@errorName(e)});
+            return -1;
+        };
+        defer error_bundle.deinit(ctx.gpa);
+        const count = error_bundle.errorMessageCount();
+        logErr("compilation has {d} error(s)", .{count});
+        error_bundle.renderToStdErr(.{ .ttyconf = .no_color });
+        return -1;
+    }
     return 0;
 }
 
