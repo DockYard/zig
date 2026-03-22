@@ -548,12 +548,9 @@ fn createImpl(
     const stub_dir = try std.fmt.allocPrint(ar, ".zap-cache/{s}.zig", .{root_name_str});
     const stub_src_name = try std.fmt.allocPrint(ar, "{s}.zig", .{root_name_str});
 
+    // Builder mode uses a comptime stub since the entry point is custom (not main).
     const stub_source = if (ctx.is_builder)
-        // Builder mode: the stub is replaced by ZIR injection, but needs
-        // to parse as valid Zig for error reporting. The actual builder
-        // runtime behavior is handled by the injected ZIR which emits
-        // the entry point function as "main".
-        "pub fn main() void {}\n"
+        "comptime {}\n"
     else if (output_mode_enum == .Exe)
         "pub fn main() void {}\n"
     else
@@ -593,6 +590,12 @@ fn createImpl(
     else
         null;
 
+    // Set custom entry point for builder mode.
+    const entry: Compilation.CreateOptions.Entry = if (ctx.builder_entry_mangled) |name|
+        .{ .named = name }
+    else
+        .default;
+
     var create_diag: Compilation.CreateDiagnostic = undefined;
     ctx.compilation = Compilation.create(gpa, ar, &create_diag, .{
         .dirs = ctx.dirs,
@@ -604,6 +607,7 @@ fn createImpl(
         .cache_mode = .none,
         .emit_bin = .{ .yes_path = output_path_duped },
         .skip_linker_dependencies = !build_options.have_llvm,
+        .entry = entry,
     }) catch |err| {
         // Log the error for debugging.
         const stderr = std.debug.lockStderrWriter(&.{});
