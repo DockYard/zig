@@ -53,6 +53,17 @@ pub const ZirContext = struct {
     compilation: *Compilation,
     root_mod: *Package.Module,
     output_mode: std.builtin.OutputMode = .Exe,
+    /// Builder mode: the compiled binary is a build system builder.
+    /// The stub source sets up a runtime that reads os_argv, constructs
+    /// a Zap.Env struct, calls the configured entry point function, and
+    /// serializes the returned Zap.Manifest to stdout.
+    is_builder: bool = false,
+    /// The entry point function name for builder mode (e.g., "manifest").
+    /// Set via zir_compilation_set_builder_entry.
+    builder_entry: ?[]const u8 = null,
+    /// The module-qualified entry point (e.g., "FooBar__Builder__manifest").
+    /// This is the mangled name as it appears in ZIR.
+    builder_entry_mangled: ?[]const u8 = null,
 
     pub fn arena(self: *ZirContext) Allocator {
         return self.arena_state.allocator();
@@ -166,6 +177,26 @@ pub export fn zir_compilation_add_module_source(
 ) callconv(.c) i32 {
     const c = ctx orelse return -1;
     addModuleSourceImpl(c, mem.sliceTo(name, 0), source_ptr[0..source_len]) catch return -1;
+    return 0;
+}
+
+/// Configure the compilation as a builder binary.
+/// The builder's stub source sets up a runtime that:
+/// 1. Reads os_argv to get target, os, arch, and -D flags
+/// 2. Constructs a Zap.Env struct from those args
+/// 3. Calls the configured entry point function with the env
+/// 4. Serializes the returned Zap.Manifest fields to stdout
+///
+/// `entry_name` is the mangled function name (e.g., "FooBar__Builder__manifest").
+/// Must be called after create and before addZir/update.
+pub export fn zir_compilation_set_builder_entry(
+    ctx: ?*ZirContext,
+    entry_name: [*:0]const u8,
+) callconv(.c) i32 {
+    const c = ctx orelse return -1;
+    const ar = c.arena();
+    c.is_builder = true;
+    c.builder_entry_mangled = ar.dupe(u8, mem.sliceTo(entry_name, 0)) catch return -1;
     return 0;
 }
 
@@ -517,7 +548,16 @@ fn createImpl(
     const stub_dir = try std.fmt.allocPrint(ar, ".zap-cache/{s}.zig", .{root_name_str});
     const stub_src_name = try std.fmt.allocPrint(ar, "{s}.zig", .{root_name_str});
 
-    const stub_source = if (output_mode_enum == .Exe) "pub fn main() void {}\n" else "comptime {}\n";
+    const stub_source = if (ctx.is_builder)
+        // Builder mode: the stub is replaced by ZIR injection, but needs
+        // to parse as valid Zig for error reporting. The actual builder
+        // runtime behavior is handled by the injected ZIR which emits
+        // the entry point function as "main".
+        "pub fn main() void {}\n"
+    else if (output_mode_enum == .Exe)
+        "pub fn main() void {}\n"
+    else
+        "comptime {}\n";
     fs.cwd().makePath(stub_dir) catch {};
     const stub_full = try std.fmt.allocPrint(ar, "{s}/{s}", .{ stub_dir, stub_src_name });
     fs.cwd().writeFile(.{
