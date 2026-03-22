@@ -2179,6 +2179,52 @@ fn initSegments(self: *MachO) !void {
         seg_id.* = segment_id;
     }
 
+    // Re-sort segments after section attachment — new segments may have been
+    // appended after the initial sort, causing VM address ordering violations.
+    // This ensures all segments (including late-created ones like __CONST_ZIG)
+    // are in proper rank order before VM address allocation.
+    if (self.segments.items.len > entries.items.len) {
+        var re_entries = try std.array_list.Managed(Entry).initCapacity(gpa, self.segments.items.len);
+        defer re_entries.deinit();
+        for (0..self.segments.items.len) |index| {
+            re_entries.appendAssumeCapacity(.{ .index = @intCast(index) });
+        }
+        mem.sort(Entry, re_entries.items, self, Entry.lessThan);
+
+        const re_backlinks = try gpa.alloc(u8, re_entries.items.len);
+        defer gpa.free(re_backlinks);
+        for (re_entries.items, 0..) |entry, i| {
+            re_backlinks[entry.index] = @intCast(i);
+        }
+
+        const re_segments = try self.segments.toOwnedSlice(gpa);
+        defer gpa.free(re_segments);
+        try self.segments.ensureTotalCapacityPrecise(gpa, re_segments.len);
+        for (re_entries.items) |sorted| {
+            self.segments.appendAssumeCapacity(re_segments[sorted.index]);
+        }
+
+        // Update cached segment indices
+        for (&[_]*?u8{
+            &self.pagezero_seg_index,
+            &self.text_seg_index,
+            &self.linkedit_seg_index,
+            &self.zig_text_seg_index,
+            &self.zig_const_seg_index,
+            &self.zig_data_seg_index,
+            &self.zig_bss_seg_index,
+        }) |maybe_index| {
+            if (maybe_index.*) |*index| {
+                index.* = re_backlinks[index.*];
+            }
+        }
+
+        // Update section segment_id references
+        for (slice.items(.segment_id)) |*seg_id| {
+            seg_id.* = re_backlinks[seg_id.*];
+        }
+    }
+
     // Set __DATA_CONST as READ_ONLY
     if (self.getSegmentByName("__DATA_CONST")) |seg_id| {
         const seg = &self.segments.items[seg_id];
