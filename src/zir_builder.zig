@@ -3,6 +3,12 @@ const Zir = std.zig.Zir;
 const Ast = std.zig.Ast;
 const Allocator = std.mem.Allocator;
 
+/// Numeric field names for tuple struct fields ("0", "1", "2", ...).
+const index_field_names = [_][]const u8{
+    "0",  "1",  "2",  "3",  "4",  "5",  "6",  "7",
+    "8",  "9",  "10", "11", "12", "13", "14", "15",
+};
+
 pub const Builder = struct {
     gpa: Allocator,
     tags: std.ArrayListUnmanaged(u8),
@@ -149,7 +155,10 @@ pub const Builder = struct {
         const func_payload_idx: u32 = @intCast(self.extra.items.len);
 
         // ret_ty: packed RetTy { body_len: u31, is_generic: bool }
-        if (body.ret_type == .void) {
+        if (body.tuple_ret_types.items.len > 0) {
+            // body_len=1 with the tuple_decl instruction Ref
+            try self.extra.append(self.gpa, 1);
+        } else if (body.ret_type == .void) {
             // body_len=0 means void, is_generic=false → u32 value 0
             try self.extra.append(self.gpa, 0);
         } else {
@@ -162,7 +171,9 @@ pub const Builder = struct {
         try self.extra.append(self.gpa, body_len);
 
         // Trailing return type Ref (if ret_ty.body_len == 1)
-        if (body.ret_type != .void) {
+        if (body.tuple_ret_types.items.len > 0) {
+            try self.extra.append(self.gpa, @intFromEnum(body.tuple_ret_types.items[0]));
+        } else if (body.ret_type != .void) {
             try self.extra.append(self.gpa, @intFromEnum(body.ret_type));
         }
 
@@ -241,6 +252,8 @@ pub const Builder = struct {
         // Clean up
         body.body_inst_indices.deinit(self.gpa);
         body.param_inst_indices.deinit(self.gpa);
+        body.tuple_ret_types.deinit(self.gpa);
+        body.tuple_element_type_refs.deinit(self.gpa);
         self.gpa.destroy(body);
         self.active_body = null;
     }
@@ -351,7 +364,7 @@ pub const Builder = struct {
         } };
     }
 
-    fn encodeExtended(opcode: u16, small: u16, operand: u32) Zir.Inst.Data {
+    pub fn encodeExtended(opcode: u16, small: u16, operand: u32) Zir.Inst.Data {
         return .{ .extended = .{
             .opcode = @enumFromInt(opcode),
             .small = small,
@@ -404,6 +417,12 @@ pub const FuncBody = struct {
     restore_inst: u32,
     has_explicit_return: bool,
     ret_type: ReturnType,
+    /// When non-empty, the function returns a tuple type. endFunction will
+    /// emit a ret_ty body that computes the struct type from these element
+    /// type Refs (e.g., .i64_type, .slice_const_u8_type).
+    tuple_ret_types: std.ArrayListUnmanaged(Zir.Inst.Ref) = .{},
+    /// The individual element type Refs for the tuple return type.
+    tuple_element_type_refs: std.ArrayListUnmanaged(Zir.Inst.Ref) = .{},
     /// When false, emitBodyInst/emitBodyInstVoid still emit instructions via
     /// addInst but do NOT append the index to body_inst_indices. This allows
     /// emitting instructions that live inside sub-bodies (e.g. condbr branches)
@@ -419,7 +438,7 @@ pub const FuncBody = struct {
     /// (unless body_tracking is false, in which case it may be captured via
     /// non_body_capture).
     /// Returns the Ref pointing to this instruction.
-    fn emitBodyInst(self: *FuncBody, tag: Zir.Inst.Tag, inst_data: Zir.Inst.Data) !Zir.Inst.Ref {
+    pub fn emitBodyInst(self: *FuncBody, tag: Zir.Inst.Tag, inst_data: Zir.Inst.Data) !Zir.Inst.Ref {
         const idx = try self.builder.addInst(tag, inst_data);
         if (self.body_tracking) {
             try self.body_inst_indices.append(self.builder.gpa, idx);
@@ -584,6 +603,43 @@ pub const FuncBody = struct {
         try self.builder.extra.append(self.builder.gpa, @intFromEnum(object));
         try self.builder.extra.append(self.builder.gpa, name_idx);
         return self.emitBodyInst(.field_val, Builder.encodePlNode(.zero, payload_idx));
+    }
+
+    /// Emit field pointer access on an object (get a pointer to a.b). Returns a Ref to the field pointer.
+    /// Uses the `.field_ptr` instruction with `.pl_node` data and `Field` payload.
+    pub fn addFieldPtr(self: *FuncBody, object: Zir.Inst.Ref, field_name: []const u8) !Zir.Inst.Ref {
+        const name_idx = try self.builder.internString(field_name);
+        // Field payload in extra: { lhs: Ref, field_name_start: NullTerminatedString }
+        const payload_idx: u32 = @intCast(self.builder.extra.items.len);
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(object));
+        try self.builder.extra.append(self.builder.gpa, name_idx);
+        return self.emitBodyInst(.field_ptr, Builder.encodePlNode(.zero, payload_idx));
+    }
+
+    /// Emit a store through a pointer. Stores value into the location pointed to by ptr.
+    /// Uses the `.store_node` instruction with `.pl_node` data and `Bin` payload.
+    /// This is a void operation (no result value).
+    pub fn addStore(self: *FuncBody, ptr: Zir.Inst.Ref, value: Zir.Inst.Ref) !void {
+        // Bin payload in extra: { lhs: Ref (ptr), rhs: Ref (value) }
+        const payload_idx: u32 = @intCast(self.builder.extra.items.len);
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(ptr));
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(value));
+        try self.emitBodyInstVoid(.store_node, Builder.encodePlNode(.zero, payload_idx));
+    }
+
+    /// Emit is_non_null check on an optional value. Returns a bool Ref.
+    /// `x != null` — returns true if the optional has a payload.
+    /// Uses the `.is_non_null` instruction with `.un_node` data.
+    pub fn addIsNonNull(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.is_non_null, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit optional payload extraction with safety check. `?T => T`.
+    /// Given an optional value, returns the payload value with a safety check
+    /// that the value is non-null. Used for `orelse`, `if`, and `while`.
+    /// Uses the `.optional_payload_safe` instruction with `.un_node` data.
+    pub fn addOptionalPayloadSafe(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.optional_payload_safe, Builder.encodeUnNode(.zero, operand));
     }
 
     /// Emit an anonymous struct initialization (for building aggregates/tuples).
@@ -777,48 +833,44 @@ pub const FuncBody = struct {
         const b = self.builder;
         const gpa = b.gpa;
 
-        // 1. Emit block_inline with a placeholder payload (fix up below).
+        // 1. Emit block with a placeholder payload (fix up below).
+        // Using non-inline block+condbr+break so conditions can be runtime values.
+        // Payload format is identical between inline and non-inline variants.
         const block_payload_idx: u32 = @intCast(b.extra.items.len);
-        // Reserve space for Block { body_len: u32 } + 1 body index
-        try b.extra.append(gpa, 1); // body_len = 1 (the condbr_inline)
+        try b.extra.append(gpa, 1); // body_len = 1 (the condbr)
         const block_body_slot: u32 = @intCast(b.extra.items.len);
-        try b.extra.append(gpa, 0); // placeholder for condbr_inline index
+        try b.extra.append(gpa, 0); // placeholder for condbr index
 
-        // The block_inline is a body instruction of the function.
-        const block_idx = try b.addInst(.block_inline, Builder.encodePlNode(.zero, block_payload_idx));
-        try self.body_inst_indices.append(gpa, block_idx);
+        const block_idx = try b.addInst(.block, Builder.encodePlNode(.zero, block_payload_idx));
+        if (self.body_tracking) {
+            try self.body_inst_indices.append(gpa, block_idx);
+        } else if (self.non_body_capture) |capture| {
+            try capture.append(gpa, block_idx);
+        }
 
-        // 2. Emit the two break_inline instructions (NOT body instructions).
-        //    They reference the block_inline by instruction index.
-
-        // Break payload for then branch
+        // 2. Emit the two break instructions (NOT body instructions).
         const break_then_payload_idx: u32 = @intCast(b.extra.items.len);
         try b.extra.append(gpa, @bitCast(@as(i32, std.math.maxInt(i32)))); // operand_src_node = none
-        try b.extra.append(gpa, block_idx); // block_inst = block_inline
-        const break_then_idx = try b.addInst(.break_inline, Builder.encodeBreak(then_value, break_then_payload_idx));
+        try b.extra.append(gpa, block_idx); // block_inst
+        const break_then_idx = try b.addInst(.@"break", Builder.encodeBreak(then_value, break_then_payload_idx));
 
-        // Break payload for else branch
         const break_else_payload_idx: u32 = @intCast(b.extra.items.len);
         try b.extra.append(gpa, @bitCast(@as(i32, std.math.maxInt(i32)))); // operand_src_node = none
-        try b.extra.append(gpa, block_idx); // block_inst = block_inline
-        const break_else_idx = try b.addInst(.break_inline, Builder.encodeBreak(else_value, break_else_payload_idx));
+        try b.extra.append(gpa, block_idx); // block_inst
+        const break_else_idx = try b.addInst(.@"break", Builder.encodeBreak(else_value, break_else_payload_idx));
 
-        // 3. Emit condbr_inline (NOT a body instruction).
-        //    CondBr payload: { condition: Ref, then_body_len: u32, else_body_len: u32 }
-        //    Trailing: then body indices..., else body indices...
+        // 3. Emit condbr (NOT a body instruction).
         const condbr_payload_idx: u32 = @intCast(b.extra.items.len);
         try b.extra.append(gpa, @intFromEnum(condition)); // condition
         try b.extra.append(gpa, 1); // then_body_len = 1
         try b.extra.append(gpa, 1); // else_body_len = 1
         try b.extra.append(gpa, break_then_idx); // then body[0]
         try b.extra.append(gpa, break_else_idx); // else body[0]
-        const condbr_idx = try b.addInst(.condbr_inline, Builder.encodePlNode(.zero, condbr_payload_idx));
+        const condbr_idx = try b.addInst(.condbr, Builder.encodePlNode(.zero, condbr_payload_idx));
 
-        // 4. Fix up block_inline's body to point to condbr_inline.
+        // 4. Fix up block's body to point to condbr.
         b.extra.items[block_body_slot] = condbr_idx;
 
-        // The block_inline instruction result is the value produced by
-        // whichever break_inline executes.
         return Builder.instRef(block_idx);
     }
 
@@ -848,29 +900,37 @@ pub const FuncBody = struct {
         const then_body_len: u32 = @intCast(then_insts.len + 1);
         const else_body_len: u32 = @intCast(else_insts.len + 1);
 
-        // 1. Emit block_inline with placeholder payload.
+        // 1. Emit block with placeholder payload.
+        // Using non-inline block+condbr+break so conditions can be runtime values.
         const block_payload_idx: u32 = @intCast(b.extra.items.len);
-        try b.extra.append(gpa, 1); // body_len = 1 (the condbr_inline)
+        try b.extra.append(gpa, 1); // body_len = 1 (the condbr)
         const block_body_slot: u32 = @intCast(b.extra.items.len);
-        try b.extra.append(gpa, 0); // placeholder for condbr_inline index
+        try b.extra.append(gpa, 0); // placeholder for condbr index
 
-        // block_inline IS a body instruction of the function.
-        const block_idx = try b.addInst(.block_inline, Builder.encodePlNode(.zero, block_payload_idx));
-        try self.body_inst_indices.append(gpa, block_idx);
+        // block IS a body instruction of the function — but only when
+        // body_tracking is active. When tracking is off, the block goes
+        // into the capture buffer so it can be nested inside an outer condbr's
+        // branch body (used by switch/case chaining).
+        const block_idx = try b.addInst(.block, Builder.encodePlNode(.zero, block_payload_idx));
+        if (self.body_tracking) {
+            try self.body_inst_indices.append(gpa, block_idx);
+        } else if (self.non_body_capture) |capture| {
+            try capture.append(gpa, block_idx);
+        }
 
-        // 2. Emit break_inline for then branch (NOT a body instruction).
+        // 2. Emit break for then branch (NOT a body instruction).
         const break_then_payload_idx: u32 = @intCast(b.extra.items.len);
         try b.extra.append(gpa, @bitCast(@as(i32, std.math.maxInt(i32)))); // operand_src_node = none
         try b.extra.append(gpa, block_idx); // block_inst
-        const break_then_idx = try b.addInst(.break_inline, Builder.encodeBreak(then_result, break_then_payload_idx));
+        const break_then_idx = try b.addInst(.@"break", Builder.encodeBreak(then_result, break_then_payload_idx));
 
-        // 3. Emit break_inline for else branch (NOT a body instruction).
+        // 3. Emit break for else branch (NOT a body instruction).
         const break_else_payload_idx: u32 = @intCast(b.extra.items.len);
         try b.extra.append(gpa, @bitCast(@as(i32, std.math.maxInt(i32)))); // operand_src_node = none
         try b.extra.append(gpa, block_idx); // block_inst
-        const break_else_idx = try b.addInst(.break_inline, Builder.encodeBreak(else_result, break_else_payload_idx));
+        const break_else_idx = try b.addInst(.@"break", Builder.encodeBreak(else_result, break_else_payload_idx));
 
-        // 4. Emit condbr_inline with full branch bodies.
+        // 4. Emit condbr with full branch bodies.
         const condbr_payload_idx: u32 = @intCast(b.extra.items.len);
         try b.extra.append(gpa, @intFromEnum(condition)); // condition
         try b.extra.append(gpa, then_body_len); // then_body_len
@@ -885,9 +945,9 @@ pub const FuncBody = struct {
             try b.extra.append(gpa, idx);
         }
         try b.extra.append(gpa, break_else_idx);
-        const condbr_idx = try b.addInst(.condbr_inline, Builder.encodePlNode(.zero, condbr_payload_idx));
+        const condbr_idx = try b.addInst(.condbr, Builder.encodePlNode(.zero, condbr_payload_idx));
 
-        // 5. Fix up block_inline's body to point to condbr_inline.
+        // 5. Fix up block's body to point to condbr.
         b.extra.items[block_body_slot] = condbr_idx;
 
         return Builder.instRef(block_idx);
@@ -897,6 +957,110 @@ pub const FuncBody = struct {
     /// Used by callers to track instruction index ranges for branch bodies.
     pub fn getInstCount(self: *FuncBody) u32 {
         return @intCast(self.builder.tags.items.len);
+    }
+
+    /// Emit a struct_init for a known tuple type.
+    /// Emits a tuple_decl INSIDE the function body so Sema can resolve it,
+    /// then uses struct_init with struct_init_field_type to create a typed init.
+    pub fn addStructInitTyped(
+        self: *FuncBody,
+        struct_type: Zir.Inst.Ref,
+        field_names: []const []const u8,
+        field_values: []const Zir.Inst.Ref,
+    ) !Zir.Inst.Ref {
+        std.debug.assert(field_names.len == field_values.len);
+        const b = self.builder;
+        const gpa = b.gpa;
+        const fields_len: u32 = @intCast(field_names.len);
+
+        // Emit a tuple_decl in the function body so Sema can resolve the type
+        // from within this scope. Use the element types from the stored tuple_ret_types.
+        // Use the caller-provided struct_type directly. The caller is responsible
+        // for emitting body-local tuple_decl instructions (including nested ones).
+        const body_tuple_ref = struct_type;
+
+        // validate_struct_init_result_ty with the body-local tuple type
+        try self.emitBodyInstVoid(.validate_struct_init_result_ty, Builder.encodeUnNode(.zero, body_tuple_ref));
+
+        // struct_init_field_type per field
+        var field_type_indices = std.ArrayListUnmanaged(u32).empty;
+        defer field_type_indices.deinit(gpa);
+        for (field_names) |name| {
+            const name_idx = try b.internString(name);
+            const ft_payload_idx: u32 = @intCast(b.extra.items.len);
+            try b.extra.append(gpa, @intFromEnum(body_tuple_ref));
+            try b.extra.append(gpa, name_idx);
+            const ft_idx = try b.addInst(.struct_init_field_type, Builder.encodePlNode(.zero, ft_payload_idx));
+            try field_type_indices.append(gpa, ft_idx);
+        }
+
+        // struct_init
+        const payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, 0); // abs_node
+        try b.extra.append(gpa, 0); // abs_line
+        try b.extra.append(gpa, fields_len);
+        for (field_type_indices.items, field_values) |ft_idx, init_ref| {
+            try b.extra.append(gpa, ft_idx);
+            try b.extra.append(gpa, @intFromEnum(init_ref));
+        }
+
+        return self.emitBodyInst(.struct_init, Builder.encodePlNode(.zero, payload_idx));
+    }
+
+    /// Set a tuple return type from element type Refs.
+    /// Emits a `tuple_decl` extended instruction in the declaration value body
+    /// and stores its Ref for use by `endFunction`.
+    pub fn setTupleReturnType(self: *FuncBody, types: []const Zir.Inst.Ref) !void {
+        const b = self.builder;
+        const fields_len: u16 = @intCast(types.len);
+
+        // TupleDecl payload: { src_node: Ast.Node.Offset }
+        const tuple_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, 0); // src_node = 0
+
+        // Trailing: per field { type: Ref, init: Ref }
+        for (types) |elem_type| {
+            try b.extra.append(b.gpa, @intFromEnum(elem_type));
+            try b.extra.append(b.gpa, @intFromEnum(Zir.Inst.Ref.none)); // no default init
+        }
+
+        const tuple_decl_idx = try b.addInst(
+            .extended,
+            Builder.encodeExtended(@intFromEnum(Zir.Inst.Extended.tuple_decl), fields_len, tuple_payload_idx),
+        );
+
+        // Track as a param instruction so it's in the declaration value body
+        try self.param_inst_indices.append(b.gpa, tuple_decl_idx);
+
+        // Store the Ref for endFunction to use as the return type
+        self.tuple_ret_types.clearRetainingCapacity();
+        try self.tuple_ret_types.append(b.gpa, Builder.instRef(tuple_decl_idx));
+
+        // Store element types for addStructInitTyped to re-emit tuple_decl in function body
+        self.tuple_element_type_refs.clearRetainingCapacity();
+        try self.tuple_element_type_refs.appendSlice(b.gpa, types);
+    }
+
+    /// Emit `try operand` — unwrap an error union, panicking on error.
+    /// Equivalent to `operand catch unreachable`.
+    ///
+    /// Emits a ZIR `.@"try"` instruction whose error body contains a single
+    /// `@"unreachable"` instruction. The result is the unwrapped payload value.
+    pub fn addTry(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        const b = self.builder;
+        const gpa = b.gpa;
+
+        // Emit unreachable instruction for the error body (NOT a body instruction).
+        // The .@"unreachable" tag uses .@"unreachable" data: { src_node: Node.Offset }
+        const unreachable_idx = try b.addInst(.@"unreachable", .{ .@"unreachable" = .{ .src_node = .zero } });
+
+        // Try payload in extra: { operand: Ref, body_len: u32 }, trailing: [body_len] inst indices
+        const payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @intFromEnum(operand)); // operand
+        try b.extra.append(gpa, 1); // body_len = 1
+        try b.extra.append(gpa, unreachable_idx); // body[0] = unreachable
+
+        return self.emitBodyInst(.@"try", Builder.encodePlNode(.zero, payload_idx));
     }
 };
 
@@ -1431,19 +1595,19 @@ test "Builder: addIfElse" {
     // 5: block_inline        <- body instruction
     // 6: break_inline (then) <- NOT a body instruction, referenced from condbr extra
     // 7: break_inline (else) <- NOT a body instruction, referenced from condbr extra
-    // 8: condbr_inline       <- NOT a body instruction, referenced from block extra
+    // 8: condbr              <- NOT a body instruction, referenced from block extra
     // 9: ret_node
     // 10: func
     // 11: break_inline (func)
     try std.testing.expectEqual(@as(u32, 12), result.instructions_len);
 
-    // Verify instruction tags
+    // Verify instruction tags — using non-inline block/condbr/break for runtime support
     try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.int), result.instructions_tags[3]);
     try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.int), result.instructions_tags[4]);
-    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.block_inline), result.instructions_tags[5]);
-    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.break_inline), result.instructions_tags[6]);
-    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.break_inline), result.instructions_tags[7]);
-    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.condbr_inline), result.instructions_tags[8]);
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.block), result.instructions_tags[5]);
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.@"break"), result.instructions_tags[6]);
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.@"break"), result.instructions_tags[7]);
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.condbr), result.instructions_tags[8]);
     try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.ret_node), result.instructions_tags[9]);
 
     // Verify block_inline's extra payload
@@ -1453,9 +1617,9 @@ test "Builder: addIfElse" {
 
     // Block payload: { body_len: u32 } + body indices
     try std.testing.expectEqual(@as(u32, 1), result.extra[block_payload_idx]); // body_len = 1
-    try std.testing.expectEqual(@as(u32, 8), result.extra[block_payload_idx + 1]); // body[0] = condbr_inline at index 8
+    try std.testing.expectEqual(@as(u32, 8), result.extra[block_payload_idx + 1]); // body[0] = condbr at index 8
 
-    // Verify condbr_inline's extra payload
+    // Verify condbr's extra payload
     const condbr_data = data_items[8].pl_node;
     const condbr_payload_idx = condbr_data.payload_index;
 
@@ -1609,4 +1773,118 @@ test "Builder: addTypeOf" {
     const data_items: []const Zir.Inst.Data = @alignCast(std.mem.bytesAsSlice(Zir.Inst.Data, result.instructions_data));
     const typeof_data = data_items[4].un_node;
     try std.testing.expectEqual(val, typeof_data.operand);
+}
+
+test "Builder: addFieldPtr and addStore" {
+    var builder = try Builder.init(std.testing.allocator);
+    defer builder.deinit();
+
+    const body = try builder.beginFunction("test_field_ptr_store", .void);
+
+    // Create a struct
+    const val_a = try body.addInt(1);
+    const val_b = try body.addInt(2);
+    const s = try body.addStructInitAnon(
+        &.{ "x", "y" },
+        &.{ val_a, val_b },
+    );
+
+    // Get a field pointer
+    const fptr = try body.addFieldPtr(s, "x");
+
+    // Store a new value through the pointer
+    const new_val = try body.addInt(99);
+    try body.addStore(fptr, new_val);
+
+    try builder.endFunction(body);
+    const result = try builder.finalize();
+
+    // Instructions:
+    // 0: extended(struct_decl)
+    // 1: declaration
+    // 2: restore_err_ret
+    // 3: int(1)
+    // 4: int(2)
+    // 5: struct_init_anon
+    // 6: field_ptr
+    // 7: int(99)
+    // 8: store_node
+    // 9: ret_implicit
+    // 10: func
+    // 11: break_inline
+    try std.testing.expectEqual(@as(u32, 12), result.instructions_len);
+
+    // Verify the field_ptr instruction
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.field_ptr), result.instructions_tags[6]);
+
+    // Verify Field payload for field_ptr
+    const data_items: []const Zir.Inst.Data = @alignCast(std.mem.bytesAsSlice(Zir.Inst.Data, result.instructions_data));
+    const fptr_data = data_items[6].pl_node;
+    const fptr_payload_idx = fptr_data.payload_index;
+    // Field.lhs = Ref of struct_init_anon
+    try std.testing.expectEqual(@intFromEnum(s), result.extra[fptr_payload_idx]);
+    // Field.field_name_start = string index of "x"
+    const name_idx = result.extra[fptr_payload_idx + 1];
+    try std.testing.expectEqualStrings("x", result.string_bytes[name_idx .. name_idx + 1]);
+
+    // Verify the store_node instruction
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.store_node), result.instructions_tags[8]);
+
+    // Verify Bin payload for store_node
+    const store_data = data_items[8].pl_node;
+    const store_payload_idx = store_data.payload_index;
+    // Bin.lhs = ptr (field_ptr Ref)
+    try std.testing.expectEqual(@intFromEnum(fptr), result.extra[store_payload_idx]);
+    // Bin.rhs = value (new_val Ref)
+    try std.testing.expectEqual(@intFromEnum(new_val), result.extra[store_payload_idx + 1]);
+}
+
+test "Builder: addIsNonNull and addOptionalPayloadSafe" {
+    var builder = try Builder.init(std.testing.allocator);
+    defer builder.deinit();
+
+    const body = try builder.beginFunction("test_optional", .void);
+
+    // Use a param to represent an optional value
+    const opt_val = try body.addParam("maybe", Zir.Inst.Ref.usize_type);
+
+    // Check if non-null
+    const check = try body.addIsNonNull(opt_val);
+
+    // Extract optional payload
+    const payload = try body.addOptionalPayloadSafe(opt_val);
+
+    _ = check;
+    _ = payload;
+
+    try builder.endFunction(body);
+    const result = try builder.finalize();
+
+    // Instructions:
+    // 0: extended(struct_decl)
+    // 1: declaration
+    // 2: restore_err_ret
+    // 3: break_inline (param type body)
+    // 4: param
+    // 5: is_non_null
+    // 6: optional_payload_safe
+    // 7: ret_implicit
+    // 8: func
+    // 9: break_inline (func)
+    try std.testing.expectEqual(@as(u32, 10), result.instructions_len);
+
+    // Verify is_non_null instruction
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.is_non_null), result.instructions_tags[5]);
+
+    // Verify un_node data for is_non_null — operand should be the param Ref
+    const data_items: []const Zir.Inst.Data = @alignCast(std.mem.bytesAsSlice(Zir.Inst.Data, result.instructions_data));
+    const is_nn_data = data_items[5].un_node;
+    try std.testing.expectEqual(opt_val, is_nn_data.operand);
+
+    // Verify optional_payload_safe instruction
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.optional_payload_safe), result.instructions_tags[6]);
+
+    // Verify un_node data for optional_payload_safe
+    const payload_data = data_items[6].un_node;
+    try std.testing.expectEqual(opt_val, payload_data.operand);
 }

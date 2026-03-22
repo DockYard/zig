@@ -17,6 +17,7 @@ const zir_builder = @import("zir_builder.zig");
 const Compilation = @import("Compilation.zig");
 const Zcu = @import("Zcu.zig");
 const Package = @import("Package.zig");
+const link = @import("link.zig");
 const Zir = std.zig.Zir;
 const Cache = std.Build.Cache;
 const introspect = @import("introspect.zig");
@@ -51,6 +52,7 @@ pub const ZirContext = struct {
     dirs: Compilation.Directories,
     compilation: *Compilation,
     root_mod: *Package.Module,
+    output_mode: std.builtin.OutputMode = .Exe,
 
     pub fn arena(self: *ZirContext) Allocator {
         return self.arena_state.allocator();
@@ -71,6 +73,10 @@ pub export fn zir_compilation_create(
     global_cache_dir: [*:0]const u8,
     output_path: [*:0]const u8,
     root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
 ) ?*ZirContext {
     return createImpl(
         mem.sliceTo(zig_lib_dir, 0),
@@ -78,6 +84,10 @@ pub export fn zir_compilation_create(
         mem.sliceTo(global_cache_dir, 0),
         mem.sliceTo(output_path, 0),
         mem.sliceTo(root_name, 0),
+        output_mode,
+        optimize_mode,
+        is_dynamic,
+        link_libc,
     ) catch null;
 }
 
@@ -96,7 +106,9 @@ pub export fn zir_compilation_add_zir(
 /// Run semantic analysis, codegen, and linking.
 /// Returns 0 on success, non-zero if errors occurred.
 pub export fn zir_compilation_update(ctx: *ZirContext) i32 {
-    ctx.compilation.update(.none) catch |err| {
+    const prog_node = std.Progress.start(.{});
+    defer prog_node.end();
+    ctx.compilation.update(prog_node) catch |err| {
         logErr("update failed: {s}", .{@errorName(err)});
         return -1;
     };
@@ -137,6 +149,36 @@ pub export fn zir_compilation_add_module(
     source_path: [*:0]const u8,
 ) callconv(.c) i32 {
     addModuleImpl(ctx, mem.sliceTo(name, 0), mem.sliceTo(source_path, 0)) catch return -1;
+    return 0;
+}
+
+/// Register a Zig module from an in-memory source buffer instead of a file path.
+/// The source is written to a file in the compilation's cache directory,
+/// then registered as a module dependency of the root module.
+/// `name` is the import name (null-terminated C string).
+/// `source_ptr`/`source_len` is the Zig source code.
+/// Returns 0 on success, -1 on error.
+pub export fn zir_compilation_add_module_source(
+    ctx: ?*ZirContext,
+    name: [*:0]const u8,
+    source_ptr: [*]const u8,
+    source_len: u32,
+) callconv(.c) i32 {
+    const c = ctx orelse return -1;
+    addModuleSourceImpl(c, mem.sliceTo(name, 0), source_ptr[0..source_len]) catch return -1;
+    return 0;
+}
+
+/// Link a system library by name (e.g., "m" for libm).
+/// Searches standard system library directories for the library file.
+/// Must be called after create and before update.
+/// Returns 0 on success, -1 if the library was not found.
+pub export fn zir_compilation_add_link_lib(
+    ctx: ?*ZirContext,
+    name: [*:0]const u8,
+) callconv(.c) i32 {
+    const c = ctx orelse return -1;
+    addLinkLibImpl(c, mem.sliceTo(name, 0)) catch return -1;
     return 0;
 }
 
@@ -200,9 +242,7 @@ fn addModuleImpl(ctx: *ZirContext, name: []const u8, source_path: []const u8) !v
     if (gop.found_existing) {
         path.deinit(gpa);
         try zcu.module_roots.put(gpa, mod, gop.key_ptr.*.toOptional());
-        logErr("addModule: file already exists in import table", .{});
     } else {
-        logErr("addModule: creating new file entry", .{});
         // Create a new File for this module.
         const new_file = try gpa.create(Zcu.File);
         const pt: Zcu.PerThread = .activate(zcu, .main);
@@ -246,9 +286,117 @@ fn addModuleImpl(ctx: *ZirContext, name: []const u8, source_path: []const u8) !v
         }
     }
 
-    logErr("addModule: registered '{s}' from '{s}' (deps count: {d}, roots: {d})", .{
-        name, source_path, ctx.root_mod.deps.count(), zcu.module_roots.count(),
-    });
+}
+
+fn addModuleSourceImpl(ctx: *ZirContext, name: []const u8, source: []const u8) !void {
+    const ar = ctx.arena();
+
+    // Build a path within the local cache directory for the source file.
+    const cache_path = ctx.dirs.local_cache.path orelse return error.OutOfMemory;
+    const sub_dir = try std.fmt.allocPrint(ar, "{s}/zap_modules", .{cache_path});
+    const file_name = try std.fmt.allocPrint(ar, "{s}.zig", .{name});
+    const full_path = try std.fmt.allocPrint(ar, "{s}/{s}", .{ sub_dir, file_name });
+
+    // Ensure the subdirectory exists.
+    fs.cwd().makePath(sub_dir) catch |err| {
+        logErr("addModuleSource: makePath failed: {s}", .{@errorName(err)});
+        return error.OutOfMemory;
+    };
+
+    // Write the source to disk.
+    fs.cwd().writeFile(.{
+        .sub_path = full_path,
+        .data = source,
+    }) catch |err| {
+        logErr("addModuleSource: writeFile failed: {s}", .{@errorName(err)});
+        return error.OutOfMemory;
+    };
+
+
+    // Null-terminate the strings for the C-ABI add_module path.
+    const full_path_z = try ar.dupeZ(u8, full_path);
+
+    // Register the module using the existing addModuleImpl.
+    try addModuleImpl(ctx, name, full_path_z);
+}
+
+fn addLinkLibImpl(ctx: *ZirContext, lib_name: []const u8) !void {
+    const ar = ctx.arena();
+    const target = &ctx.root_mod.resolved_target.result;
+
+    // Library search paths (platform-specific)
+    const search_dirs: []const []const u8 = if (target.os.tag.isDarwin())
+        &.{
+            "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
+            "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/lib",
+            "/usr/lib",
+            "/opt/homebrew/lib",
+            "/usr/local/lib",
+        }
+    else
+        &.{
+            "/usr/lib",
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/local/lib",
+            "/lib",
+        };
+
+    // File extensions to try (prefer dynamic, fall back to static)
+    const exts: []const []const u8 = if (target.os.tag.isDarwin())
+        &.{ ".tbd", ".dylib", ".a" }
+    else
+        &.{ ".so", ".a" };
+
+    for (search_dirs) |dir_path| {
+        for (exts) |ext| {
+            const file_name = std.fmt.allocPrint(ar, "lib{s}{s}", .{ lib_name, ext }) catch continue;
+            const full_path = std.fmt.allocPrint(ar, "{s}/{s}", .{ dir_path, file_name }) catch continue;
+
+            var file = fs.cwd().openFile(full_path, .{}) catch continue;
+            errdefer file.close();
+
+            // Found the library — open the containing directory for the Path
+            var dir = fs.cwd().openDir(dir_path, .{}) catch {
+                file.close();
+                continue;
+            };
+            errdefer dir.close();
+
+            const is_shared = !mem.endsWith(u8, ext, ".a");
+            const path: Cache.Path = .{
+                .root_dir = .{ .handle = dir, .path = ar.dupe(u8, dir_path) catch null },
+                .sub_path = file_name,
+            };
+
+            // Grow the link_inputs slice
+            const old = ctx.compilation.link_inputs;
+            const new = try ar.alloc(link.Input, old.len + 1);
+            @memcpy(new[0..old.len], old);
+
+            if (is_shared) {
+                new[old.len] = .{ .dso = .{
+                    .path = path,
+                    .file = file,
+                    .needed = true,
+                    .weak = false,
+                    .reexport = false,
+                } };
+            } else {
+                new[old.len] = .{ .archive = .{
+                    .path = path,
+                    .file = file,
+                    .must_link = false,
+                    .hidden = false,
+                } };
+            }
+
+            ctx.compilation.link_inputs = new;
+            return;
+        }
+    }
+
+    logErr("system library not found: lib{s}", .{lib_name});
+    return error.OutOfMemory;
 }
 
 fn logErr(comptime fmt: []const u8, args: anytype) void {
@@ -263,6 +411,10 @@ fn createImpl(
     global_cache_dir_path: []const u8,
     output_path: []const u8,
     root_name_str: []const u8,
+    output_mode_raw: u8,
+    optimize_mode_raw: u8,
+    is_dynamic: bool,
+    do_link_libc: bool,
 ) !*ZirContext {
     const gpa = std.heap.page_allocator;
 
@@ -283,7 +435,8 @@ fn createImpl(
     };
     errdefer gpa.destroy(tp);
     tp.* = undefined;
-    tp.init(.{ .allocator = gpa, .n_jobs = 1, .track_ids = true }) catch {
+    const cpu_count: u32 = @intCast(@min(std.Thread.getCpuCount() catch 1, std.math.maxInt(u32)));
+    tp.init(.{ .allocator = gpa, .n_jobs = cpu_count, .track_ids = true }) catch {
         logErr("ThreadPool.init failed", .{});
         return error.OutOfMemory;
     };
@@ -322,16 +475,32 @@ fn createImpl(
         .is_explicit_dynamic_linker = false,
     };
 
+    // Map integer output/optimize modes to enums.
+    const output_mode_enum: std.builtin.OutputMode = switch (output_mode_raw) {
+        0 => .Exe,
+        1 => .Lib,
+        2 => .Obj,
+        else => .Exe,
+    };
+    const optimize_mode_enum: std.builtin.OptimizeMode = switch (optimize_mode_raw) {
+        0 => .Debug,
+        1 => .ReleaseSafe,
+        2 => .ReleaseFast,
+        3 => .ReleaseSmall,
+        else => .ReleaseSafe,
+    };
+
     // Compilation config.
     const config = Compilation.Config.resolve(.{
-        .output_mode = .Exe,
+        .output_mode = output_mode_enum,
         .resolved_target = resolved_target,
         .is_test = false,
         .have_zcu = true,
         .emit_bin = true,
-        .root_optimize_mode = .ReleaseFast, // TODO: make configurable; Debug triggers safety checks that need proper source locations
+        .root_optimize_mode = optimize_mode_enum,
         .root_strip = false,
-        .link_libc = true,
+        .link_libc = do_link_libc,
+        .link_mode = if (output_mode_enum == .Lib and is_dynamic) .dynamic else null,
         .lto = .none,
         .use_llvm = build_options.have_llvm,
     }) catch |err| {
@@ -348,7 +517,7 @@ fn createImpl(
     const stub_dir = try std.fmt.allocPrint(ar, ".zap-cache/{s}.zig", .{root_name_str});
     const stub_src_name = try std.fmt.allocPrint(ar, "{s}.zig", .{root_name_str});
 
-    const stub_source = "pub fn main() void {}\n";
+    const stub_source = if (output_mode_enum == .Exe) "pub fn main() void {}\n" else "comptime {}\n";
     fs.cwd().makePath(stub_dir) catch {};
     const stub_full = try std.fmt.allocPrint(ar, "{s}/{s}", .{ stub_dir, stub_src_name });
     fs.cwd().writeFile(.{
@@ -372,6 +541,7 @@ fn createImpl(
         .parent = null,
     }) catch return error.OutOfMemory;
     ctx.root_mod = root_mod;
+    ctx.output_mode = output_mode_enum;
 
     const output_path_duped = try ar.dupe(u8, output_path);
 
@@ -483,7 +653,7 @@ fn addZirImpl(ctx: *ZirContext, name: []const u8, data: *const ZirData) !void {
     // Parse the stub source so that error reporting has a valid AST tree.
     // Without this, SrcLoc.span crashes when Sema tries to format errors.
     if (file.source == null) {
-        const stub_source = "pub fn main() void {}\n";
+        const stub_source = if (ctx.output_mode == .Exe) "pub fn main() void {}\n" else "comptime {}\n";
         const source = try gpa.allocSentinel(u8, stub_source.len, 0);
         @memcpy(source, stub_source);
         file.source = source;
@@ -746,6 +916,59 @@ pub export fn zir_builder_emit_field_val(
     return @intFromEnum(ref);
 }
 
+/// Emit field pointer access (get pointer to a.b). Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_field_ptr(
+    handle: ?*ZirBuilderHandle,
+    object: u32,
+    field_ptr_arg: [*]const u8,
+    field_len: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const object_ref: Zir.Inst.Ref = @enumFromInt(object);
+    const ref = body.addFieldPtr(object_ref, field_ptr_arg[0..field_len]) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit a store through a pointer. Stores value into the location pointed to by ptr_ref.
+/// Returns 0 on success, -1 on error.
+pub export fn zir_builder_emit_store(
+    handle: ?*ZirBuilderHandle,
+    ptr_ref: u32,
+    value_ref: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    const ptr: Zir.Inst.Ref = @enumFromInt(ptr_ref);
+    const value: Zir.Inst.Ref = @enumFromInt(value_ref);
+    body.addStore(ptr, value) catch return -1;
+    return 0;
+}
+
+/// Emit is_non_null check on an optional. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_is_non_null(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addIsNonNull(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit optional payload extraction with safety. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_optional_payload(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addOptionalPayloadSafe(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
 /// Emit an anonymous struct initialization.
 /// `names_ptr` is a packed array of (ptr, len) pairs for field names.
 /// `values_ptr` is an array of u32 Ref values.
@@ -996,6 +1219,170 @@ pub export fn zir_builder_emit_if_else_bodies(
         else_ref,
     ) catch return 0xFFFFFFFF;
     return @intFromEnum(ref);
+}
+
+/// Pop the last instruction index from body_inst_indices and return it.
+/// Used when chaining nested if-else blocks: the inner block_inline must
+/// be removed from the function body and placed inside the outer condbr's
+/// else branch instead.
+/// Returns the popped instruction index, or 0xFFFFFFFF if body is empty.
+pub export fn zir_builder_pop_body_inst(
+    handle: ?*ZirBuilderHandle,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    if (body.body_inst_indices.items.len == 0) return 0xFFFFFFFF;
+    const idx = body.body_inst_indices.items[body.body_inst_indices.items.len - 1];
+    body.body_inst_indices.items.len -= 1;
+    return idx;
+}
+
+/// Emit `try operand` — unwrap an error union, panicking on error.
+/// Returns `@intFromEnum(Ref)` to the unwrapped payload, or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_try(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addTry(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit a struct_init for a known struct type (e.g., tuple return).
+/// `struct_type` is a Ref to the target struct type.
+/// `field_names_ptrs`/`field_names_lens` specify field names.
+/// `values_ptr` contains the init value Refs.
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_struct_init_typed(
+    handle: ?*ZirBuilderHandle,
+    struct_type: u32,
+    field_names_ptrs: [*]const [*]const u8,
+    field_names_lens: [*]const u32,
+    values_ptr: [*]const u32,
+    fields_len: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const gpa = b.gpa;
+
+    const struct_type_ref: Zir.Inst.Ref = @enumFromInt(struct_type);
+
+    const names = gpa.alloc([]const u8, fields_len) catch return 0xFFFFFFFF;
+    defer gpa.free(names);
+    for (0..fields_len) |i| {
+        names[i] = field_names_ptrs[i][0..field_names_lens[i]];
+    }
+
+    const refs = gpa.alloc(Zir.Inst.Ref, fields_len) catch return 0xFFFFFFFF;
+    defer gpa.free(refs);
+    for (0..fields_len) |i| {
+        refs[i] = @enumFromInt(values_ptr[i]);
+    }
+
+    const ref = body.addStructInitTyped(struct_type_ref, names, refs) catch return 0xFFFFFFFF;
+
+    // Don't clear here — nested tuples check element count to decide.
+
+    return @intFromEnum(ref);
+}
+
+/// Emit a tuple_decl instruction (as a param-like instruction in the declaration body)
+/// and return its Ref. Used to build nested tuple types.
+pub export fn zir_builder_emit_tuple_decl(
+    handle: ?*ZirBuilderHandle,
+    types_ptr: [*]const u32,
+    types_len: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const gpa = b.gpa;
+
+    const fields_len: u16 = @intCast(types_len);
+    const tuple_payload_idx: u32 = @intCast(b.extra.items.len);
+    b.extra.append(gpa, 0) catch return 0xFFFFFFFF; // src_node
+    for (0..types_len) |i| {
+        b.extra.append(gpa, types_ptr[i]) catch return 0xFFFFFFFF; // field type
+        b.extra.append(gpa, @intFromEnum(Zir.Inst.Ref.none)) catch return 0xFFFFFFFF; // no init
+    }
+    const idx = b.addInst(
+        .extended,
+        zir_builder.Builder.encodeExtended(@intFromEnum(Zir.Inst.Extended.tuple_decl), fields_len, tuple_payload_idx),
+    ) catch return 0xFFFFFFFF;
+
+    // Track as a param instruction so it's in the declaration value body
+    body.param_inst_indices.append(gpa, idx) catch return 0xFFFFFFFF;
+
+    return @intFromEnum(zir_builder.Builder.instRef(idx));
+}
+
+/// Emit a tuple_decl as a function BODY instruction and return its Ref.
+/// Used to create body-local tuple types for nested struct_init_typed.
+pub export fn zir_builder_emit_tuple_decl_body(
+    handle: ?*ZirBuilderHandle,
+    types_ptr: [*]const u32,
+    types_len: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const gpa = b.gpa;
+
+    const fields_len: u16 = @intCast(types_len);
+    const tuple_payload_idx: u32 = @intCast(b.extra.items.len);
+    b.extra.append(gpa, 0) catch return 0xFFFFFFFF;
+    for (0..types_len) |i| {
+        b.extra.append(gpa, types_ptr[i]) catch return 0xFFFFFFFF;
+        b.extra.append(gpa, @intFromEnum(Zir.Inst.Ref.none)) catch return 0xFFFFFFFF;
+    }
+    const ref = body.emitBodyInst(
+        .extended,
+        zir_builder.Builder.encodeExtended(@intFromEnum(Zir.Inst.Extended.tuple_decl), fields_len, tuple_payload_idx),
+    ) catch return 0xFFFFFFFF;
+
+    return @intFromEnum(ref);
+}
+
+/// Get the tuple return type Ref and element count for the current function.
+/// Returns 0 if not a tuple-returning function.
+/// `out_elem_count` receives the number of elements in the tuple type.
+pub export fn zir_builder_get_tuple_return_type(handle: ?*ZirBuilderHandle) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0;
+    const body = b.active_body orelse return 0;
+    if (body.tuple_ret_types.items.len > 0 and body.tuple_element_type_refs.items.len > 0) {
+        return @intFromEnum(body.tuple_ret_types.items[0]);
+    }
+    return 0;
+}
+
+/// Get the number of elements in the tuple return type, or 0.
+pub export fn zir_builder_get_tuple_return_type_len(handle: ?*ZirBuilderHandle) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0;
+    const body = b.active_body orelse return 0;
+    return @intCast(body.tuple_element_type_refs.items.len);
+}
+
+/// Set a tuple return type for the current function from an array of element type Refs.
+/// Each element in `types_ptr` is a u32 Ref value (e.g., @intFromEnum(Zir.Inst.Ref.i64_type)).
+/// Must be called after begin_func and before end_func.
+/// Returns 0 on success, -1 on error.
+pub export fn zir_builder_set_tuple_return_type(
+    handle: ?*ZirBuilderHandle,
+    types_ptr: [*]const u32,
+    types_len: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    const gpa = b.gpa;
+
+    const refs = gpa.alloc(Zir.Inst.Ref, types_len) catch return -1;
+    defer gpa.free(refs);
+    for (0..types_len) |i| {
+        refs[i] = @enumFromInt(types_ptr[i]);
+    }
+
+    body.setTupleReturnType(refs) catch return -1;
+    return 0;
 }
 
 /// Finalize the builder and inject its ZIR into a compilation context.
