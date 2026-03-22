@@ -121,6 +121,9 @@ pub export fn zir_compilation_update(ctx: *ZirContext) i32 {
     defer prog_node.end();
     ctx.compilation.update(prog_node) catch |err| {
         logErr("update failed: {s}", .{@errorName(err)});
+        if (@errorReturnTrace()) |trace| {
+            std.debug.dumpStackTrace(trace.*);
+        }
         // Print detailed errors
         var error_bundle = ctx.compilation.getAllErrorsAlloc() catch |e| {
             logErr("getAllErrorsAlloc failed: {s}", .{@errorName(e)});
@@ -518,7 +521,10 @@ fn createImpl(
     is_dynamic: bool,
     do_link_libc: bool,
 ) !*ZirContext {
-    const gpa = std.heap.page_allocator;
+    // Use c_allocator (libc malloc) instead of page_allocator.
+    // page_allocator creates one mmap per allocation, hitting the kernel's
+    // per-process mapping limit before physical memory runs out.
+    const gpa = std.heap.c_allocator;
 
     const ctx = gpa.create(ZirContext) catch {
         logErr("failed to allocate ZirContext", .{});
@@ -537,7 +543,8 @@ fn createImpl(
     };
     errdefer gpa.destroy(tp);
     tp.* = undefined;
-    const cpu_count: u32 = @intCast(@min(std.Thread.getCpuCount() catch 1, std.math.maxInt(u32)));
+    // Limit thread pool to reduce concurrent memory pressure from MIR codegen.
+    const cpu_count: u32 = @intCast(@min(std.Thread.getCpuCount() catch 1, 4));
     tp.init(.{ .allocator = gpa, .n_jobs = cpu_count, .track_ids = true }) catch {
         logErr("ThreadPool.init failed", .{});
         return error.OutOfMemory;
@@ -600,7 +607,7 @@ fn createImpl(
         .have_zcu = true,
         .emit_bin = true,
         .root_optimize_mode = optimize_mode_enum,
-        .root_strip = false,
+        .root_strip = true,
         .link_libc = do_link_libc,
         .link_mode = if (output_mode_enum == .Lib and is_dynamic) .dynamic else null,
         .lto = .none,
