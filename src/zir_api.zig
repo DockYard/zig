@@ -144,13 +144,58 @@ pub export fn zir_compilation_update(ctx: *ZirContext) i32 {
         }
         return -1;
     };
-    // Note: anyErrors() may report false positives for ZIR-injected compilations
-    // due to source location mismatches. The binary is still written by the linker
-    // during update(). We return success and let the caller validate the output.
     if (ctx.compilation.anyErrors()) {
-        logErr("compilation reports errors (check output binary validity)", .{});
+        var error_bundle = ctx.compilation.getAllErrorsAlloc() catch |e| {
+            logErr("getAllErrorsAlloc failed: {s}", .{@errorName(e)});
+            return -1;
+        };
+        defer error_bundle.deinit(ctx.gpa);
+        dumpErrorBundle(error_bundle);
+        return -1;
     }
     return 0;
+}
+
+fn dumpErrorBundle(eb: std.zig.ErrorBundle) void {
+    const w = std.fs.File.stderr().deprecatedWriter();
+    const count = eb.errorMessageCount();
+    w.print("\n=== {d} compilation error(s) ===\n", .{count}) catch return;
+
+    if (eb.extra.len == 0) {
+        w.print("(error bundle extra array is empty)\n", .{}) catch return;
+        return;
+    }
+
+    const messages = eb.getMessages();
+    for (messages, 0..) |msg_index, i| {
+        const err_msg = eb.getErrorMessage(msg_index);
+        const text = eb.nullTerminatedString(err_msg.msg);
+
+        if (err_msg.src_loc != .none) {
+            const src = eb.getSourceLocation(err_msg.src_loc);
+            const path = eb.nullTerminatedString(src.src_path);
+            w.print("[{d}] {s}:{d}:{d}: error: {s}\n", .{
+                i, path, src.line + 1, src.column + 1, text,
+            }) catch return;
+        } else {
+            w.print("[{d}] error: {s}\n", .{ i, text }) catch return;
+        }
+
+        for (eb.getNotes(msg_index)) |note_index| {
+            const note = eb.getErrorMessage(note_index);
+            const note_text = eb.nullTerminatedString(note.msg);
+            if (note.src_loc != .none) {
+                const note_src = eb.getSourceLocation(note.src_loc);
+                const note_path = eb.nullTerminatedString(note_src.src_path);
+                w.print("       {s}:{d}:{d}: note: {s}\n", .{
+                    note_path, note_src.line + 1, note_src.column + 1, note_text,
+                }) catch return;
+            } else {
+                w.print("       note: {s}\n", .{note_text}) catch return;
+            }
+        }
+    }
+    w.print("=== end errors ===\n", .{}) catch return;
 }
 
 /// Print compilation errors to stderr.
