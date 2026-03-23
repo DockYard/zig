@@ -649,6 +649,35 @@ pub fn build(b: *std.Build) !void {
     unit_tests.root_module.addOptions("build_options", exe_options);
     unit_tests_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
+    const zir_api_tests_step = b.step("test-zir-api", "Run zir_api unit tests");
+    const zir_api_tests_aro_mod = b.createModule(.{
+        .root_source_file = b.path("lib/compiler/aro/aro.zig"),
+    });
+    const zir_api_tests_aro_translate_c_mod = b.createModule(.{
+        .root_source_file = b.path("lib/compiler/aro_translate_c.zig"),
+    });
+    zir_api_tests_aro_translate_c_mod.addImport("aro", zir_api_tests_aro_mod);
+    const zir_api_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/zir_api.zig"),
+        .target = target,
+        .optimize = optimize,
+        .single_threaded = single_threaded,
+    });
+    zir_api_tests_mod.addImport("aro", zir_api_tests_aro_mod);
+    zir_api_tests_mod.addImport("aro_translate_c", zir_api_tests_aro_translate_c_mod);
+    const zir_api_tests = b.addTest(.{
+        .root_module = zir_api_tests_mod,
+        .filters = test_filters,
+        .use_llvm = use_llvm,
+        .use_lld = use_llvm,
+        .zig_lib_dir = b.path("lib"),
+    });
+    if (link_libc) {
+        zir_api_tests.root_module.link_libc = true;
+    }
+    zir_api_tests.root_module.addOptions("build_options", exe_options);
+    zir_api_tests_step.dependOn(&b.addRunArtifact(zir_api_tests).step);
+
     test_step.dependOn(tests.addCompareOutputTests(b, test_filters, optimization_modes));
     test_step.dependOn(tests.addStandaloneTests(
         b,

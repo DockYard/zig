@@ -108,7 +108,8 @@ pub fn initSymbols(self: *InternalObject, macho_file: *MachO) !void {
     self.objc_msg_send_index = newSymbolAssumeCapacity(self, try self.addString(gpa, "_objc_msgSend"), .{});
 
     if (!macho_file.base.isDynLib()) {
-        self.entry_index = newSymbolAssumeCapacity(self, try self.addString(gpa, macho_file.entry_name orelse "_main"), .{});
+        const entry_name = macho_file.entry_name orelse "_main";
+        self.entry_index = newSymbolAssumeCapacity(self, try self.addString(gpa, entry_name), .{});
         self.mh_execute_header_index = newSymbolAssumeCapacity(self, try self.addString(gpa, "__mh_execute_header"), .{
             .type = macho.N_SECT | macho.N_EXT,
             .desc = macho.REFERENCED_DYNAMICALLY,
@@ -122,6 +123,7 @@ pub fn initSymbols(self: *InternalObject, macho_file: *MachO) !void {
     self.dso_handle_index = newSymbolAssumeCapacity(self, try self.addString(gpa, "___dso_handle"), .{
         .type = macho.N_SECT | macho.N_EXT,
     });
+    self.symbols.items[self.dso_handle_index.?].visibility = .hidden;
     self.dyld_private_index = newSymbolAssumeCapacity(self, try self.addString(gpa, "dyld_private"), .{
         .type = macho.N_SECT,
     });

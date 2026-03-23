@@ -121,9 +121,6 @@ pub export fn zir_compilation_update(ctx: *ZirContext) i32 {
     defer prog_node.end();
     ctx.compilation.update(prog_node) catch |err| {
         logErr("update failed: {s}", .{@errorName(err)});
-        if (@errorReturnTrace()) |trace| {
-            std.debug.dumpStackTrace(trace.*);
-        }
         // Print detailed errors
         var error_bundle = ctx.compilation.getAllErrorsAlloc() catch |e| {
             logErr("getAllErrorsAlloc failed: {s}", .{@errorName(e)});
@@ -390,7 +387,6 @@ fn addModuleImpl(ctx: *ZirContext, name: []const u8, source_path: []const u8) !v
             }
         }
     }
-
 }
 
 fn addModuleSourceImpl(ctx: *ZirContext, name: []const u8, source: []const u8) !void {
@@ -416,7 +412,6 @@ fn addModuleSourceImpl(ctx: *ZirContext, name: []const u8, source: []const u8) !
         logErr("addModuleSource: writeFile failed: {s}", .{@errorName(err)});
         return error.OutOfMemory;
     };
-
 
     // Null-terminate the strings for the C-ABI add_module path.
     const full_path_z = try ar.dupeZ(u8, full_path);
@@ -531,7 +526,14 @@ fn createImpl(
         return error.OutOfMemory;
     };
     errdefer gpa.destroy(ctx);
-    ctx.gpa = gpa;
+    ctx.* = .{
+        .gpa = gpa,
+        .arena_state = undefined,
+        .thread_pool = undefined,
+        .dirs = undefined,
+        .compilation = undefined,
+        .root_mod = undefined,
+    };
     ctx.arena_state = std.heap.ArenaAllocator.init(gpa);
     errdefer ctx.arena_state.deinit();
     const ar = ctx.arena_state.allocator();
@@ -725,7 +727,6 @@ fn addZirImpl(ctx: *ZirContext, name: []const u8, data: *const ZirData) !void {
         logErr("addZir: zcu is null", .{});
         return error.OutOfMemory;
     };
-
 
     const inst_len: usize = data.instructions_len;
 
@@ -1526,4 +1527,102 @@ pub export fn zir_builder_inject(
     std.heap.page_allocator.destroy(b);
 
     return 0;
+}
+
+fn testRepoLibDir(allocator: Allocator) ![]u8 {
+    return std.fs.cwd().realpathAlloc(allocator, "lib") catch |err| switch (err) {
+        error.FileNotFound => blk: {
+            const src_dir = std.fs.path.dirname(@src().file) orelse break :blk error.FileNotFound;
+            const lib_path = try std.fs.path.join(allocator, &.{ src_dir, "..", "lib" });
+            defer allocator.free(lib_path);
+            break :blk std.fs.cwd().realpathAlloc(allocator, lib_path);
+        },
+        else => err,
+    };
+}
+
+fn testExpectSegmentVmaddrOrder(file_path: []const u8, allocator: Allocator) !void {
+    const bytes = try std.fs.cwd().readFileAlloc(allocator, file_path, 16 * 1024 * 1024);
+    defer allocator.free(bytes);
+
+    try std.testing.expect(bytes.len >= @sizeOf(std.macho.mach_header_64));
+
+    const header: *align(1) const std.macho.mach_header_64 = @ptrCast(bytes.ptr);
+    try std.testing.expectEqual(std.macho.MH_MAGIC_64, header.magic);
+
+    var offset: usize = @sizeOf(std.macho.mach_header_64);
+    var last_vmaddr: u64 = 0;
+
+    for (0..header.ncmds) |_| {
+        try std.testing.expect(offset + @sizeOf(std.macho.load_command) <= bytes.len);
+        const lc: *align(1) const std.macho.load_command = @ptrCast(bytes.ptr + offset);
+        try std.testing.expect(offset + lc.cmdsize <= bytes.len);
+
+        if (lc.cmd == .SEGMENT_64) {
+            const seg: *align(1) const std.macho.segment_command_64 = @ptrCast(bytes.ptr + offset);
+            try std.testing.expect(seg.vmaddr >= last_vmaddr);
+            last_vmaddr = seg.vmaddr;
+        }
+
+        offset += lc.cmdsize;
+    }
+}
+
+test "zir_api: injected executable update succeeds" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("local-cache");
+    try tmp.dir.makePath("global-cache");
+
+    const zig_lib_dir = try testRepoLibDir(allocator);
+    defer allocator.free(zig_lib_dir);
+
+    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const original_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(original_cwd);
+    try std.posix.chdir(tmp_path);
+    defer std.posix.chdir(original_cwd) catch {};
+
+    const local_cache_dir = try std.fs.path.join(allocator, &.{ tmp_path, "local-cache" });
+    defer allocator.free(local_cache_dir);
+    const global_cache_dir = try std.fs.path.join(allocator, &.{ tmp_path, "global-cache" });
+    defer allocator.free(global_cache_dir);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_path, "repro-bin" });
+    defer allocator.free(output_path);
+
+    const ctx = try createImpl(
+        zig_lib_dir,
+        local_cache_dir,
+        global_cache_dir,
+        output_path,
+        "zir_api_oom_repro",
+        0,
+        1,
+        false,
+        true,
+    );
+    defer zir_compilation_destroy(ctx);
+
+    try addModuleSourceImpl(ctx, "zap_runtime", "pub fn noop() void {}\n");
+
+    var builder = try zir_builder.Builder.init(allocator);
+    defer builder.deinit();
+
+    const body = try builder.beginFunction("main", .void);
+    try builder.endFunction(body);
+
+    const fzir = try builder.finalize();
+    try addZirFromFinalized(ctx, fzir);
+
+    try std.testing.expectEqual(@as(i32, 0), zir_compilation_update(ctx));
+
+    const file = try std.fs.cwd().openFile(output_path, .{});
+    defer file.close();
+
+    try testExpectSegmentVmaddrOrder(output_path, allocator);
 }

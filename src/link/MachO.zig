@@ -202,12 +202,7 @@ pub fn createEmpty(
         .install_name = options.install_name,
         .entitlements = options.entitlements,
         .compatibility_version = options.compatibility_version,
-        .entry_name = switch (options.entry) {
-            .disabled => null,
-            .default => if (output_mode != .Exe) null else default_entry_symbol_name,
-            .enabled => default_entry_symbol_name,
-            .named => |name| name,
-        },
+        .entry_name = null,
         .platform = Platform.fromTarget(target),
         .sdk_version = if (options.darwin_sdk_layout) |layout| inferSdkVersion(comp, layout) else null,
         .undefined_treatment = if (allow_shlib_undefined) .dynamic_lookup else .@"error",
@@ -216,6 +211,12 @@ pub fn createEmpty(
         .framework_dirs = options.framework_dirs,
         .force_load_objc = options.force_load_objc,
         .discard_local_symbols = options.discard_local_symbols,
+    };
+    self.entry_name = switch (options.entry) {
+        .disabled => null,
+        .default => if (output_mode != .Exe) null else default_entry_symbol_name,
+        .enabled => default_entry_symbol_name,
+        .named => |name| name,
     };
     errdefer self.base.destroy();
 
@@ -1743,10 +1744,14 @@ fn getSegmentProt(segname: []const u8) macho.vm_prot_t {
 fn getSegmentRank(segname: []const u8) u8 {
     if (mem.eql(u8, segname, "__PAGEZERO")) return 0x0;
     if (mem.eql(u8, segname, "__LINKEDIT")) return 0xf;
-    if (mem.indexOf(u8, segname, "ZIG")) |_| return 0xe;
+    if (mem.startsWith(u8, segname, "__TEXT_ZIG")) return 0xb;
+    if (mem.startsWith(u8, segname, "__CONST_ZIG")) return 0xc;
+    if (mem.startsWith(u8, segname, "__DATA_ZIG")) return 0xd;
+    if (mem.startsWith(u8, segname, "__BSS_ZIG")) return 0xe;
     if (mem.startsWith(u8, segname, "__TEXT")) return 0x1;
     if (mem.startsWith(u8, segname, "__DATA_CONST")) return 0x2;
     if (mem.startsWith(u8, segname, "__DATA")) return 0x3;
+    if (mem.indexOf(u8, segname, "ZIG")) |_| return 0xe;
     return 0x4;
 }
 
@@ -2875,13 +2880,31 @@ fn writeLoadCommands(self: *MachO) !struct { usize, usize, u64 } {
     // Segment and section load commands
     {
         const slice = self.sections.slice();
-        var sect_id: usize = 0;
-        for (self.segments.items) |seg| {
+        const SegIndex = struct {
+            index: u8,
+
+            fn lessThan(macho_file: *MachO, lhs: @This(), rhs: @This()) bool {
+                const lhs_seg = macho_file.segments.items[lhs.index];
+                const rhs_seg = macho_file.segments.items[rhs.index];
+                if (lhs_seg.vmaddr == rhs_seg.vmaddr) return lhs.index < rhs.index;
+                return lhs_seg.vmaddr < rhs_seg.vmaddr;
+            }
+        };
+
+        var seg_order = try std.array_list.Managed(SegIndex).initCapacity(gpa, self.segments.items.len);
+        defer seg_order.deinit();
+        for (0..self.segments.items.len) |index| {
+            seg_order.appendAssumeCapacity(.{ .index = @intCast(index) });
+        }
+        mem.sort(SegIndex, seg_order.items, self, SegIndex.lessThan);
+
+        for (seg_order.items) |entry| {
+            const seg = self.segments.items[entry.index];
             try writer.writeStruct(seg);
-            for (slice.items(.header)[sect_id..][0..seg.nsects]) |header| {
+            for (slice.items(.header), slice.items(.segment_id)) |header, segment_id| {
+                if (segment_id != entry.index) continue;
                 try writer.writeStruct(header);
             }
-            sect_id += seg.nsects;
         }
         ncmds += self.segments.items.len;
     }
@@ -4072,7 +4095,7 @@ const is_hot_update_compatible = switch (builtin.target.os.tag) {
     else => false,
 };
 
-const default_entry_symbol_name = "_main";
+const default_entry_symbol_name: []const u8 = "_main";
 
 const Section = struct {
     header: macho.section_64,

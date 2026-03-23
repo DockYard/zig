@@ -87,7 +87,7 @@ pub fn RegisterManager(
                 max_id = @max(elem_id, max_id);
             }
 
-            comptime var map: [max_id - min_id + 1]std.math.IntFittingRange(0, set.len) = @splat(set.len);
+            comptime var map: [@as(usize, max_id) - @as(usize, min_id) + 1]std.math.IntFittingRange(0, set.len) = @splat(set.len);
             inline for (set, 0..) |elem, elem_index| map[comptime elem.id() - min_id] = elem_index;
 
             const id_index = reg.id() -% min_id;
@@ -531,7 +531,7 @@ test "tryAllocReg: no spilling" {
     };
     defer function.deinit();
 
-    const mock_instruction: Air.Inst.Index = 1;
+    const mock_instruction: Air.Inst.Index = @enumFromInt(1);
     const gp = MockRegister1.gp;
 
     try expectEqual(@as(?MockRegister1, .r2), function.register_manager.tryAllocReg(mock_instruction, gp));
@@ -560,7 +560,7 @@ test "allocReg: spilling" {
     };
     defer function.deinit();
 
-    const mock_instruction: Air.Inst.Index = 1;
+    const mock_instruction: Air.Inst.Index = @enumFromInt(1);
     const gp = MockRegister1.gp;
 
     try expectEqual(@as(?MockRegister1, .r2), try function.register_manager.allocReg(mock_instruction, gp));
@@ -702,7 +702,7 @@ test "getReg" {
     };
     defer function.deinit();
 
-    const mock_instruction: Air.Inst.Index = 1;
+    const mock_instruction: Air.Inst.Index = @enumFromInt(1);
 
     try function.register_manager.getReg(.r3, mock_instruction);
 

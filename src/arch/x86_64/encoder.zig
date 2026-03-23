@@ -1,9 +1,18 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const log = std.log.scoped(.x86_64_encoder);
 const math = std.math;
 const testing = std.testing;
 const Writer = std.io.Writer;
+
+fn testTarget() !std.Target {
+    return (try std.zig.system.resolveTargetQuery(.{
+        .cpu_arch = .x86_64,
+        .os_tag = builtin.target.os.tag,
+        .abi = builtin.target.abi,
+    })).result;
+}
 
 const bits = @import("bits.zig");
 const Encoding = @import("Encoding.zig");
@@ -1205,7 +1214,8 @@ const TestEncode = struct {
         ops: []const Instruction.Operand,
     ) !void {
         var writer: std.Io.Writer = .fixed(&enc.buffer);
-        const inst: Instruction = try .new(.none, mnemonic, ops);
+        const target = try testTarget();
+        const inst: Instruction = try .new(.none, mnemonic, ops, &target);
         try inst.encode(&writer, .{});
         enc.index = writer.bufferedLen();
     }
@@ -1216,15 +1226,15 @@ const TestEncode = struct {
 };
 
 test "encode" {
-    var buf = std.array_list.Managed(u8).init(testing.allocator);
-    defer buf.deinit();
-
+    const target = try testTarget();
     const inst: Instruction = try .new(.none, .mov, &.{
         .{ .reg = .rbx },
         .{ .imm = .u(4) },
-    });
-    try inst.encode(buf.writer(), .{});
-    try testing.expectEqualSlices(u8, &.{ 0x48, 0xc7, 0xc3, 0x4, 0x0, 0x0, 0x0 }, buf.items);
+    }, &target);
+    var buf: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer buf.deinit();
+    try inst.encode(&buf.writer, .{});
+    try testing.expectEqualSlices(u8, &.{ 0x48, 0xc7, 0xc3, 0x4, 0x0, 0x0, 0x0 }, buf.writer.buffered());
 }
 
 test "lower I encoding" {
@@ -1954,8 +1964,8 @@ test "lower NP encoding" {
 }
 
 fn invalidInstruction(mnemonic: Instruction.Mnemonic, ops: []const Instruction.Operand) !void {
-    const err: Instruction = .new(.none, mnemonic, ops);
-    try testing.expectError(error.InvalidInstruction, err);
+    const target = try testTarget();
+    try testing.expectError(error.InvalidInstruction, Instruction.new(.none, mnemonic, ops, &target));
 }
 
 test "invalid instruction" {
@@ -2007,7 +2017,8 @@ test "invalid instruction" {
 }
 
 fn cannotEncode(mnemonic: Instruction.Mnemonic, ops: []const Instruction.Operand) !void {
-    try testing.expectError(error.CannotEncode, .new(.none, mnemonic, ops));
+    const target = try testTarget();
+    try testing.expectError(error.CannotEncode, Instruction.new(.none, mnemonic, ops, &target));
 }
 
 test "cannot encode" {
@@ -2190,8 +2201,9 @@ const Assembler = struct {
     }
 
     pub fn assemble(as: *Assembler, w: *Writer) !void {
+        const target = try testTarget();
         while (try as.next()) |parsed_inst| {
-            const inst: Instruction = try .new(.none, parsed_inst.mnemonic, &parsed_inst.ops);
+            const inst: Instruction = try .new(.none, parsed_inst.mnemonic, &parsed_inst.ops, &target);
             try inst.encode(w, .{});
         }
     }
@@ -2647,10 +2659,10 @@ test "assemble" {
     // zig fmt: on
 
     var as = Assembler.init(input);
-    var output = std.array_list.Managed(u8).init(testing.allocator);
+    var output: std.Io.Writer.Allocating = .init(testing.allocator);
     defer output.deinit();
-    try as.assemble(output.writer());
-    try expectEqualHexStrings(expected, output.items, input);
+    try as.assemble(&output.writer);
+    try expectEqualHexStrings(expected, output.writer.buffered(), input);
 }
 
 test "assemble - Jcc" {
@@ -2691,10 +2703,10 @@ test "assemble - Jcc" {
         const input = @tagName(mnemonic[0]) ++ " 0x0";
         const expected = [_]u8{ 0x0f, mnemonic[1], 0x0, 0x0, 0x0, 0x0 };
         var as = Assembler.init(input);
-        var output = std.array_list.Managed(u8).init(testing.allocator);
+        var output: std.Io.Writer.Allocating = .init(testing.allocator);
         defer output.deinit();
-        try as.assemble(output.writer());
-        try expectEqualHexStrings(&expected, output.items, input);
+        try as.assemble(&output.writer);
+        try expectEqualHexStrings(&expected, output.writer.buffered(), input);
     }
 }
 
@@ -2736,10 +2748,10 @@ test "assemble - SETcc" {
         const input = @tagName(mnemonic[0]) ++ " al";
         const expected = [_]u8{ 0x0f, mnemonic[1], 0xC0 };
         var as = Assembler.init(input);
-        var output = std.array_list.Managed(u8).init(testing.allocator);
+        var output: std.Io.Writer.Allocating = .init(testing.allocator);
         defer output.deinit();
-        try as.assemble(output.writer());
-        try expectEqualHexStrings(&expected, output.items, input);
+        try as.assemble(&output.writer);
+        try expectEqualHexStrings(&expected, output.writer.buffered(), input);
     }
 }
 
@@ -2781,9 +2793,9 @@ test "assemble - CMOVcc" {
         const input = @tagName(mnemonic[0]) ++ " rax, rbx";
         const expected = [_]u8{ 0x48, 0x0f, mnemonic[1], 0xC3 };
         var as = Assembler.init(input);
-        var output = std.array_list.Managed(u8).init(testing.allocator);
+        var output: std.Io.Writer.Allocating = .init(testing.allocator);
         defer output.deinit();
-        try as.assemble(output.writer());
-        try expectEqualHexStrings(&expected, output.items, input);
+        try as.assemble(&output.writer);
+        try expectEqualHexStrings(&expected, output.writer.buffered(), input);
     }
 }
