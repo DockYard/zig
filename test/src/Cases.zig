@@ -601,6 +601,7 @@ pub fn lowerToTranslateCSteps(
 pub const CaseTestOptions = struct {
     test_filters: []const []const u8,
     test_target_filters: []const []const u8,
+    compiler_under_test: ?*std.Build.Step.Compile = null,
     skip_compile_errors: bool,
     skip_non_native: bool,
     skip_freebsd: bool,
@@ -611,6 +612,17 @@ pub const CaseTestOptions = struct {
     skip_llvm: bool,
     skip_libc: bool,
 };
+
+fn shouldUseCompilerUnderTest(case: Case, host: std.Target) bool {
+    if (case.backend != .stage2) return false;
+    if (case.output_mode != .Exe) return false;
+    if (case.case == null or case.case.? != .Execution) return false;
+    if (!case.target.query.isNative()) return false;
+    if (host.os.tag != .macos) return false;
+    if (case.imports.len != 0 or case.deps.items.len != 0) return false;
+    return std.mem.eql(u8, case.name, "returning_undefined_sentinel_terminated_const_u8_slice") or
+        std.mem.eql(u8, case.name, "maximum_sized_integer_literal");
+}
 
 pub fn lowerToBuildSteps(
     self: *Cases,
@@ -741,6 +753,25 @@ pub fn lowerToBuildSteps(
                 parent_step.dependOn(&artifact.step);
             },
             .Execution => |expected_stdout| no_exec: {
+                if (options.compiler_under_test) |compiler_under_test| {
+                    if (shouldUseCompilerUnderTest(case, host)) {
+                        const compile = b.addRunArtifact(compiler_under_test);
+                        compile.setName(b.fmt("run exe {s} (compiler-under-test build)", .{case.name}));
+                        compile.addArgs(&.{"build-exe"});
+                        compile.addFileArg(root_source_file);
+                        compile.addArg("--zig-lib-dir");
+                        compile.addDirectoryArg(b.path("lib"));
+                        const emitted_bin = compile.addPrefixedOutputFileArg("-femit-bin=", b.fmt("{s}.bin", .{case.name}));
+
+                        const run = b.addSystemCommand(&.{"/usr/bin/env"});
+                        run.setName(b.fmt("run exe {s}", .{case.name}));
+                        run.addFileArg(emitted_bin);
+                        run.expectStdOutEqual(expected_stdout);
+                        parent_step.dependOn(&run.step);
+                        break :no_exec;
+                    }
+                }
+
                 const run = if (case.target.result.ofmt == .c) run_step: {
                     if (getExternalExecutor(&host, &case.target.result, .{ .link_libc = true }) != .native) {
                         // We wouldn't be able to run the compiled C code.

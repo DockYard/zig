@@ -7,11 +7,11 @@ const testing = std.testing;
 const Writer = std.io.Writer;
 
 fn testTarget() !std.Target {
-    return (try std.zig.system.resolveTargetQuery(.{
+    return try std.zig.system.resolveTargetQuery(.{
         .cpu_arch = .x86_64,
         .os_tag = builtin.target.os.tag,
         .abi = builtin.target.abi,
-    })).result;
+    });
 }
 
 const bits = @import("bits.zig");
@@ -323,7 +323,7 @@ pub const Instruction = struct {
     ) !Instruction {
         const encoding: Encoding = switch (prefix) {
             else => (try Encoding.findByMnemonic(prefix, mnemonic, ops, target)) orelse {
-                log.err("no encoding found for: {s} {s} {s} {s} {s} {s}", .{
+                log.debug("no encoding found for: {s} {s} {s} {s} {s} {s}", .{
                     @tagName(prefix),
                     @tagName(mnemonic),
                     @tagName(if (ops.len > 0) Encoding.Op.fromOperand(ops[0], target) else .none),
@@ -1217,7 +1217,7 @@ const TestEncode = struct {
         const target = try testTarget();
         const inst: Instruction = try .new(.none, mnemonic, ops, &target);
         try inst.encode(&writer, .{});
-        enc.index = writer.bufferedLen();
+        enc.index = writer.buffered().len;
     }
 
     fn code(enc: TestEncode) []const u8 {

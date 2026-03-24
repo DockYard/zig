@@ -2594,6 +2594,7 @@ pub fn addCases(
     b: *std.Build,
     parent_step: *Step,
     target: std.Build.ResolvedTarget,
+    compiler_under_test: *std.Build.Step.Compile,
     case_test_options: @import("src/Cases.zig").CaseTestOptions,
     translate_c_options: @import("src/Cases.zig").TranslateCOptions,
     build_options: @import("cases.zig").BuildOptions,
@@ -2621,7 +2622,11 @@ pub fn addCases(
     cases.lowerToBuildSteps(
         b,
         parent_step,
-        case_test_options,
+        blk: {
+            var opts = case_test_options;
+            opts.compiler_under_test = compiler_under_test;
+            break :blk opts;
+        },
     );
 }
 
