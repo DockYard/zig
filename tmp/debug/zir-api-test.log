@@ -1,0 +1,33 @@
+test-zir-api
++- run test 7/8 passed, 1 failed
+error: 'zir_api.test.zir_api: injected executable update succeeds' failed: zir_api: bin_file=38336172880, zcu=38336168064
+dylib.parseTbd exports=9239 dependents=0 strtab_bytes=209184
+dylib.initSymbols nsyms=9239 symbol_bytes~=443472 extra_bytes~=258692 globals=9239
+dylib.initSymbols symbols capacity ok
+dylib.initSymbols extras capacity ok
+dylib.initSymbols globals capacity ok
+dylib.initSymbols completed
+macho.flush parseInputFiles done objects=0 dylibs=1 files=3
+macho.flush parseDependentDylibs done dylibs=1 files=3
+macho.flush force_undefined=0
+macho.flush internal file slot added index=3
+macho.flush internal object init done
+zir_api: update failed: OutOfMemory
+zir_api: error count from update catch: 0
+zir_api: no error messages in bundle despite error count
+expected 0, found -1
+/Users/bcardarella/projects/zig/lib/std/testing.zig:110:17: 0x1030c4e03 in expectEqualInner__anon_1429725 (test)
+                return error.TestExpectedEqual;
+                ^
+/Users/bcardarella/projects/zig/src/zir_api.zig:1592:5: 0x1030c6153 in test.zir_api: injected executable update succeeds (test)
+    try std.testing.expectEqual(@as(i32, 0), zir_compilation_update(ctx));
+    ^
+error: while executing test 'Package.Fetch.test_0', the following test command failed:
+./.zig-cache/o/ba09bfaed0be64e4b2134b337a6a543a/test --cache-dir=./.zig-cache --seed=0xdf1aa7db --listen=-
+
+Build Summary: 2/4 steps succeeded; 1 failed; 7/8 tests passed; 1 failed
+test-zir-api transitive failure
++- run test 7/8 passed, 1 failed
+
+error: the following build command failed with exit code 1:
+.zig-cache/o/d8e6f31947269e3c6812bb8b20c37819/build /Users/bcardarella/.asdf/installs/zig/0.15.2/zig /Users/bcardarella/.asdf/installs/zig/0.15.2/lib /Users/bcardarella/projects/zig .zig-cache /Users/bcardarella/.cache/zig --seed 0xdf1aa7db -Z4d98192081c16f98 test-zir-api -Dtest-filter=zir_api: injected executable update succeeds

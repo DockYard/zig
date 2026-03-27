@@ -1,0 +1,13 @@
+test-cases
++- run exe returning_undefined_sentinel_terminated_const_u8_slice failure
+dyld[7895]: segment '__CONST_ZIG' vm address out of order in /Users/bcardarella/projects/zig/tmp/debug/cache5/o/45c5cf6c97cd9daa05ab116a2539760a/returning_undefined_sentinel_terminated_const_u8_slice
+dyld[7895]: segment '__CONST_ZIG' vm address out of order
+error: the following command terminated with signal 6 (expected exited with code 0):
+./tmp/debug/cache5/o/45c5cf6c97cd9daa05ab116a2539760a/returning_undefined_sentinel_terminated_const_u8_slice
+
+Build Summary: 7/9 steps succeeded; 1 failed
+test-cases transitive failure
++- run exe returning_undefined_sentinel_terminated_const_u8_slice failure
+
+error: the following build command failed with exit code 1:
+tmp/debug/cache5/o/9d7bb798b6554cc6c77239fe2c347413/build /Users/bcardarella/.asdf/installs/zig/0.15.2/zig /Users/bcardarella/.asdf/installs/zig/0.15.2/lib /Users/bcardarella/projects/zig tmp/debug/cache5 /Users/bcardarella/.cache/zig --seed 0x9f7fda19 -Zf9c7df00f94154d7 test-cases -Dtest-filter=returning_undefined_sentinel_terminated_const_u8_slice -Dtest-target-filter=native

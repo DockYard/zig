@@ -577,6 +577,40 @@ pub const FuncBody = struct {
         return self.emitBodyInst(.bool_not, Builder.encodeUnNode(.zero, operand));
     }
 
+    /// Emit `@as(dest_type, operand)`. Returns a Ref to the coerced value.
+    pub fn addAs(self: *FuncBody, dest_type: Zir.Inst.Ref, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        const payload_idx: u32 = @intCast(self.builder.extra.items.len);
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(dest_type));
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(operand));
+        return self.emitBodyInst(.as_node, Builder.encodePlNode(.zero, payload_idx));
+    }
+
+    /// Emit `@ptrCast(dest_type, operand)`. Returns a Ref to the casted value.
+    pub fn addPtrCast(self: *FuncBody, dest_type: Zir.Inst.Ref, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.addBinOp(.ptr_cast, dest_type, operand);
+    }
+
+    /// Emit a full pointer cast with nested flags such as `@alignCast`.
+    pub fn addFullPtrCast(self: *FuncBody, flags: Zir.Inst.FullPtrCastFlags, dest_type: Zir.Inst.Ref, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        const payload_idx: u32 = @intCast(self.builder.extra.items.len);
+        try self.builder.extra.append(self.builder.gpa, 0); // Ast.Node.Offset synthetic node
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(dest_type));
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(operand));
+        return self.emitBodyInst(
+            .extended,
+            Builder.encodeExtended(
+                @intFromEnum(Zir.Inst.Extended.ptr_cast_full),
+                @bitCast(@as(u16, @intCast(@as(u5, @bitCast(flags))))),
+                payload_idx,
+            ),
+        );
+    }
+
+    /// Emit `@alignCast(dest_type, operand)`. Returns a Ref to the casted value.
+    pub fn addAlignCast(self: *FuncBody, dest_type: Zir.Inst.Ref, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.addFullPtrCast(.{ .align_cast = true }, dest_type, operand);
+    }
+
     /// Emit @TypeOf(operand). Returns a Ref to the type.
     /// ZIR tag: .typeof, data field: .un_node
     pub fn addTypeOf(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
@@ -1887,4 +1921,50 @@ test "Builder: addIsNonNull and addOptionalPayloadSafe" {
     // Verify un_node data for optional_payload_safe
     const payload_data = data_items[6].un_node;
     try std.testing.expectEqual(opt_val, payload_data.operand);
+}
+
+test "Builder: addAs and addPtrCast" {
+    var builder = try Builder.init(std.testing.allocator);
+    defer builder.deinit();
+
+    const body = try builder.beginFunction("test_casts", .void);
+    const value = try body.addParam("value", Zir.Inst.Ref.usize_type);
+    const casted = try body.addAs(Zir.Inst.Ref.anyopaque_type, value);
+    const ptr_casted = try body.addPtrCast(Zir.Inst.Ref.anyopaque_type, casted);
+    _ = ptr_casted;
+
+    try builder.endFunction(body);
+    const result = try builder.finalize();
+
+    const data_items: []const Zir.Inst.Data = @alignCast(std.mem.bytesAsSlice(Zir.Inst.Data, result.instructions_data));
+
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.as_node), result.instructions_tags[5]);
+    const as_payload_idx = data_items[5].pl_node.payload_index;
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Ref.anyopaque_type), result.extra[as_payload_idx]);
+    try std.testing.expectEqual(@intFromEnum(value), result.extra[as_payload_idx + 1]);
+
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.ptr_cast), result.instructions_tags[6]);
+    const ptr_payload_idx = data_items[6].pl_node.payload_index;
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Ref.anyopaque_type), result.extra[ptr_payload_idx]);
+    try std.testing.expectEqual(@intFromEnum(casted), result.extra[ptr_payload_idx + 1]);
+}
+
+test "Builder: addAlignCast emits ptr_cast_full" {
+    var builder = try Builder.init(std.testing.allocator);
+    defer builder.deinit();
+
+    const body = try builder.beginFunction("test_align_cast", .void);
+    const value = try body.addParam("value", Zir.Inst.Ref.anyopaque_type);
+    _ = try body.addAlignCast(Zir.Inst.Ref.anyopaque_type, value);
+
+    try builder.endFunction(body);
+    const result = try builder.finalize();
+
+    const data_items: []const Zir.Inst.Data = @alignCast(std.mem.bytesAsSlice(Zir.Inst.Data, result.instructions_data));
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.extended), result.instructions_tags[5]);
+    const ext = data_items[5].extended;
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Extended.ptr_cast_full), @intFromEnum(ext.opcode));
+
+    const flags: Zir.Inst.FullPtrCastFlags = @bitCast(@as(u5, @truncate(ext.small)));
+    try std.testing.expect(flags.align_cast);
 }

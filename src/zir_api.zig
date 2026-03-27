@@ -969,6 +969,51 @@ pub export fn zir_builder_emit_bool_not(handle: ?*ZirBuilderHandle, operand: u32
     return @intFromEnum(ref);
 }
 
+/// Emit `@as(dest_type, operand)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_as(
+    handle: ?*ZirBuilderHandle,
+    dest_type: u32,
+    operand: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const dest_type_ref: Zir.Inst.Ref = @enumFromInt(dest_type);
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addAs(dest_type_ref, operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@ptrCast(dest_type, operand)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_ptr_cast(
+    handle: ?*ZirBuilderHandle,
+    dest_type: u32,
+    operand: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const dest_type_ref: Zir.Inst.Ref = @enumFromInt(dest_type);
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addPtrCast(dest_type_ref, operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit a full pointer cast such as `@alignCast(dest_type, operand)`.
+/// `flags_bits` is the packed `u5` representation of `Zir.Inst.FullPtrCastFlags`.
+pub export fn zir_builder_emit_ptr_cast_full(
+    handle: ?*ZirBuilderHandle,
+    flags_bits: u8,
+    dest_type: u32,
+    operand: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const dest_type_ref: Zir.Inst.Ref = @enumFromInt(dest_type);
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const flags: Zir.Inst.FullPtrCastFlags = @bitCast(@as(u5, @truncate(flags_bits)));
+    const ref = body.addFullPtrCast(flags, dest_type_ref, operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
 /// Emit a function call by name.
 /// `args_ptr` points to an array of `u32` Ref values, `args_len` is the count.
 /// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.

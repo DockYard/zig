@@ -374,7 +374,7 @@ pub fn build(b: *std.Build) !void {
         }
     }
 
-    // ZIR API static library — `zig build lib` produces libzig_compiler.a
+    // ZIR API static library — `zig build lib` produces libzap_compiler.a
     // Pass -Denable-llvm -Dstatic-llvm to build with LLVM backend for real binaries.
     {
         const lib = addCompilerLibStep(b, .{
@@ -883,7 +883,7 @@ fn addCompilerLibStep(b: *std.Build, options: AddCompilerModOptions) *std.Build.
 
     const lib = b.addLibrary(.{
         .linkage = .static,
-        .name = "zig_compiler",
+        .name = "zap_compiler",
         .max_rss = 7_800_000_000,
         .root_module = lib_mod,
     });
