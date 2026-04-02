@@ -1170,73 +1170,57 @@ pub export fn zir_builder_emit_struct_init_anon(
     return @intFromEnum(ref);
 }
 
-/// Begin a switch_block on a tagged union value. Returns the instruction index
-/// and a payload Ref. Body instructions that reference the payload Ref will
-/// receive the captured union payload at runtime.
-/// Returns packed: lower 32 bits = inst_idx, upper 32 bits = payload_ref.
+/// Emit a complete switch_block instruction in a single pass.
+///
+/// Prong data is packed as sequential entries:
+///   [name_ptr, name_len, has_capture, body_insts_len, body_result, body_inst_0, body_inst_1, ...]
+///
+/// Each prong:
+///   - name_ptr/name_len: variant name string (e.g., "Ok", "Error")
+///   - has_capture: 1 for payload capture, 0 for none
+///   - body_insts_len: number of pre-emitted body instruction indices
+///   - body_result: Ref for the prong's result value
+///   - body_inst_0..N: the pre-emitted instruction indices
+///
+/// Returns packed u64: lower 32 = switch_block Ref, upper 32 = switch_block inst index.
+/// Body instructions that reference the switch_block Ref get the captured payload.
 /// Returns 0xFFFFFFFFFFFFFFFF on error.
-pub export fn zir_builder_begin_switch_block(
+pub export fn zir_builder_add_switch_block(
     handle: ?*ZirBuilderHandle,
     operand: u32,
+    prong_names_ptrs: [*]const [*]const u8,
+    prong_names_lens: [*]const u32,
+    prong_captures: [*]const u32,
+    prong_body_lens: [*]const u32,
+    prong_body_results: [*]const u32,
+    prong_body_insts: [*]const u32,
+    num_prongs: u32,
 ) callconv(.c) u64 {
     const b = getBuilder(handle) orelse return 0xFFFFFFFFFFFFFFFF;
     const body = b.active_body orelse return 0xFFFFFFFFFFFFFFFF;
-    const result = body.beginSwitchBlock(@enumFromInt(operand)) catch return 0xFFFFFFFFFFFFFFFF;
-    const lo: u64 = result.inst_idx;
-    const hi: u64 = @as(u64, @intFromEnum(result.payload_ref)) << 32;
-    return lo | hi;
-}
-
-/// Finalize a switch_block with prong data. Each prong has:
-/// - item: u32 Ref (enum literal)
-/// - has_capture: bool (1 or 0)
-/// - body_insts_ptr + body_insts_len: instruction indices for the body
-/// - body_result: u32 Ref (the result value)
-///
-/// Prongs are packed as: [item, has_capture, body_insts_len, body_result, body_inst_0, body_inst_1, ...]
-/// `prong_data_ptr` points to this packed array, `prong_data_len` is total u32 count.
-/// `num_prongs` is the number of prongs.
-/// Returns the switch result Ref or 0xFFFFFFFF on error.
-pub export fn zir_builder_finalize_switch_block(
-    handle: ?*ZirBuilderHandle,
-    inst_idx: u32,
-    operand: u32,
-    prong_data_ptr: [*]const u32,
-    prong_data_len: u32,
-    num_prongs: u32,
-) callconv(.c) u32 {
-    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
-    const body = b.active_body orelse return 0xFFFFFFFF;
     const gpa = b.gpa;
 
-    // Parse packed prong data
     const ZirBuilder = @import("zir_builder.zig");
-    const prongs = gpa.alloc(ZirBuilder.FuncBody.SwitchProng, num_prongs) catch return 0xFFFFFFFF;
+    const prongs = gpa.alloc(ZirBuilder.FuncBody.SwitchProng, num_prongs) catch return 0xFFFFFFFFFFFFFFFF;
     defer gpa.free(prongs);
 
-    var offset: u32 = 0;
+    var body_offset: u32 = 0;
     for (0..num_prongs) |i| {
-        if (offset + 4 > prong_data_len) return 0xFFFFFFFF;
-        const item: Zir.Inst.Ref = @enumFromInt(prong_data_ptr[offset]);
-        const has_capture = prong_data_ptr[offset + 1] != 0;
-        const body_insts_len = prong_data_ptr[offset + 2];
-        const body_result: Zir.Inst.Ref = @enumFromInt(prong_data_ptr[offset + 3]);
-        offset += 4;
-
-        if (offset + body_insts_len > prong_data_len) return 0xFFFFFFFF;
-        const body_insts = prong_data_ptr[offset .. offset + body_insts_len];
-        offset += body_insts_len;
-
+        const body_len = prong_body_lens[i];
         prongs[i] = .{
-            .item = item,
-            .has_capture = has_capture,
-            .body_insts = body_insts,
-            .body_result = body_result,
+            .item_name = prong_names_ptrs[i][0..prong_names_lens[i]],
+            .has_capture = prong_captures[i] != 0,
+            .body_insts = prong_body_insts[body_offset .. body_offset + body_len],
+            .body_result = @enumFromInt(prong_body_results[i]),
         };
+        body_offset += body_len;
     }
 
-    const ref = body.finalizeSwitchBlock(inst_idx, @enumFromInt(operand), prongs) catch return 0xFFFFFFFF;
-    return @intFromEnum(ref);
+    const ref = body.addSwitchBlock(@enumFromInt(operand), prongs) catch return 0xFFFFFFFFFFFFFFFF;
+    const ref_u32: u32 = @intFromEnum(ref);
+    // The instruction index is ref minus the ref_start_index offset
+    const inst_idx: u32 = ref_u32 - @intFromEnum(Zir.Inst.Index.ref_start_index);
+    return @as(u64, ref_u32) | (@as(u64, inst_idx) << 32);
 }
 
 /// Emit a union initialization: @unionInit(union_type, field_name, init_value).
