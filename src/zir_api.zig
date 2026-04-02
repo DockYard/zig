@@ -1170,6 +1170,101 @@ pub export fn zir_builder_emit_struct_init_anon(
     return @intFromEnum(ref);
 }
 
+/// Begin a switch_block on a tagged union value. Returns the instruction index
+/// and a payload Ref. Body instructions that reference the payload Ref will
+/// receive the captured union payload at runtime.
+/// Returns packed: lower 32 bits = inst_idx, upper 32 bits = payload_ref.
+/// Returns 0xFFFFFFFFFFFFFFFF on error.
+pub export fn zir_builder_begin_switch_block(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+) callconv(.c) u64 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFFFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFFFFFFFFFF;
+    const result = body.beginSwitchBlock(@enumFromInt(operand)) catch return 0xFFFFFFFFFFFFFFFF;
+    const lo: u64 = result.inst_idx;
+    const hi: u64 = @as(u64, @intFromEnum(result.payload_ref)) << 32;
+    return lo | hi;
+}
+
+/// Finalize a switch_block with prong data. Each prong has:
+/// - item: u32 Ref (enum literal)
+/// - has_capture: bool (1 or 0)
+/// - body_insts_ptr + body_insts_len: instruction indices for the body
+/// - body_result: u32 Ref (the result value)
+///
+/// Prongs are packed as: [item, has_capture, body_insts_len, body_result, body_inst_0, body_inst_1, ...]
+/// `prong_data_ptr` points to this packed array, `prong_data_len` is total u32 count.
+/// `num_prongs` is the number of prongs.
+/// Returns the switch result Ref or 0xFFFFFFFF on error.
+pub export fn zir_builder_finalize_switch_block(
+    handle: ?*ZirBuilderHandle,
+    inst_idx: u32,
+    operand: u32,
+    prong_data_ptr: [*]const u32,
+    prong_data_len: u32,
+    num_prongs: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const gpa = b.gpa;
+
+    // Parse packed prong data
+    const ZirBuilder = @import("zir_builder.zig");
+    const prongs = gpa.alloc(ZirBuilder.FuncBody.SwitchProng, num_prongs) catch return 0xFFFFFFFF;
+    defer gpa.free(prongs);
+
+    var offset: u32 = 0;
+    for (0..num_prongs) |i| {
+        if (offset + 4 > prong_data_len) return 0xFFFFFFFF;
+        const item: Zir.Inst.Ref = @enumFromInt(prong_data_ptr[offset]);
+        const has_capture = prong_data_ptr[offset + 1] != 0;
+        const body_insts_len = prong_data_ptr[offset + 2];
+        const body_result: Zir.Inst.Ref = @enumFromInt(prong_data_ptr[offset + 3]);
+        offset += 4;
+
+        if (offset + body_insts_len > prong_data_len) return 0xFFFFFFFF;
+        const body_insts = prong_data_ptr[offset .. offset + body_insts_len];
+        offset += body_insts_len;
+
+        prongs[i] = .{
+            .item = item,
+            .has_capture = has_capture,
+            .body_insts = body_insts,
+            .body_result = body_result,
+        };
+    }
+
+    const ref = body.finalizeSwitchBlock(inst_idx, @enumFromInt(operand), prongs) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit a union initialization: @unionInit(union_type, field_name, init_value).
+/// `union_type` is a Ref to the union type, `field_name_ptr`/`field_name_len`
+/// specify the variant name (will be interned as an enum_literal),
+/// `init_value` is the payload value Ref.
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_union_init(
+    handle: ?*ZirBuilderHandle,
+    union_type: u32,
+    field_name_ptr: [*]const u8,
+    field_name_len: u32,
+    init_value: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+
+    const union_type_ref: Zir.Inst.Ref = @enumFromInt(union_type);
+    const init_value_ref: Zir.Inst.Ref = @enumFromInt(init_value);
+
+    // Create an enum_literal for the field name
+    const field_name = field_name_ptr[0..field_name_len];
+    const field_name_ref = body.addEnumLiteral(field_name) catch return 0xFFFFFFFF;
+
+    const ref = body.addUnionInit(union_type_ref, field_name_ref, init_value_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
 /// Emit a function call using a Ref as the callee (e.g. from @import + field access).
 /// `args_ptr` points to an array of `u32` Ref values, `args_len` is the count.
 /// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
@@ -1550,6 +1645,37 @@ pub export fn zir_builder_set_tuple_return_type(
     }
 
     body.setTupleReturnType(refs) catch return -1;
+    return 0;
+}
+
+/// Set the current function's return type to a tagged union(enum).
+/// `names_ptrs`/`names_lens` are the variant names, `types_ptr` are the variant
+/// type Refs (use 0 for void/unit variants).
+/// Returns 0 on success, -1 on error.
+pub export fn zir_builder_set_union_return_type(
+    handle: ?*ZirBuilderHandle,
+    names_ptrs: [*]const [*]const u8,
+    names_lens: [*]const u32,
+    types_ptr: [*]const u32,
+    fields_len: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    const gpa = b.gpa;
+
+    const names = gpa.alloc([]const u8, fields_len) catch return -1;
+    defer gpa.free(names);
+    for (0..fields_len) |i| {
+        names[i] = names_ptrs[i][0..names_lens[i]];
+    }
+
+    const refs = gpa.alloc(Zir.Inst.Ref, fields_len) catch return -1;
+    defer gpa.free(refs);
+    for (0..fields_len) |i| {
+        refs[i] = @enumFromInt(types_ptr[i]);
+    }
+
+    body.setUnionReturnType(names, refs) catch return -1;
     return 0;
 }
 

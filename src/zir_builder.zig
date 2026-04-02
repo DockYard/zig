@@ -700,6 +700,24 @@ pub const FuncBody = struct {
         return self.emitBodyInst(.struct_init_anon, Builder.encodePlNode(.zero, payload_idx));
     }
 
+    /// Emit a union initialization: @unionInit(union_type, field_name, init_value)
+    /// union_type: Ref to the union type
+    /// field_name: Ref to an enum_literal for the field name
+    /// init_value: Ref to the initial value
+    pub fn addUnionInit(
+        self: *FuncBody,
+        union_type: Zir.Inst.Ref,
+        field_name: Zir.Inst.Ref,
+        init_value: Zir.Inst.Ref,
+    ) !Zir.Inst.Ref {
+        const payload_idx: u32 = @intCast(self.builder.extra.items.len);
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(union_type));
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(field_name));
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(init_value));
+
+        return self.emitBodyInst(.union_init, Builder.encodePlNode(.zero, payload_idx));
+    }
+
     /// Emit a call using a Ref as the callee (e.g. from import + field access).
     /// Returns a Ref to the result.
     ///
@@ -1073,6 +1091,219 @@ pub const FuncBody = struct {
         // Store element types for addStructInitTyped to re-emit tuple_decl in function body
         self.tuple_element_type_refs.clearRetainingCapacity();
         try self.tuple_element_type_refs.appendSlice(b.gpa, types);
+    }
+
+    /// Prong descriptor for addSwitchBlock.
+    pub const SwitchProng = struct {
+        /// The case item (enum literal Ref, e.g., from addEnumLiteral).
+        item: Zir.Inst.Ref,
+        /// Whether this prong captures the payload: `.Ok => |val| ...`
+        has_capture: bool,
+        /// ZIR instruction indices for the prong body.
+        body_insts: []const u32,
+        /// The result Ref produced by this prong body (used as the switch expression value).
+        body_result: Zir.Inst.Ref,
+    };
+
+    /// Reserve a switch_block instruction and return its Ref.
+    /// Body instructions that reference this Ref will receive the captured payload.
+    /// After building all prong bodies, call `finalizeSwitchBlock` to fill in the data.
+    pub fn beginSwitchBlock(self: *FuncBody, operand: Zir.Inst.Ref) !struct { inst_idx: u32, payload_ref: Zir.Inst.Ref } {
+        const b = self.builder;
+        _ = operand;
+
+        // Bug fix #2: Sema reads inst-1 as dbg_stmt unconditionally.
+        // Emit a debug statement before the switch_block.
+        try self.emitBodyInstVoid(.dbg_stmt, .{ .dbg_stmt = .{
+            .line = 0,
+            .column = 0,
+        } });
+
+        // Reserve the instruction slot with placeholder data
+        const inst_idx: u32 = @intCast(b.tags.items.len);
+        try b.tags.append(b.gpa, @intFromEnum(Zir.Inst.Tag.switch_block));
+        try b.data.append(b.gpa, .{ .pl_node = .{ .src_node = .zero, .payload_index = 0 } });
+        // Add to body
+        if (self.body_tracking) {
+            try self.body_inst_indices.append(b.gpa, inst_idx);
+        } else if (self.non_body_capture) |capture| {
+            try capture.append(b.gpa, inst_idx);
+        }
+        return .{ .inst_idx = inst_idx, .payload_ref = Builder.instRef(inst_idx) };
+    }
+
+    /// Fill in the switch_block instruction's extra data with prong information.
+    /// Must be called after beginSwitchBlock and after all prong bodies are built.
+    ///
+    /// Layout in extra (must be contiguous — no interleaving with break payloads):
+    ///   [0] operand: Ref
+    ///   [1] bits: packed Bits
+    ///   For each scalar case:
+    ///     [N]   item: Ref (enum literal)
+    ///     [N+1] ProngInfo: packed u32
+    ///     [N+2..N+1+body_len] instruction indices (including break_inline at end)
+    pub fn finalizeSwitchBlock(self: *FuncBody, inst_idx: u32, operand: Zir.Inst.Ref, prongs: []const SwitchProng) !Zir.Inst.Ref {
+        const b = self.builder;
+
+        var any_non_inline_capture = false;
+        for (prongs) |p| {
+            if (p.has_capture) any_non_inline_capture = true;
+        }
+
+        // Step 1: Emit ALL break_inline instructions first.
+        // Their extra data (Break payload) goes into b.extra NOW,
+        // before we start writing the SwitchBlock payload.
+        var break_indices = try b.gpa.alloc(u32, prongs.len);
+        defer b.gpa.free(break_indices);
+        for (prongs, 0..) |p, pi| {
+            const break_payload_idx: u32 = @intCast(b.extra.items.len);
+            try b.extra.append(b.gpa, 0); // Break.operand_src_node = 0
+            try b.extra.append(b.gpa, inst_idx); // Break.block_inst = the switch_block
+            break_indices[pi] = try b.addInst(.break_inline, .{ .@"break" = .{
+                .operand = p.body_result,
+                .payload_index = break_payload_idx,
+            } });
+        }
+
+        // Step 2: Write SwitchBlock extra data (contiguous, after all break payloads).
+        const payload_idx: u32 = @intCast(b.extra.items.len);
+
+        // SwitchBlock.operand
+        try b.extra.append(b.gpa, @intFromEnum(operand));
+
+        // SwitchBlock.bits
+        const bits: Zir.Inst.SwitchBlock.Bits = .{
+            .has_multi_cases = false,
+            .special_prongs = .none,
+            .any_has_tag_capture = false,
+            .any_non_inline_capture = any_non_inline_capture,
+            .has_continue = false,
+            .scalar_cases_len = @intCast(prongs.len),
+        };
+        try b.extra.append(b.gpa, @bitCast(bits));
+
+        // No conditional trailing fields (all has_* flags false except has_fields)
+
+        // Scalar cases: contiguous [item, ProngInfo, body_insts...]
+        for (prongs, 0..) |p, pi| {
+            try b.extra.append(b.gpa, @intFromEnum(p.item));
+
+            const prong_info: Zir.Inst.SwitchBlock.ProngInfo = .{
+                .body_len = @intCast(p.body_insts.len + 1), // +1 for break
+                .capture = if (p.has_capture) .by_val else .none,
+                .is_inline = false,
+                .has_tag_capture = false,
+            };
+            try b.extra.append(b.gpa, @bitCast(prong_info));
+
+            for (p.body_insts) |inst_i| {
+                try b.extra.append(b.gpa, inst_i);
+            }
+            try b.extra.append(b.gpa, break_indices[pi]);
+        }
+
+        // Step 3: Patch the switch_block instruction to point to our payload.
+        b.data.items[inst_idx] = .{ .pl_node = .{
+            .src_node = .zero,
+            .payload_index = payload_idx,
+        } };
+
+        return Builder.instRef(inst_idx);
+    }
+
+    /// Emit a tagged union(enum) type declaration and store it as the return type.
+    /// `variant_names` and `variant_types` are parallel arrays.
+    /// A variant_type of `.none` means a void/unit variant.
+    ///
+    /// The union_decl ZIR extended instruction has this exact layout:
+    ///   Extra[operand+0..5]: UnionDecl { fields_hash_0..3, src_line, src_node }
+    ///   Trailing (ordered by Small flags):
+    ///     [tag_type: Ref]          if has_tag_type
+    ///     [captures_len: u32]      if has_captures_len
+    ///     [body_len: u32]          if has_body_len
+    ///     [fields_len: u32]        if has_fields_len
+    ///     [decls_len: u32]         if has_decls_len
+    ///     [captures...]            2 u32 per capture
+    ///     [decls...]               1 u32 per decl
+    ///     [body...]                1 u32 per body inst
+    ///     [bit_bags...]            1 u32 per 8 fields (4 bits per field)
+    ///     [field_data...]          per field: name + conditional type/align/tag
+    pub fn setUnionReturnType(self: *FuncBody, variant_names: []const []const u8, variant_types: []const Zir.Inst.Ref) !void {
+        std.debug.assert(variant_names.len == variant_types.len);
+        const b = self.builder;
+        const fields_len: u32 = @intCast(variant_names.len);
+
+        // --- UnionDecl fixed payload (6 u32s) ---
+        const union_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, 0); // fields_hash_0
+        try b.extra.append(b.gpa, 0); // fields_hash_1
+        try b.extra.append(b.gpa, 0); // fields_hash_2
+        try b.extra.append(b.gpa, 0); // fields_hash_3
+        try b.extra.append(b.gpa, 0); // src_line = 0
+        try b.extra.append(b.gpa, 0); // src_node = 0
+
+        const small: Zir.Inst.UnionDecl.Small = .{
+            .has_tag_type = false,
+            .has_captures_len = false,
+            .has_body_len = false,
+            .has_fields_len = true,
+            .has_decls_len = false,
+            .name_strategy = .anon,
+            .layout = .auto,
+            .auto_enum_tag = true, // union(enum)
+            .any_aligned_fields = false,
+        };
+
+        // --- Trailing conditional fields (ordered by flag bits) ---
+        // has_tag_type=false → skip
+        // has_captures_len=false → skip
+        // has_body_len=false → skip
+        // has_fields_len=true → emit fields_len
+        try b.extra.append(b.gpa, fields_len);
+        // has_decls_len=false → skip
+
+        // --- Captures (none) ---
+        // --- Decls (none) ---
+        // --- Body (none) ---
+
+        // --- Bit bags: 4 bits per field, 8 fields per u32 ---
+        // For each field: bit 0 = has_type, bit 1 = has_align, bit 2 = has_tag, bit 3 = unused
+        // All our variants have types, no alignment, no explicit tag value.
+        const num_bit_bags = (fields_len + 7) / 8;
+        for (0..num_bit_bags) |bag_i| {
+            var bit_bag: u32 = 0;
+            const fields_in_bag = @min(fields_len - @as(u32, @intCast(bag_i)) * 8, 8);
+            for (0..fields_in_bag) |field_in_bag| {
+                const has_type: u32 = if (variant_types[bag_i * 8 + field_in_bag] != .none) 1 else 0;
+                // has_align=0, has_tag=0, unused=0
+                bit_bag |= has_type << @intCast(field_in_bag * 4);
+            }
+            try b.extra.append(b.gpa, bit_bag);
+        }
+
+        // --- Per-field data ---
+        for (0..variant_names.len) |i| {
+            // Field name (NullTerminatedString index)
+            const name_idx = try b.internString(variant_names[i]);
+            try b.extra.append(b.gpa, name_idx);
+            // Field type (only if has_type bit is set)
+            if (variant_types[i] != .none) {
+                try b.extra.append(b.gpa, @intFromEnum(variant_types[i]));
+            }
+            // No align, no tag_value
+        }
+
+        const union_decl_idx = try b.addInst(
+            .extended,
+            Builder.encodeExtended(@intFromEnum(Zir.Inst.Extended.union_decl), @bitCast(small), union_payload_idx),
+        );
+
+        // Track as param instruction (declaration value body)
+        try self.param_inst_indices.append(b.gpa, union_decl_idx);
+
+        // Store as return type Ref
+        self.tuple_ret_types.clearRetainingCapacity();
+        try self.tuple_ret_types.append(b.gpa, Builder.instRef(union_decl_idx));
     }
 
     /// Emit `try operand` — unwrap an error union, panicking on error.
@@ -1967,4 +2198,66 @@ test "Builder: addAlignCast emits ptr_cast_full" {
 
     const flags: Zir.Inst.FullPtrCastFlags = @bitCast(@as(u5, @truncate(ext.small)));
     try std.testing.expect(flags.align_cast);
+}
+
+test "Builder: switch_block extra data layout" {
+    var builder = try Builder.init(std.testing.allocator);
+    defer builder.deinit();
+
+    const body = try builder.beginFunction("test_switch", .slice_const_u8_type);
+
+    // Emit a string as the operand (fake union value)
+    const operand = try body.addStr("test");
+
+    // Emit enum literal items BEFORE beginSwitchBlock
+    const ok_item = try body.addEnumLiteral("Ok");
+    const err_item = try body.addEnumLiteral("Error");
+
+    // Begin switch
+    const sw = try body.beginSwitchBlock(operand);
+
+    // Verify we got valid indices
+    try std.testing.expect(sw.inst_idx > 0);
+
+    // Build prongs (no body instructions, just break with result)
+    const ok_result = try body.addStr("ok_value");
+    const err_result = try body.addStr("err_value");
+
+    const prongs = [_]FuncBody.SwitchProng{
+        .{ .item = ok_item, .has_capture = true, .body_insts = &.{}, .body_result = ok_result },
+        .{ .item = err_item, .has_capture = true, .body_insts = &.{}, .body_result = err_result },
+    };
+
+    const result = try body.finalizeSwitchBlock(sw.inst_idx, operand, &prongs);
+    try std.testing.expect(@intFromEnum(result) > 0);
+
+    // Verify the switch_block instruction was patched
+    const data_items: []const Zir.Inst.Data = @alignCast(std.mem.bytesAsSlice(Zir.Inst.Data, @as([]const u8, std.mem.sliceAsBytes(builder.data.items))));
+    const sw_data = data_items[sw.inst_idx];
+    const payload_idx = sw_data.pl_node.payload_index;
+    try std.testing.expect(payload_idx > 0);
+
+    // Verify extra data layout
+    const extra = builder.extra.items;
+
+    // extra[payload_idx+0] = operand Ref
+    try std.testing.expectEqual(@intFromEnum(operand), extra[payload_idx]);
+
+    // extra[payload_idx+1] = bits (scalar_cases_len=2, any_non_inline_capture=true)
+    const bits: Zir.Inst.SwitchBlock.Bits = @bitCast(extra[payload_idx + 1]);
+    try std.testing.expectEqual(@as(u25, 2), bits.scalar_cases_len);
+    try std.testing.expect(bits.any_non_inline_capture);
+    try std.testing.expect(!bits.has_multi_cases);
+
+    // extra[payload_idx+2] = first scalar case item (Ok enum literal Ref)
+    try std.testing.expectEqual(@intFromEnum(ok_item), extra[payload_idx + 2]);
+
+    // extra[payload_idx+3] = ProngInfo for first case
+    const prong0_info: Zir.Inst.SwitchBlock.ProngInfo = @bitCast(extra[payload_idx + 3]);
+    try std.testing.expectEqual(@as(u28, 1), prong0_info.body_len); // 0 body + 1 break
+    try std.testing.expectEqual(Zir.Inst.SwitchBlock.ProngInfo.Capture.by_val, prong0_info.capture);
+
+    // extra[payload_idx+4] = break instruction index for prong 0
+    // extra[payload_idx+5] = second scalar case item (Error enum literal Ref)
+    try std.testing.expectEqual(@intFromEnum(err_item), extra[payload_idx + 5]);
 }
