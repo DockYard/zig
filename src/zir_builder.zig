@@ -149,13 +149,38 @@ pub const Builder = struct {
 
         const body_len: u32 = @intCast(body.body_inst_indices.items.len);
 
+        // For union return types, we need to emit a ret_ty body containing
+        // [union_decl, break_inline(func, union_decl)]. The break_inline
+        // targets the func instruction, so we must predict the func index.
+        // We emit the break_inline instruction FIRST, then build the func
+        // payload referencing both instructions in the ret_ty body.
+        var ret_break_inline_idx: u32 = undefined;
+        if (body.union_ret_type_inst) |union_decl_idx| {
+            // The next instruction we emit is the break_inline for ret_ty body.
+            // After that comes the func instruction.
+            ret_break_inline_idx = @intCast(self.tags.items.len);
+            const func_inst_predicted: u32 = ret_break_inline_idx + 1;
+
+            // Break payload: { operand_src_node: none, block_inst: func_inst }
+            const brk_payload_idx: u32 = @intCast(self.extra.items.len);
+            try self.extra.append(self.gpa, @bitCast(@as(i32, std.math.maxInt(i32)))); // operand_src_node = none
+            try self.extra.append(self.gpa, func_inst_predicted); // block_inst = func instruction
+
+            // Emit break_inline: operand = union_decl Ref, payload = break payload
+            const union_decl_ref = instRef(union_decl_idx);
+            _ = try self.addInst(.break_inline, encodeBreak(union_decl_ref, brk_payload_idx));
+        }
+
         // Build Func payload in extra
         // Func struct: ret_ty (u32), param_block (Index), body_len (u32)
-        // Trailing: [return type Ref if ret_ty.body_len==1], body indices, SrcLocs (3 u32s), proto_hash (4 u32s)
+        // Trailing: [return type body or Ref], body indices, SrcLocs (3 u32s), proto_hash (4 u32s)
         const func_payload_idx: u32 = @intCast(self.extra.items.len);
 
         // ret_ty: packed RetTy { body_len: u31, is_generic: bool }
-        if (body.tuple_ret_types.items.len > 0) {
+        if (body.union_ret_type_inst != null) {
+            // ret_ty body has 2 instructions: [union_decl, break_inline(func, union_decl)]
+            try self.extra.append(self.gpa, 2);
+        } else if (body.tuple_ret_types.items.len > 0) {
             // body_len=1 with the tuple_decl instruction Ref
             try self.extra.append(self.gpa, 1);
         } else if (body.ret_type == .void) {
@@ -170,8 +195,12 @@ pub const Builder = struct {
         // body_len
         try self.extra.append(self.gpa, body_len);
 
-        // Trailing return type Ref (if ret_ty.body_len == 1)
-        if (body.tuple_ret_types.items.len > 0) {
+        // Trailing return type body or Ref
+        if (body.union_ret_type_inst) |union_decl_idx| {
+            // ret_ty body: [union_decl instruction index, break_inline instruction index]
+            try self.extra.append(self.gpa, union_decl_idx);
+            try self.extra.append(self.gpa, ret_break_inline_idx);
+        } else if (body.tuple_ret_types.items.len > 0) {
             try self.extra.append(self.gpa, @intFromEnum(body.tuple_ret_types.items[0]));
         } else if (body.ret_type != .void) {
             try self.extra.append(self.gpa, @intFromEnum(body.ret_type));
@@ -421,6 +450,11 @@ pub const FuncBody = struct {
     /// emit a ret_ty body that computes the struct type from these element
     /// type Refs (e.g., .i64_type, .slice_const_u8_type).
     tuple_ret_types: std.ArrayListUnmanaged(Zir.Inst.Ref) = .{},
+    /// When set, the function returns a union type declared inline.
+    /// endFunction will emit a ret_ty body containing this union_decl
+    /// instruction and a break_inline, matching AstGen's encoding for
+    /// inline return type declarations.
+    union_ret_type_inst: ?u32 = null,
     /// The individual element type Refs for the tuple return type.
     tuple_element_type_refs: std.ArrayListUnmanaged(Zir.Inst.Ref) = .{},
     /// When false, emitBodyInst/emitBodyInstVoid still emit instructions via
@@ -698,6 +732,12 @@ pub const FuncBody = struct {
         }
 
         return self.emitBodyInst(.struct_init_anon, Builder.encodePlNode(.zero, payload_idx));
+    }
+
+    /// Emit a `ret_type` instruction that yields the current function's return type.
+    /// Used to reference the return type inside the function body (e.g., for @unionInit).
+    pub fn addRetType(self: *FuncBody) !Zir.Inst.Ref {
+        return self.emitBodyInst(.ret_type, .{ .node = .zero });
     }
 
     /// Emit a union initialization: @unionInit(union_type, field_name, init_value)
@@ -1323,12 +1363,13 @@ pub const FuncBody = struct {
             Builder.encodeExtended(@intFromEnum(Zir.Inst.Extended.union_decl), @bitCast(small), union_payload_idx),
         );
 
-        // Track as param instruction (declaration value body)
-        try self.param_inst_indices.append(b.gpa, union_decl_idx);
-
-        // Store as return type Ref
-        self.tuple_ret_types.clearRetainingCapacity();
-        try self.tuple_ret_types.append(b.gpa, Builder.instRef(union_decl_idx));
+        // Store union_decl instruction index for the ret_ty body.
+        // Unlike tuple_ret_types (which uses ret_ty.body_len=1 with a simple Ref),
+        // union types must use ret_ty.body_len=2 with a body of
+        // [union_decl, break_inline(func, union_decl)] to match AstGen's encoding.
+        // The union_decl must NOT go in param_inst_indices because Sema reads
+        // param_body[0..param_count] expecting param instructions there.
+        self.union_ret_type_inst = union_decl_idx;
     }
 
     /// Emit `try operand` — unwrap an error union, panicking on error.

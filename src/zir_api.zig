@@ -1241,9 +1241,9 @@ pub export fn zir_builder_emit_union_init(
     const union_type_ref: Zir.Inst.Ref = @enumFromInt(union_type);
     const init_value_ref: Zir.Inst.Ref = @enumFromInt(init_value);
 
-    // Create an enum_literal for the field name
+    // Create a string literal for the field name (Sema expects resolveConstStringIntern)
     const field_name = field_name_ptr[0..field_name_len];
-    const field_name_ref = body.addEnumLiteral(field_name) catch return 0xFFFFFFFF;
+    const field_name_ref = body.addStr(field_name) catch return 0xFFFFFFFF;
 
     const ref = body.addUnionInit(union_type_ref, field_name_ref, init_value_ref) catch return 0xFFFFFFFF;
     return @intFromEnum(ref);
@@ -1682,6 +1682,19 @@ pub export fn zir_builder_inject(
     std.heap.page_allocator.destroy(b);
 
     return 0;
+}
+
+/// Emit a `ret_type` instruction that yields the current function's return type.
+/// Returns the Ref as u32, or 0 if the function has no union return type.
+/// Use this as the type argument to `zir_builder_emit_union_init`.
+pub export fn zir_builder_get_union_ret_type_ref(
+    handle: ?*ZirBuilderHandle,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0;
+    const body = b.active_body orelse return 0;
+    if (body.union_ret_type_inst == null) return 0;
+    const ref = body.addRetType() catch return 0;
+    return @intFromEnum(ref);
 }
 
 fn testRepoLibDir(allocator: Allocator) ![]u8 {
