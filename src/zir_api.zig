@@ -1209,9 +1209,10 @@ pub export fn zir_builder_add_switch_block(
         const body_len = prong_body_lens[i];
         prongs[i] = .{
             .item_name = prong_names_ptrs[i][0..prong_names_lens[i]],
-            .has_capture = prong_captures[i] != 0,
+            .has_capture = (prong_captures[i] & 1) != 0,
             .body_insts = prong_body_insts[body_offset .. body_offset + body_len],
             .body_result = @enumFromInt(prong_body_results[i]),
+            .use_capture_as_result = (prong_captures[i] & 2) != 0,
         };
         body_offset += body_len;
     }

@@ -1140,14 +1140,13 @@ pub const FuncBody = struct {
         /// Whether this prong captures the payload: `.Ok => |val| ...`
         has_capture: bool,
         /// Pre-emitted ZIR instruction indices for the prong body.
-        /// These must already exist in the instruction array (emitted with
-        /// body_tracking OFF by the caller). The switch_block Ref can be
-        /// referenced by these instructions for payload capture.
         body_insts: []const u32,
-        /// The result value of this prong. For capture prongs, this is
-        /// typically the switch_block Ref (resolved via inst_map to the payload).
-        /// For non-capture prongs, this is whatever the prong body produces.
+        /// The result value of this prong.
         body_result: Zir.Inst.Ref,
+        /// If true, the break operand will be the switch_block's own Ref
+        /// (which Sema resolves to the captured payload via inst_map).
+        /// This is used for the Ok prong where the result IS the captured payload.
+        use_capture_as_result: bool = false,
     };
 
     /// Emit a complete switch_block instruction in a single pass.
@@ -1203,7 +1202,7 @@ pub const FuncBody = struct {
             // For capture prongs with void_value as body_result, use the
             // switch_block's own Ref. Sema resolves this through inst_map
             // to the captured payload value.
-            const result = if (p.has_capture and p.body_result == .void_value)
+            const result = if (p.use_capture_as_result)
                 switch_ref
             else
                 p.body_result;
