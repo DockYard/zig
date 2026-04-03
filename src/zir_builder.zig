@@ -1155,7 +1155,7 @@ pub const FuncBody = struct {
     /// All prong body instructions must be pre-emitted by the caller
     /// (with body_tracking OFF). This function atomically emits:
     ///   1. enum_literal instructions for each prong item (body_tracking ON)
-    ///   2. break_inline instructions for each prong (via addInst, no body tracking)
+    ///   2. break instructions for each prong (via addInst, no body tracking)
     ///   3. dbg_stmt (body_tracking ON)
     ///   4. switch_block instruction (body_tracking ON)
     ///   5. Contiguous SwitchBlock extra data
@@ -1181,10 +1181,14 @@ pub const FuncBody = struct {
             item_refs[pi] = try self.addEnumLiteral(p.item_name);
         }
 
-        // ---- Phase 2: Emit break_inline instructions (via addInst, not body) ----
+        // ---- Phase 2: Emit break instructions (via addInst, not body) ----
         // We need to know the future switch_block index for break targets.
         // breaks + dbg_stmt are emitted first, then the switch_block.
         // Future switch index = current + num_breaks + 1 (dbg_stmt).
+        // NOTE: We use .break (not .break_inline) because break_inline
+        // triggers ComptimeBreak which creates post-hoc blocks that don't
+        // integrate properly with switch_block's Sema handling. Regular
+        // .break is what AstGen uses for switch prong exits.
         const future_switch_idx: u32 = @intCast(b.tags.items.len + prongs.len + 1);
 
         const switch_ref = Builder.instRef(future_switch_idx);
@@ -1204,7 +1208,7 @@ pub const FuncBody = struct {
             else
                 p.body_result;
 
-            break_indices[pi] = try b.addInst(.break_inline, .{ .@"break" = .{
+            break_indices[pi] = try b.addInst(.@"break", .{ .@"break" = .{
                 .operand = result,
                 .payload_index = break_payload_idx,
             } });
@@ -1252,7 +1256,7 @@ pub const FuncBody = struct {
 
             // ProngInfo
             try b.extra.append(b.gpa, @bitCast(Zir.Inst.SwitchBlock.ProngInfo{
-                .body_len = @intCast(p.body_insts.len + 1), // +1 for break_inline
+                .body_len = @intCast(p.body_insts.len + 1), // +1 for break
                 .capture = if (p.has_capture) .by_val else .none,
                 .is_inline = false,
                 .has_tag_capture = false,
@@ -1263,7 +1267,7 @@ pub const FuncBody = struct {
                 try b.extra.append(b.gpa, inst_i);
             }
 
-            // break_inline (last body instruction)
+            // break (last body instruction)
             try b.extra.append(b.gpa, break_indices[pi]);
         }
 
