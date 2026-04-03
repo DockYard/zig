@@ -1498,6 +1498,33 @@ pub export fn zir_builder_emit_try(
     return @intFromEnum(ref);
 }
 
+/// Emit `operand catch catch_value` — unwrap error union, using catch_value on error.
+pub export fn zir_builder_emit_catch(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+    catch_value: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const catch_ref: Zir.Inst.Ref = @enumFromInt(catch_value);
+    const ref = body.addCatch(operand_ref, catch_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `return error.<name>` — returns an error value from the current function.
+pub export fn zir_builder_emit_ret_error(
+    handle: ?*ZirBuilderHandle,
+    name_ptr: [*]const u8,
+    name_len: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    const name = name_ptr[0..name_len];
+    body.addReturnError(name) catch return -1;
+    return 0;
+}
+
 /// Emit a struct_init for a known struct type (e.g., tuple return).
 /// `struct_type` is a Ref to the target struct type.
 /// `field_names_ptrs`/`field_names_lens` specify field names.

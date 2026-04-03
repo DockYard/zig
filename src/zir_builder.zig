@@ -1403,6 +1403,75 @@ pub const FuncBody = struct {
 
         return self.emitBodyInst(.@"try", Builder.encodePlNode(.zero, payload_idx));
     }
+
+    /// Emit `operand catch catch_value` — unwrap an error union, using catch_value on error.
+    ///
+    /// Emits a ZIR `.@"try"` instruction whose error body contains a
+    /// `break` instruction that produces `catch_value`.
+    pub fn addCatch(self: *FuncBody, operand: Zir.Inst.Ref, catch_value: Zir.Inst.Ref) !Zir.Inst.Ref {
+        const b = self.builder;
+        const gpa = b.gpa;
+
+        // The try instruction itself will be at this index — we need it for the break target.
+        // But we don't know it yet. The break in the error body targets the try block.
+        // ZIR break uses operand=block_ref, so we need a forward reference.
+        //
+        // Instead, emit `try` with a body that just has a `break_inline` producing catch_value.
+        // Actually, the correct approach: the error body should break out of the try block.
+        // The try block result is the break target. But for `try`, the result IS the unwrapped
+        // value on success, and the body result on error.
+        //
+        // Per ZIR semantics: `.try` evaluates to the payload on success.
+        // On error, the body executes. If the body "breaks" from the try block,
+        // that break value becomes the result. We need `break_inline` targeting the try inst.
+
+        // We'll emit the try instruction, then patch the body.
+        // Step 1: Reserve the try instruction index
+        const try_inst_idx: u32 = @intCast(b.tags.items.len);
+
+        // Step 2: Emit a break_inline targeting the try instruction, producing catch_value
+        // Break payload in extra: { operand_src_node: OptionalOffset, block_inst: Index }
+        const break_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @as(u32, @bitCast(@intFromEnum(Ast.Node.OptionalOffset.none)))); // operand_src_node
+        try b.extra.append(gpa, try_inst_idx); // block_inst = the try instruction
+        const break_idx = try b.addInst(.break_inline, Builder.encodeBreak(catch_value, break_payload_idx));
+
+        // Step 3: Build the try payload
+        const payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @intFromEnum(operand)); // operand
+        try b.extra.append(gpa, 1); // body_len = 1
+        try b.extra.append(gpa, break_idx); // body[0] = break_inline
+
+        return self.emitBodyInst(.@"try", Builder.encodePlNode(.zero, payload_idx));
+    }
+
+    /// Emit `error.name` — an error value from an inferred error set.
+    ///
+    /// Emits a ZIR `.error_value` instruction with the given error name.
+    pub fn addErrorValue(self: *FuncBody, name: []const u8) !Zir.Inst.Ref {
+        const b = self.builder;
+        const gpa = b.gpa;
+
+        // .error_value uses .str_tok data: { start: u32, tok: Token.Index }
+        // start is the offset into string_bytes where the error name is stored.
+        const str_start: u32 = @intCast(b.string_bytes.items.len);
+        try b.string_bytes.appendSlice(gpa, name);
+        try b.string_bytes.append(gpa, 0); // null terminator
+
+        return self.emitBodyInst(.error_value, .{ .str_tok = .{
+            .start = @enumFromInt(str_start),
+            .src_tok = .zero,
+        } });
+    }
+
+    /// Emit `return error.name` — returns an error value from the current function.
+    ///
+    /// Combines addErrorValue + addRetNode to return an error from a function
+    /// whose return type is an error union.
+    pub fn addReturnError(self: *FuncBody, name: []const u8) !void {
+        const err_ref = try self.addErrorValue(name);
+        try self.addRetNode(err_ref);
+    }
 };
 
 pub const FinalizedZir = struct {
