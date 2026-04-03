@@ -1685,6 +1685,20 @@ pub export fn zir_builder_inject(
     return 0;
 }
 
+/// Emit a `decl_ref` instruction that yields a reference to a named declaration.
+/// Used to get a function Ref without calling it (for use with call_ref inside branches).
+pub export fn zir_builder_emit_decl_ref(
+    handle: ?*ZirBuilderHandle,
+    name_ptr: [*]const u8,
+    name_len: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const name = name_ptr[0..name_len];
+    const ref = body.addDeclRef(name) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
 /// Emit a `ret_type` instruction that yields the current function's return type.
 /// Returns the Ref as u32, or 0 if the function has no union return type.
 /// Use this as the type argument to `zir_builder_emit_union_init`.
