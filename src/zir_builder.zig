@@ -155,7 +155,18 @@ pub const Builder = struct {
         // We emit the break_inline instruction FIRST, then build the func
         // payload referencing both instructions in the ret_ty body.
         var ret_break_inline_idx: u32 = undefined;
-        if (body.union_ret_type_inst) |union_decl_idx| {
+        if (body.error_union_ret_type_inst) |eu_inst_idx| {
+            // Same pattern as union return type: emit break_inline for ret_ty body
+            ret_break_inline_idx = @intCast(self.tags.items.len);
+            const func_inst_predicted: u32 = ret_break_inline_idx + 1;
+
+            const brk_payload_idx: u32 = @intCast(self.extra.items.len);
+            try self.extra.append(self.gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+            try self.extra.append(self.gpa, func_inst_predicted);
+
+            const eu_ref = instRef(eu_inst_idx);
+            _ = try self.addInst(.break_inline, encodeBreak(eu_ref, brk_payload_idx));
+        } else if (body.union_ret_type_inst) |union_decl_idx| {
             // The next instruction we emit is the break_inline for ret_ty body.
             // After that comes the func instruction.
             ret_break_inline_idx = @intCast(self.tags.items.len);
@@ -177,7 +188,13 @@ pub const Builder = struct {
         const func_payload_idx: u32 = @intCast(self.extra.items.len);
 
         // ret_ty: packed RetTy { body_len: u31, is_generic: bool }
-        if (body.union_ret_type_inst != null) {
+        if (body.is_generic_return) {
+            // is_generic=true, body_len=0 → Zig infers return type from body
+            try self.extra.append(self.gpa, @as(u32, 1) << 31); // is_generic bit set, body_len=0
+        } else if (body.error_union_ret_type_inst != null) {
+            // ret_ty body has 2 instructions: [error_union_type, break_inline(func, error_union_type)]
+            try self.extra.append(self.gpa, 2);
+        } else if (body.union_ret_type_inst != null) {
             // ret_ty body has 2 instructions: [union_decl, break_inline(func, union_decl)]
             try self.extra.append(self.gpa, 2);
         } else if (body.tuple_ret_types.items.len > 0) {
@@ -196,7 +213,11 @@ pub const Builder = struct {
         try self.extra.append(self.gpa, body_len);
 
         // Trailing return type body or Ref
-        if (body.union_ret_type_inst) |union_decl_idx| {
+        if (body.error_union_ret_type_inst) |eu_inst_idx| {
+            // ret_ty body: [error_union_type instruction, break_inline instruction]
+            try self.extra.append(self.gpa, eu_inst_idx);
+            try self.extra.append(self.gpa, ret_break_inline_idx);
+        } else if (body.union_ret_type_inst) |union_decl_idx| {
             // ret_ty body: [union_decl instruction index, break_inline instruction index]
             try self.extra.append(self.gpa, union_decl_idx);
             try self.extra.append(self.gpa, ret_break_inline_idx);
@@ -455,6 +476,13 @@ pub const FuncBody = struct {
     /// instruction and a break_inline, matching AstGen's encoding for
     /// inline return type declarations.
     union_ret_type_inst: ?u32 = null,
+    /// When set, the function returns an error union type (anyerror!T).
+    /// endFunction will emit a ret_ty body containing the error_union_type
+    /// instruction and a break_inline.
+    error_union_ret_type_inst: ?u32 = null,
+    /// When true, the function has a generic (inferred) return type.
+    /// ret_ty = { body_len: 0, is_generic: true } = 0x80000000
+    is_generic_return: bool = false,
     /// The individual element type Refs for the tuple return type.
     tuple_element_type_refs: std.ArrayListUnmanaged(Zir.Inst.Ref) = .{},
     /// When false, emitBodyInst/emitBodyInstVoid still emit instructions via
@@ -462,6 +490,10 @@ pub const FuncBody = struct {
     /// emitting instructions that live inside sub-bodies (e.g. condbr branches)
     /// without polluting the function's main body.
     body_tracking: bool = true,
+    /// Call modifier for the next addCall (reset to 0 after use).
+    /// 0=auto, 2=never_inline, 3=no_optimizations
+    call_modifier: u3 = 0,
+
     /// When non-null AND body_tracking is false, "would-be body" instruction
     /// indices are captured here instead of being discarded. This lets callers
     /// collect exactly the top-level instructions for a branch body, excluding
@@ -771,40 +803,38 @@ pub const FuncBody = struct {
     /// Each arg body is a single break_inline instruction that yields the arg
     /// value. The break_inline targets the call instruction.
     pub fn addCallRef(self: *FuncBody, callee: Zir.Inst.Ref, args: []const Zir.Inst.Ref) !Zir.Inst.Ref {
-        // Pre-compute where the call instruction will be:
-        // After 1 non-body instruction per arg (break_inline), then 1 dbg_stmt
-        const call_inst_idx: u32 = @intCast(self.builder.tags.items.len + args.len + 1);
+        const b = self.builder;
+        const gpa = b.gpa;
 
-        // Each arg body = [break_inline(call, arg_value)]
+        // Pre-compute call instruction index
+        const predicted = @as(u32, @intCast(b.tags.items.len)) + @as(u32, @intCast(args.len)) + 1;
+        const call_inst_idx: u32 = predicted;
+
         var arg_inst_indices = std.ArrayListUnmanaged(u32).empty;
-        defer arg_inst_indices.deinit(self.builder.gpa);
+        defer arg_inst_indices.deinit(gpa);
 
         for (args) |arg| {
-            const brk_payload = try self.builder.addExtraSlice(&.{
-                @bitCast(@as(i32, std.math.maxInt(i32))), // operand_src_node = none
-                call_inst_idx, // block_inst = call instruction
-            });
-            const brk_idx = try self.builder.addInst(.break_inline, Builder.encodeBreak(arg, brk_payload));
-            try arg_inst_indices.append(self.builder.gpa, brk_idx);
+            const brk_payload_idx: u32 = @intCast(b.extra.items.len);
+            try b.extra.append(gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+            try b.extra.append(gpa, call_inst_idx);
+            const brk_idx = try b.addInst(.break_inline, Builder.encodeBreak(arg, brk_payload_idx));
+            try arg_inst_indices.append(gpa, brk_idx);
         }
 
-        // Sema requires a dbg_stmt immediately before the call instruction.
         try self.emitBodyInstVoid(.dbg_stmt, .{ .dbg_stmt = .{ .line = 0, .column = 0 } });
 
-        // Call payload
-        const payload_idx: u32 = @intCast(self.builder.extra.items.len);
+        const payload_idx: u32 = @intCast(b.extra.items.len);
         const args_len: u32 = @intCast(args.len);
-        const flags: u32 = args_len << 5;
-        try self.builder.extra.append(self.builder.gpa, flags);
-        try self.builder.extra.append(self.builder.gpa, @intFromEnum(callee));
+        const flags: u32 = (args_len << 5) | (1 << 4);
+        try b.extra.append(gpa, flags);
+        try b.extra.append(gpa, @intFromEnum(callee));
 
-        // arg_end: cumulative, each arg body has 1 instruction
         for (0..args.len) |i| {
-            try self.builder.extra.append(self.builder.gpa, @as(u32, @intCast(args_len + (i + 1))));
+            try b.extra.append(gpa, @as(u32, @intCast(args_len + (i + 1))));
         }
 
         for (arg_inst_indices.items) |idx| {
-            try self.builder.extra.append(self.builder.gpa, idx);
+            try b.extra.append(gpa, idx);
         }
 
         return self.emitBodyInst(.call, Builder.encodePlNode(.zero, payload_idx));
@@ -812,60 +842,73 @@ pub const FuncBody = struct {
 
     /// Add a function call by name. Returns a Ref to the result.
     pub fn addCall(self: *FuncBody, callee_name: []const u8, args: []const Zir.Inst.Ref) !Zir.Inst.Ref {
-        // First, resolve callee via decl_val
-        const name_start = try self.builder.internString(callee_name);
+        const b = self.builder;
+        const gpa = b.gpa;
+
+        // Resolve callee via decl_val
+        const name_start = try b.internString(callee_name);
         const callee_ref = try self.emitBodyInst(.decl_val, Builder.encodeStrTok(name_start, .zero));
 
-        // Pre-compute call instruction index (after decl_val + N non-body break_inline + 1 dbg_stmt)
-        const call_inst_idx: u32 = @intCast(self.builder.tags.items.len + @as(u32, @intCast(args.len)) + 1);
+        // Reserve the call instruction (will be patched after args are processed).
+        // This matches AstGen's approach: pre-allocate, then fill in.
+        const call_inst_idx: u32 = @intCast(b.tags.items.len);
+        _ = try b.addInst(undefined, undefined); // placeholder
 
-        // Each arg body = [break_inline(call, arg_value)]
-        var arg_inst_indices = std.ArrayListUnmanaged(u32).empty;
-        defer arg_inst_indices.deinit(self.builder.gpa);
+        // Emit break_inline for each arg body (targeting the reserved call instruction)
+        const args_len: u32 = @intCast(args.len);
+        var arg_body_indices = std.ArrayListUnmanaged(u32).empty;
+        defer arg_body_indices.deinit(gpa);
 
         for (args) |arg| {
-            const brk_payload = try self.builder.addExtraSlice(&.{
-                @bitCast(@as(i32, std.math.maxInt(i32))), // operand_src_node = none
-                call_inst_idx, // block_inst = call instruction
-            });
-            const brk_idx = try self.builder.addInst(.break_inline, Builder.encodeBreak(arg, brk_payload));
-            try arg_inst_indices.append(self.builder.gpa, brk_idx);
+            const brk_payload_idx: u32 = @intCast(b.extra.items.len);
+            try b.extra.append(gpa, @bitCast(@as(i32, std.math.maxInt(i32)))); // operand_src_node = none
+            try b.extra.append(gpa, call_inst_idx); // block_inst = call instruction
+            const brk_idx = try b.addInst(.break_inline, Builder.encodeBreak(arg, brk_payload_idx));
+            try arg_body_indices.append(gpa, brk_idx);
         }
 
-        // Sema requires a dbg_stmt immediately before the call instruction.
+        // Sema requires dbg_stmt immediately before the call instruction body.
         try self.emitBodyInstVoid(.dbg_stmt, .{ .dbg_stmt = .{ .line = 0, .column = 0 } });
 
-        const payload_idx: u32 = @intCast(self.builder.extra.items.len);
-        const args_len: u32 = @intCast(args.len);
-        const flags: u32 = args_len << 5;
-        try self.builder.extra.append(self.builder.gpa, flags);
-        try self.builder.extra.append(self.builder.gpa, @intFromEnum(callee_ref));
+        // Build Call payload matching AstGen's exact format:
+        // [flags(u32), callee(Ref), arg_0_end, arg_1_end, ..., body_inst_0, body_inst_1, ...]
+        const payload_idx: u32 = @intCast(b.extra.items.len);
 
-        // arg_end: cumulative, 1 instruction per arg
+        // Flags: packed_modifier(never_inline=2) | ensure_result_used(0) | pop_error_return_trace(1) | args_len
+        // Flags: packed_modifier(0=auto) | ensure_result_used(0) | pop_error_return_trace(1) | args_len
+        const flags: u32 = (args_len << 5) | (1 << 4); // auto + pop_error_return_trace
+        try b.extra.append(gpa, flags);
+        try b.extra.append(gpa, @intFromEnum(callee_ref));
+
+        // arg_end values: cumulative offsets into the body array
+        // arg_0_start = args_len (implicit). Each arg has 1 body instruction (break_inline).
         for (0..args.len) |i| {
-            try self.builder.extra.append(self.builder.gpa, @as(u32, @intCast(args_len + (i + 1))));
+            try b.extra.append(gpa, @as(u32, @intCast(args_len + (i + 1))));
         }
 
-        for (arg_inst_indices.items) |idx| {
-            try self.builder.extra.append(self.builder.gpa, idx);
+        // Body instructions (break_inline indices)
+        for (arg_body_indices.items) |idx| {
+            try b.extra.append(gpa, idx);
         }
 
-        return self.emitBodyInst(.call, Builder.encodePlNode(.zero, payload_idx));
+        // Patch the reserved call instruction
+        b.tags.items[call_inst_idx] = @intFromEnum(Zir.Inst.Tag.call);
+        b.data.items[call_inst_idx] = Builder.encodePlNode(.zero, payload_idx);
+
+        // Track call as a body instruction
+        if (self.body_tracking) {
+            try self.body_inst_indices.append(gpa, call_inst_idx);
+        } else if (self.non_body_capture) |capture| {
+            try capture.append(gpa, call_inst_idx);
+        }
+
+        return Builder.instRef(call_inst_idx);
     }
 
     /// Emit @typeInfo(operand). Returns a Ref to the type info value.
     /// ZIR tag: .type_info, data field: .un_node
     pub fn addTypeInfo(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
         return self.emitBodyInst(.type_info, Builder.encodeUnNode(.zero, operand));
-    }
-
-    /// Add element access by immediate index (tuple/array indexing).
-    /// ZIR tag: `.elem_val_imm`, data field: `elem_val_imm`.
-    pub fn addElemValImm(self: *FuncBody, operand: Zir.Inst.Ref, index: u32) !Zir.Inst.Ref {
-        return self.emitBodyInst(.elem_val_imm, .{ .elem_val_imm = .{
-            .operand = operand,
-            .idx = index,
-        } });
     }
 
     /// Add an anonymous array initialization (creates a tuple type).
@@ -887,10 +930,136 @@ pub const FuncBody = struct {
         return self.emitBodyInst(.array_init_anon, Builder.encodePlNode(.zero, payload_idx));
     }
 
+    /// Access an element of a tuple/array by immediate index.
+    /// ZIR tag: `.elem_val_imm`, data field: `elem_val_imm`.
+    pub fn addElemValImm(self: *FuncBody, operand: Zir.Inst.Ref, index: u32) !Zir.Inst.Ref {
+        return self.emitBodyInst(.elem_val_imm, .{ .elem_val_imm = .{
+            .operand = operand,
+            .idx = index,
+        } });
+    }
+
+    /// Emit `is_non_err(operand)` — check if an error union value is not an error.
+    /// Returns a bool Ref.
+    pub fn addIsNonErr(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.is_non_err, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit `err_union_payload_unsafe(operand)` — extract payload from error union.
+    /// Caller must ensure operand is not an error.
+    pub fn addErrUnionPayloadUnsafe(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.err_union_payload_unsafe, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit `optional_payload_unsafe(operand)` — extract payload from optional.
+    /// Caller must ensure operand is non-null.
+    pub fn addOptionalPayloadUnsafe(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.optional_payload_unsafe, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit `operand orelse fallback` using inline block/condbr/break.
+    /// Matches AstGen's exact encoding for the `orelse` operator.
+    pub fn addOrelse(self: *FuncBody, operand: Zir.Inst.Ref, fallback: Zir.Inst.Ref) !Zir.Inst.Ref {
+        const b = self.builder;
+        const gpa = b.gpa;
+
+        // block_inline with placeholder payload
+        // body_len = 2: [is_non_null, condbr_inline]
+        const block_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, 2); // body_len = 2
+        const block_body_slot_0: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, 0); // placeholder for is_non_null
+        const block_body_slot_1: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, 0); // placeholder for condbr_inline
+
+        const block_idx = try b.addInst(.block_inline, Builder.encodePlNode(.zero, block_payload_idx));
+        if (self.body_tracking) {
+            try self.body_inst_indices.append(gpa, block_idx);
+        } else if (self.non_body_capture) |capture| {
+            try capture.append(gpa, block_idx);
+        }
+
+        // is_non_null check (block body instruction)
+        const is_non_null_inst = try b.addInst(.is_non_null, Builder.encodeUnNode(.zero, operand));
+
+        // Then branch: unwrap payload + break_inline
+        const payload_inst = try b.addInst(.optional_payload_unsafe, Builder.encodeUnNode(.zero, operand));
+        const then_break_payload: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+        try b.extra.append(gpa, block_idx);
+        const then_break = try b.addInst(.break_inline, Builder.encodeBreak(Builder.instRef(payload_inst), then_break_payload));
+
+        // Else branch: break_inline with fallback
+        const else_break_payload: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+        try b.extra.append(gpa, block_idx);
+        const else_break = try b.addInst(.break_inline, Builder.encodeBreak(fallback, else_break_payload));
+
+        // condbr_inline
+        const condbr_payload: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @intFromEnum(Builder.instRef(is_non_null_inst)));
+        try b.extra.append(gpa, 2); // then_body_len (payload + break)
+        try b.extra.append(gpa, 1); // else_body_len (break)
+        try b.extra.append(gpa, payload_inst);
+        try b.extra.append(gpa, then_break);
+        try b.extra.append(gpa, else_break);
+        const condbr_inst = try b.addInst(.condbr_inline, Builder.encodePlNode(.zero, condbr_payload));
+
+        // Fix up block body: [is_non_null, condbr_inline]
+        b.extra.items[block_body_slot_0] = is_non_null_inst;
+        b.extra.items[block_body_slot_1] = condbr_inst;
+
+        return Builder.instRef(block_idx);
+    }
+
     /// Mark a value as used (prevents "result not used" compile error for void calls).
     /// ZIR tag: `.ensure_result_used`, data field: `un_node`.
     pub fn addEnsureResultUsed(self: *FuncBody, operand: Zir.Inst.Ref) !void {
         try self.emitBodyInstVoid(.ensure_result_used, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit `if (condition) return value;` — conditional early return.
+    /// Uses block_inline + condbr_inline for proper comptime evaluation:
+    ///   block_inline { condbr_inline(cond, then: [ret_node(value)], else: [break_inline(block, void)]) }
+    pub fn addCondReturn(self: *FuncBody, condition: Zir.Inst.Ref, value: Zir.Inst.Ref) !void {
+        const b = self.builder;
+        const gpa = b.gpa;
+
+        // block_inline with placeholder
+        const block_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, 1); // body_len = 1 (condbr_inline)
+        const block_body_slot: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, 0); // placeholder
+
+        const block_idx = try b.addInst(.block_inline, Builder.encodePlNode(.zero, block_payload_idx));
+
+        // ret_node for then branch
+        const ret_idx = try b.addInst(.ret_node, Builder.encodeUnNode(.zero, value));
+
+        // break_inline(block, void) for else branch
+        const break_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+        try b.extra.append(gpa, block_idx);
+        const break_idx = try b.addInst(.break_inline, Builder.encodeBreak(.void_value, break_payload_idx));
+
+        // condbr_inline
+        const condbr_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @intFromEnum(condition));
+        try b.extra.append(gpa, 1); // then_body_len
+        try b.extra.append(gpa, 1); // else_body_len
+        try b.extra.append(gpa, ret_idx);
+        try b.extra.append(gpa, break_idx);
+        const condbr_idx = try b.addInst(.condbr_inline, Builder.encodePlNode(.zero, condbr_payload_idx));
+
+        // Fix up block body
+        b.extra.items[block_body_slot] = condbr_idx;
+
+        // Track block
+        if (self.body_tracking) {
+            try self.body_inst_indices.append(gpa, block_idx);
+        } else if (self.non_body_capture) |capture| {
+            try capture.append(gpa, block_idx);
+        }
     }
 
     /// Add a debug statement with line/column info.
@@ -912,6 +1081,52 @@ pub const FuncBody = struct {
     pub fn addRetImplicit(self: *FuncBody) !void {
         try self.emitBodyInstVoid(.ret_implicit, Builder.encodeUnTok(.zero, .void_value));
         self.has_explicit_return = true;
+    }
+
+    /// Add an inline if-then-else expression using block_inline/condbr_inline.
+    /// For comptime evaluation, only the taken branch is analyzed.
+    pub fn addIfElseInline(
+        self: *FuncBody,
+        condition: Zir.Inst.Ref,
+        then_value: Zir.Inst.Ref,
+        else_value: Zir.Inst.Ref,
+    ) !Zir.Inst.Ref {
+        const b = self.builder;
+        const gpa = b.gpa;
+
+        const block_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, 1); // body_len = 1
+        const block_body_slot: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, 0); // placeholder
+
+        const block_idx = try b.addInst(.block_inline, Builder.encodePlNode(.zero, block_payload_idx));
+        if (self.body_tracking) {
+            try self.body_inst_indices.append(gpa, block_idx);
+        } else if (self.non_body_capture) |capture| {
+            try capture.append(gpa, block_idx);
+        }
+
+        const then_brk_payload: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+        try b.extra.append(gpa, block_idx);
+        const then_brk = try b.addInst(.break_inline, Builder.encodeBreak(then_value, then_brk_payload));
+
+        const else_brk_payload: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+        try b.extra.append(gpa, block_idx);
+        const else_brk = try b.addInst(.break_inline, Builder.encodeBreak(else_value, else_brk_payload));
+
+        const condbr_payload: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @intFromEnum(condition));
+        try b.extra.append(gpa, 1);
+        try b.extra.append(gpa, 1);
+        try b.extra.append(gpa, then_brk);
+        try b.extra.append(gpa, else_brk);
+        const condbr_idx = try b.addInst(.condbr_inline, Builder.encodePlNode(.zero, condbr_payload));
+
+        b.extra.items[block_body_slot] = condbr_idx;
+
+        return Builder.instRef(block_idx);
     }
 
     /// Add an if-then-else expression. Both branches must produce a value.
@@ -1406,43 +1621,56 @@ pub const FuncBody = struct {
 
     /// Emit `operand catch catch_value` — unwrap an error union, using catch_value on error.
     ///
-    /// Emits a ZIR `.@"try"` instruction whose error body contains a
-    /// `break` instruction that produces `catch_value`.
+    /// Encodes: block { is_non_err check, condbr(then: unwrap+break, else: break catch_value) }
     pub fn addCatch(self: *FuncBody, operand: Zir.Inst.Ref, catch_value: Zir.Inst.Ref) !Zir.Inst.Ref {
         const b = self.builder;
         const gpa = b.gpa;
 
-        // The try instruction itself will be at this index — we need it for the break target.
-        // But we don't know it yet. The break in the error body targets the try block.
-        // ZIR break uses operand=block_ref, so we need a forward reference.
-        //
-        // Instead, emit `try` with a body that just has a `break_inline` producing catch_value.
-        // Actually, the correct approach: the error body should break out of the try block.
-        // The try block result is the break target. But for `try`, the result IS the unwrapped
-        // value on success, and the body result on error.
-        //
-        // Per ZIR semantics: `.try` evaluates to the payload on success.
-        // On error, the body executes. If the body "breaks" from the try block,
-        // that break value becomes the result. We need `break_inline` targeting the try inst.
+        // Step 1: Reserve the block instruction index (we need it for breaks)
+        const block_inst_idx: u32 = @intCast(b.tags.items.len);
+        const block_inst = try b.addInst(.block, .{ .pl_node = .{ .src_node = .zero, .payload_index = 0 } });
 
-        // We'll emit the try instruction, then patch the body.
-        // Step 1: Reserve the try instruction index
-        const try_inst_idx: u32 = @intCast(b.tags.items.len);
+        // Step 2: Emit is_non_err check (body instruction of the block)
+        const is_non_err_inst = try b.addInst(.is_non_err, Builder.encodeUnNode(.zero, operand));
 
-        // Step 2: Emit a break_inline targeting the try instruction, producing catch_value
-        // Break payload in extra: { operand_src_node: OptionalOffset, block_inst: Index }
-        const break_payload_idx: u32 = @intCast(b.extra.items.len);
-        try b.extra.append(gpa, @as(u32, @bitCast(@intFromEnum(Ast.Node.OptionalOffset.none)))); // operand_src_node
-        try b.extra.append(gpa, try_inst_idx); // block_inst = the try instruction
-        const break_idx = try b.addInst(.break_inline, Builder.encodeBreak(catch_value, break_payload_idx));
+        // Step 3: Emit the "then" branch body: unwrap payload + break to block
+        const payload_inst = try b.addInst(.err_union_payload_unsafe, Builder.encodeUnNode(.zero, operand));
+        const then_break_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @as(u32, @bitCast(@intFromEnum(Ast.Node.OptionalOffset.none))));
+        try b.extra.append(gpa, block_inst_idx);
+        const then_break = try b.addInst(.@"break", Builder.encodeBreak(Builder.instRef(payload_inst), then_break_payload_idx));
 
-        // Step 3: Build the try payload
-        const payload_idx: u32 = @intCast(b.extra.items.len);
-        try b.extra.append(gpa, @intFromEnum(operand)); // operand
-        try b.extra.append(gpa, 1); // body_len = 1
-        try b.extra.append(gpa, break_idx); // body[0] = break_inline
+        // Step 4: Emit the "else" branch body: break to block with catch_value
+        const else_break_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @as(u32, @bitCast(@intFromEnum(Ast.Node.OptionalOffset.none))));
+        try b.extra.append(gpa, block_inst_idx);
+        const else_break = try b.addInst(.@"break", Builder.encodeBreak(catch_value, else_break_payload_idx));
 
-        return self.emitBodyInst(.@"try", Builder.encodePlNode(.zero, payload_idx));
+        // Step 5: Emit condbr instruction
+        const condbr_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @intFromEnum(Builder.instRef(is_non_err_inst)));
+        try b.extra.append(gpa, 2); // then_body_len
+        try b.extra.append(gpa, 1); // else_body_len
+        try b.extra.append(gpa, payload_inst);
+        try b.extra.append(gpa, then_break);
+        try b.extra.append(gpa, else_break);
+        const condbr_inst = try b.addInst(.condbr, Builder.encodePlNode(.zero, condbr_payload_idx));
+
+        // Step 6: Fix up the block payload
+        const block_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, 2); // body_len = 2 (is_non_err + condbr)
+        try b.extra.append(gpa, is_non_err_inst);
+        try b.extra.append(gpa, condbr_inst);
+        b.data.items[block_inst_idx] = .{ .pl_node = .{ .src_node = .zero, .payload_index = block_payload_idx } };
+
+        // Add block to body/capture instructions
+        if (self.body_tracking) {
+            try self.body_inst_indices.append(gpa, block_inst);
+        } else if (self.non_body_capture) |capture| {
+            try capture.append(gpa, block_inst);
+        }
+
+        return Builder.instRef(block_inst);
     }
 
     /// Emit `error.name` — an error value from an inferred error set.
@@ -1472,6 +1700,50 @@ pub const FuncBody = struct {
         const err_ref = try self.addErrorValue(name);
         try self.addRetNode(err_ref);
     }
+
+    /// Mark this function as returning an optional type: `?T`
+    /// where T is the current ret_type. Emits an optional_type instruction
+    /// and stores it for the ret_ty body.
+    pub fn setOptionalReturnType(self: *FuncBody) !void {
+        const b = self.builder;
+        const payload_type_ref: Zir.Inst.Ref = @enumFromInt(@intFromEnum(self.ret_type));
+
+        // Emit optional_type instruction: .optional_type uses .un_node data
+        const opt_type_inst = try b.addInst(.optional_type, Builder.encodeUnNode(.zero, payload_type_ref));
+        self.error_union_ret_type_inst = opt_type_inst;
+    }
+
+    /// Emit `return null` — returns null from a function with optional return type.
+    pub fn addReturnNull(self: *FuncBody) !void {
+        try self.addRetNode(.null_value);
+    }
+
+    /// Mark this function as returning an error union type: `error{name}!T`
+    /// where T is the current ret_type. Emits instructions for the error set
+    /// and error union type, and stores them as a ret_ty body.
+    ///
+    /// Must be called after beginFunction but before any body instructions
+    /// that depend on the return type.
+    pub fn setErrorUnionReturnType(self: *FuncBody, _: []const u8) !void {
+        const b = self.builder;
+        const gpa = b.gpa;
+
+        // Make the ret_ty body produce `anyerror!T` using anyerror_type Ref
+        // and an error_union_type instruction. Zig will infer the specific
+        // error set from the error_value returns in the function body.
+        const payload_type_ref: Zir.Inst.Ref = @enumFromInt(@intFromEnum(self.ret_type));
+        const anyerror_ref = Zir.Inst.Ref.anyerror_type;
+
+        // Build the error_union_type: pl_node with Bin payload {lhs: error_set, rhs: payload_type}
+        const payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @intFromEnum(anyerror_ref)); // lhs = anyerror
+        try b.extra.append(gpa, @intFromEnum(payload_type_ref)); // rhs = payload type
+        const error_union_inst = try b.addInst(.error_union_type, Builder.encodePlNode(.zero, payload_idx));
+
+        // Store for endFunction to use in ret_ty body
+        self.error_union_ret_type_inst = error_union_inst;
+    }
+
 };
 
 pub const FinalizedZir = struct {

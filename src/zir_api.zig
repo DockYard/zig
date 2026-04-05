@@ -1125,6 +1125,18 @@ pub export fn zir_builder_emit_is_non_null(
     return @intFromEnum(ref);
 }
 
+/// Emit optional payload extraction (unsafe, for use after is_non_null check).
+pub export fn zir_builder_emit_optional_payload_unsafe(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addOptionalPayloadUnsafe(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
 /// Emit optional payload extraction with safety. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
 pub export fn zir_builder_emit_optional_payload(
     handle: ?*ZirBuilderHandle,
@@ -1275,20 +1287,6 @@ pub export fn zir_builder_emit_call_ref(
     return @intFromEnum(ref);
 }
 
-/// Emit element access by immediate index (tuple/array indexing).
-/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
-pub export fn zir_builder_emit_elem_val_imm(
-    handle: ?*ZirBuilderHandle,
-    operand: u32,
-    index: u32,
-) callconv(.c) u32 {
-    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
-    const body = b.active_body orelse return 0xFFFFFFFF;
-    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
-    const ref = body.addElemValImm(operand_ref, index) catch return 0xFFFFFFFF;
-    return @intFromEnum(ref);
-}
-
 /// Emit @typeInfo(operand). Returns the type info value.
 pub export fn zir_builder_emit_type_info(
     handle: ?*ZirBuilderHandle,
@@ -1398,44 +1396,64 @@ pub export fn zir_builder_get_inst_count(
     return body.getInstCount();
 }
 
-/// Thread-local capture buffer used by begin_capture / end_capture.
-/// Only one capture session at a time per builder.
-var capture_buf: std.ArrayListUnmanaged(u32) = .{};
+/// Nestable capture stack used by begin_capture / end_capture.
+/// Supports nested case/cond expressions that require inner captures
+/// while an outer capture is still active.
+const MAX_CAPTURE_DEPTH = 16;
+var capture_bufs: [MAX_CAPTURE_DEPTH]std.ArrayListUnmanaged(u32) = [_]std.ArrayListUnmanaged(u32){.{}} ** MAX_CAPTURE_DEPTH;
+var capture_saved_tracking: [MAX_CAPTURE_DEPTH]bool = [_]bool{true} ** MAX_CAPTURE_DEPTH;
+var capture_saved_non_body: [MAX_CAPTURE_DEPTH]?*std.ArrayListUnmanaged(u32) = [_]?*std.ArrayListUnmanaged(u32){null} ** MAX_CAPTURE_DEPTH;
+var capture_depth: u32 = 0;
 
 /// Begin capturing would-be-body instruction indices. Disables body tracking
 /// and directs top-level instruction indices into an internal capture buffer.
+/// Supports nesting: each begin_capture pushes a new capture level.
 /// Call `zir_builder_end_capture` to retrieve the collected indices and
-/// re-enable body tracking.
+/// restore the previous capture state.
 pub export fn zir_builder_begin_capture(
     handle: ?*ZirBuilderHandle,
 ) callconv(.c) void {
     const b = getBuilder(handle) orelse return;
     const body = b.active_body orelse return;
-    capture_buf.clearRetainingCapacity();
+    if (capture_depth >= MAX_CAPTURE_DEPTH) return;
+    // Save current state at this depth
+    capture_saved_tracking[capture_depth] = body.body_tracking;
+    capture_saved_non_body[capture_depth] = body.non_body_capture;
+    // Start fresh capture at this depth
+    capture_bufs[capture_depth].clearRetainingCapacity();
     body.body_tracking = false;
-    body.non_body_capture = &capture_buf;
+    body.non_body_capture = &capture_bufs[capture_depth];
+    capture_depth += 1;
 }
 
-/// End capture mode: re-enables body tracking and returns a pointer to the
-/// captured instruction indices. The returned pointer is valid until the
-/// next call to `zir_builder_begin_capture`.
+/// End capture mode: restores the previous capture state and returns a
+/// pointer to the captured instruction indices. The returned pointer is
+/// valid until the next call to `zir_builder_begin_capture` at this depth.
 /// `out_len` receives the number of captured indices.
 pub export fn zir_builder_end_capture(
     handle: ?*ZirBuilderHandle,
     out_len: *u32,
 ) callconv(.c) [*]const u32 {
+    if (capture_depth == 0) {
+        out_len.* = 0;
+        return @as([*]const u32, @ptrCast(&capture_bufs[0].items));
+    }
     const b = getBuilder(handle) orelse {
         out_len.* = 0;
-        return @as([*]const u32, @ptrCast(&capture_buf.items));
+        capture_depth -= 1;
+        return capture_bufs[capture_depth].items.ptr;
     };
     const body = b.active_body orelse {
         out_len.* = 0;
-        return @as([*]const u32, @ptrCast(&capture_buf.items));
+        capture_depth -= 1;
+        return capture_bufs[capture_depth].items.ptr;
     };
-    body.body_tracking = true;
-    body.non_body_capture = null;
-    out_len.* = @intCast(capture_buf.items.len);
-    return capture_buf.items.ptr;
+    capture_depth -= 1;
+    // Restore previous capture state
+    body.body_tracking = capture_saved_tracking[capture_depth];
+    body.non_body_capture = capture_saved_non_body[capture_depth];
+    out_len.* = @intCast(capture_bufs[capture_depth].items.len);
+    return capture_bufs[capture_depth].items.ptr;
 }
 
 /// Emit an if-then-else with full branch instruction bodies.
@@ -1469,20 +1487,32 @@ pub export fn zir_builder_emit_if_else_bodies(
     return @intFromEnum(ref);
 }
 
-/// Pop the last instruction index from body_inst_indices and return it.
-/// Used when chaining nested if-else blocks: the inner block_inline must
-/// be removed from the function body and placed inside the outer condbr's
-/// else branch instead.
-/// Returns the popped instruction index, or 0xFFFFFFFF if body is empty.
+/// Pop the last instruction index from the active instruction list and return it.
+/// When body_tracking is active, pops from body_inst_indices.
+/// When inside a capture (body_tracking off), pops from the active capture buffer.
+/// Used when chaining nested if-else blocks: the inner block must
+/// be removed from the current body/capture and placed inside the outer
+/// condbr's else branch instead.
+/// Returns the popped instruction index, or 0xFFFFFFFF if empty.
 pub export fn zir_builder_pop_body_inst(
     handle: ?*ZirBuilderHandle,
 ) callconv(.c) u32 {
     const b = getBuilder(handle) orelse return 0xFFFFFFFF;
     const body = b.active_body orelse return 0xFFFFFFFF;
-    if (body.body_inst_indices.items.len == 0) return 0xFFFFFFFF;
-    const idx = body.body_inst_indices.items[body.body_inst_indices.items.len - 1];
-    body.body_inst_indices.items.len -= 1;
-    return idx;
+    if (body.body_tracking) {
+        // Normal mode: pop from function body
+        if (body.body_inst_indices.items.len == 0) return 0xFFFFFFFF;
+        const idx = body.body_inst_indices.items[body.body_inst_indices.items.len - 1];
+        body.body_inst_indices.items.len -= 1;
+        return idx;
+    } else if (body.non_body_capture) |capture| {
+        // Capture mode: pop from the active capture buffer
+        if (capture.items.len == 0) return 0xFFFFFFFF;
+        const idx = capture.items[capture.items.len - 1];
+        capture.items.len -= 1;
+        return idx;
+    }
+    return 0xFFFFFFFF;
 }
 
 /// Emit `try operand` — unwrap an error union, panicking on error.
@@ -1495,6 +1525,19 @@ pub export fn zir_builder_emit_try(
     const body = b.active_body orelse return 0xFFFFFFFF;
     const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
     const ref = body.addTry(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Access a tuple/array element by immediate index.
+pub export fn zir_builder_emit_elem_val_imm(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+    index: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addElemValImm(operand_ref, index) catch return 0xFFFFFFFF;
     return @intFromEnum(ref);
 }
 
@@ -1512,6 +1555,109 @@ pub export fn zir_builder_emit_catch(
     return @intFromEnum(ref);
 }
 
+/// Emit `is_non_err(operand)` — check if an error union is not an error.
+/// Returns a bool Ref (true if operand is a success value).
+pub export fn zir_builder_emit_is_non_err(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addIsNonErr(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `err_union_payload_unsafe(operand)` — extract the payload from an error union.
+/// Only valid when the operand is known to be a success value (not an error).
+pub export fn zir_builder_emit_err_union_payload_unsafe(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addErrUnionPayloadUnsafe(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit an inline if-else expression using block_inline/condbr_inline.
+pub export fn zir_builder_emit_if_else_inline(
+    handle: ?*ZirBuilderHandle,
+    condition: u32,
+    then_value: u32,
+    else_value: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const cond_ref: Zir.Inst.Ref = @enumFromInt(condition);
+    const then_ref: Zir.Inst.Ref = @enumFromInt(then_value);
+    const else_ref: Zir.Inst.Ref = @enumFromInt(else_value);
+    const ref = body.addIfElseInline(cond_ref, then_ref, else_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Set the call modifier for the next addCall.
+/// 0=auto, 2=never_inline, 3=no_optimizations
+pub export fn zir_builder_set_call_modifier(
+    handle: ?*ZirBuilderHandle,
+    modifier: u32,
+) callconv(.c) void {
+    const b = getBuilder(handle) orelse return;
+    const body = b.active_body orelse return;
+    body.call_modifier = @intCast(modifier);
+}
+
+/// Emit `operand orelse fallback` using inline block/condbr/break.
+/// Matches AstGen's exact encoding for the orelse operator.
+pub export fn zir_builder_emit_orelse(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+    fallback: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const op_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const fb_ref: Zir.Inst.Ref = @enumFromInt(fallback);
+    const ref = body.addOrelse(op_ref, fb_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Set the current function's return type to `?T` (optional).
+pub export fn zir_builder_set_optional_return_type(
+    handle: ?*ZirBuilderHandle,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    body.setOptionalReturnType() catch return -1;
+    return 0;
+}
+
+/// Emit `return null` from a function with optional return type.
+pub export fn zir_builder_emit_ret_null(
+    handle: ?*ZirBuilderHandle,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    body.addReturnNull() catch return -1;
+    return 0;
+}
+
+/// Emit `if (condition) return value;` as a bare condbr (no block wrapper).
+/// Matches AstGen's encoding for if-statements. Falls through when false.
+pub export fn zir_builder_emit_cond_return(
+    handle: ?*ZirBuilderHandle,
+    condition: u32,
+    value: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    const cond_ref: Zir.Inst.Ref = @enumFromInt(condition);
+    const val_ref: Zir.Inst.Ref = @enumFromInt(value);
+    body.addCondReturn(cond_ref, val_ref) catch return -1;
+    return 0;
+}
+
 /// Emit `return error.<name>` — returns an error value from the current function.
 pub export fn zir_builder_emit_ret_error(
     handle: ?*ZirBuilderHandle,
@@ -1522,6 +1668,31 @@ pub export fn zir_builder_emit_ret_error(
     const body = b.active_body orelse return -1;
     const name = name_ptr[0..name_len];
     body.addReturnError(name) catch return -1;
+    return 0;
+}
+
+/// Set the current function's return type to generic (inferred from body).
+/// This allows Zig to deduce error unions from mixed return/error paths.
+pub export fn zir_builder_set_generic_return_type(
+    handle: ?*ZirBuilderHandle,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    body.is_generic_return = true;
+    return 0;
+}
+
+/// Set the current function's return type to `anyerror!T` where T is
+/// the current return type. Must be called before emitting body instructions.
+pub export fn zir_builder_set_error_union_return_type(
+    handle: ?*ZirBuilderHandle,
+    error_name_ptr: [*]const u8,
+    error_name_len: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    const name = error_name_ptr[0..error_name_len];
+    body.setErrorUnionReturnType(name) catch return -1;
     return 0;
 }
 
