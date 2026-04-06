@@ -825,7 +825,9 @@ pub const FuncBody = struct {
 
         const payload_idx: u32 = @intCast(b.extra.items.len);
         const args_len: u32 = @intCast(args.len);
-        const flags: u32 = (args_len << 5) | (1 << 4);
+        const call_mod: u32 = @as(u32, self.call_modifier) & 0x7;
+        const flags: u32 = (args_len << 5) | (1 << 4) | call_mod;
+        self.call_modifier = 0; // reset after use
         try b.extra.append(gpa, flags);
         try b.extra.append(gpa, @intFromEnum(callee));
 
@@ -874,9 +876,10 @@ pub const FuncBody = struct {
         // [flags(u32), callee(Ref), arg_0_end, arg_1_end, ..., body_inst_0, body_inst_1, ...]
         const payload_idx: u32 = @intCast(b.extra.items.len);
 
-        // Flags: packed_modifier(never_inline=2) | ensure_result_used(0) | pop_error_return_trace(1) | args_len
-        // Flags: packed_modifier(0=auto) | ensure_result_used(0) | pop_error_return_trace(1) | args_len
-        const flags: u32 = (args_len << 5) | (1 << 4); // auto + pop_error_return_trace
+        // Flags layout: [packed_modifier:3][ensure_result_used:1][pop_error_return_trace:1][args_len:27]
+        const modifier: u32 = @as(u32, self.call_modifier) & 0x7;
+        const flags: u32 = (args_len << 5) | (1 << 4) | modifier;
+        self.call_modifier = 0; // reset after use
         try b.extra.append(gpa, flags);
         try b.extra.append(gpa, @intFromEnum(callee_ref));
 
