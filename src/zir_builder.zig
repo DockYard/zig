@@ -166,6 +166,16 @@ pub const Builder = struct {
 
             const eu_ref = instRef(eu_inst_idx);
             _ = try self.addInst(.break_inline, encodeBreak(eu_ref, brk_payload_idx));
+        } else if (body.imported_ret_type_inst) |imported_inst_idx| {
+            ret_break_inline_idx = @intCast(self.tags.items.len);
+            const func_inst_predicted: u32 = ret_break_inline_idx + 1;
+
+            const brk_payload_idx: u32 = @intCast(self.extra.items.len);
+            try self.extra.append(self.gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+            try self.extra.append(self.gpa, func_inst_predicted);
+
+            const imported_ref = instRef(imported_inst_idx);
+            _ = try self.addInst(.break_inline, encodeBreak(imported_ref, brk_payload_idx));
         } else if (body.union_ret_type_inst) |union_decl_idx| {
             // The next instruction we emit is the break_inline for ret_ty body.
             // After that comes the func instruction.
@@ -194,6 +204,9 @@ pub const Builder = struct {
         } else if (body.error_union_ret_type_inst != null) {
             // ret_ty body has 2 instructions: [error_union_type, break_inline(func, error_union_type)]
             try self.extra.append(self.gpa, 2);
+        } else if (body.imported_ret_type_inst != null) {
+            // ret_ty body has 3 instructions: [import, field_val, break_inline]
+            try self.extra.append(self.gpa, 3);
         } else if (body.union_ret_type_inst != null) {
             // ret_ty body has 2 instructions: [union_decl, break_inline(func, union_decl)]
             try self.extra.append(self.gpa, 2);
@@ -216,6 +229,11 @@ pub const Builder = struct {
         if (body.error_union_ret_type_inst) |eu_inst_idx| {
             // ret_ty body: [error_union_type instruction, break_inline instruction]
             try self.extra.append(self.gpa, eu_inst_idx);
+            try self.extra.append(self.gpa, ret_break_inline_idx);
+        } else if (body.imported_ret_type_inst) |imported_inst_idx| {
+            // ret_ty body: [import, field_val, break_inline]
+            try self.extra.append(self.gpa, body.imported_ret_import_inst.?);
+            try self.extra.append(self.gpa, imported_inst_idx);
             try self.extra.append(self.gpa, ret_break_inline_idx);
         } else if (body.union_ret_type_inst) |union_decl_idx| {
             // ret_ty body: [union_decl instruction index, break_inline instruction index]
@@ -480,6 +498,10 @@ pub const FuncBody = struct {
     /// endFunction will emit a ret_ty body containing the error_union_type
     /// instruction and a break_inline.
     error_union_ret_type_inst: ?u32 = null,
+    /// When set, the function returns a type resolved via @import + field access.
+    /// endFunction will emit a ret_ty body containing [import, field_val, break_inline].
+    imported_ret_type_inst: ?u32 = null,
+    imported_ret_import_inst: ?u32 = null,
     /// When true, the function has a generic (inferred) return type.
     /// ret_ty = { body_len: 0, is_generic: true } = 0x80000000
     is_generic_return: bool = false,
@@ -641,6 +663,58 @@ pub const FuncBody = struct {
     /// Add boolean NOT. Returns a Ref to the result.
     pub fn addBoolNot(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
         return self.emitBodyInst(.bool_not, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Add a parameter whose type is @import(module_name).field_name.
+    /// The type body contains [import, field_val, break_inline].
+    pub fn addParamImportedType(self: *FuncBody, name: []const u8, module_name: []const u8, field_name: []const u8) !Zir.Inst.Ref {
+        const b = self.builder;
+        const name_idx = try b.internString(name);
+
+        // Pre-compute the param instruction index: it follows 3 instructions
+        // (import, field_val, break_inline)
+        const param_inst_idx: u32 = @intCast(b.tags.items.len + 3);
+
+        // 1. Emit import instruction
+        const path_idx = try b.internString(module_name);
+        const import_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, @intFromEnum(Zir.Inst.Ref.none));
+        try b.extra.append(b.gpa, path_idx);
+        const import_inst = try b.addInst(.import, Builder.encodePlTok(.zero, import_payload_idx));
+        const import_ref = Builder.instRef(import_inst);
+
+        // 2. Emit field_val instruction
+        const field_name_idx = try b.internString(field_name);
+        const field_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, @intFromEnum(import_ref));
+        try b.extra.append(b.gpa, field_name_idx);
+        const field_inst = try b.addInst(.field_val, Builder.encodePlNode(.zero, field_payload_idx));
+        const field_ref = Builder.instRef(field_inst);
+
+        // 3. Emit break_inline
+        const break_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+        try b.extra.append(b.gpa, param_inst_idx);
+        const break_idx = try b.addInst(.break_inline, Builder.encodeBreak(field_ref, break_payload_idx));
+
+        // Param payload
+        const payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, name_idx);
+        try b.extra.append(b.gpa, 3); // body_len=3, is_generic=false
+        try b.extra.append(b.gpa, import_inst);
+        try b.extra.append(b.gpa, field_inst);
+        try b.extra.append(b.gpa, break_idx);
+
+        const idx = try b.addInst(.param, Builder.encodePlTok(.zero, payload_idx));
+        std.debug.assert(idx == param_inst_idx);
+
+        try self.param_inst_indices.append(b.gpa, idx);
+        return Builder.instRef(idx);
+    }
+
+    /// Emit `?T` (optional type). Returns a Ref to the optional type.
+    pub fn addOptionalType(self: *FuncBody, child_type: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.optional_type, Builder.encodeUnNode(.zero, child_type));
     }
 
     /// Emit `@as(dest_type, operand)`. Returns a Ref to the coerced value.
@@ -1714,6 +1788,27 @@ pub const FuncBody = struct {
         // Emit optional_type instruction: .optional_type uses .un_node data
         const opt_type_inst = try b.addInst(.optional_type, Builder.encodeUnNode(.zero, payload_type_ref));
         self.error_union_ret_type_inst = opt_type_inst;
+    }
+
+    /// Set the return type to @import(module_name).field_name.
+    /// Used for list types: @import("zap_runtime").ListType.
+    pub fn setImportedReturnType(self: *FuncBody, module_name: []const u8, field_name: []const u8) !void {
+        const b = self.builder;
+        // Emit @import(module_name)
+        const path_idx = try b.internString(module_name);
+        const import_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, @intFromEnum(Zir.Inst.Ref.none));
+        try b.extra.append(b.gpa, path_idx);
+        const import_inst = try b.addInst(.import, Builder.encodePlTok(.zero, import_payload_idx));
+        const import_ref = Builder.instRef(import_inst);
+        // Emit field_val(import, field_name)
+        const field_name_idx = try b.internString(field_name);
+        const field_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, @intFromEnum(import_ref));
+        try b.extra.append(b.gpa, field_name_idx);
+        const field_inst = try b.addInst(.field_val, Builder.encodePlNode(.zero, field_payload_idx));
+        self.imported_ret_import_inst = import_inst;
+        self.imported_ret_type_inst = field_inst;
     }
 
     /// Emit `return null` — returns null from a function with optional return type.

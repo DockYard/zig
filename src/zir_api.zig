@@ -328,6 +328,17 @@ fn addModuleImpl(ctx: *ZirContext, name: []const u8, source_path: []const u8) !v
     const name_duped = try ar.dupe(u8, name);
     try ctx.root_mod.deps.put(ar, name_duped, mod);
 
+    // Share deps bidirectionally: new module gets existing deps, existing modules
+    // get new module. This allows cross-module @import to work between all Zap modules.
+    for (ctx.root_mod.deps.keys(), ctx.root_mod.deps.values()) |dep_name, dep_mod| {
+        if (dep_mod != mod) {
+            // Give new module access to existing deps
+            mod.deps.put(ar, dep_name, dep_mod) catch {};
+            // Give existing modules access to new module
+            dep_mod.deps.put(ar, name_duped, mod) catch {};
+        }
+    }
+
     // Register the new module in module_roots so doImport can find its file.
     // We can't re-call populateModuleRootTable because it overwrites existing
     // entries with undefined values. Instead, manually add just this module.
@@ -796,6 +807,78 @@ fn addZirImpl(ctx: *ZirContext, name: []const u8, data: *const ZirData) !void {
     // Ensure the file has its module set (needed by doImport for @import resolution).
     if (file.mod == null) {
         file.mod = ctx.root_mod;
+    }
+}
+
+/// Inject finalized ZIR into a NAMED module (not root).
+/// The module must have been registered via addModuleImpl/addModuleSourceImpl first.
+fn addZirToModuleImpl(ctx: *ZirContext, name: []const u8, data: *const ZirData) !void {
+    const gpa = ctx.gpa;
+    const zcu = ctx.compilation.zcu orelse {
+        logErr("addZirToModule: zcu is null", .{});
+        return error.OutOfMemory;
+    };
+
+    // Find the named module in root_mod.deps
+    const target_mod = ctx.root_mod.deps.get(name) orelse {
+        logErr("addZirToModule: module '{s}' not found in deps", .{name});
+        return error.OutOfMemory;
+    };
+
+    // Find its file in module_roots
+    const file_opt = zcu.module_roots.get(target_mod) orelse
+        return error.OutOfMemory;
+    const file_index = file_opt.unwrap() orelse
+        return error.OutOfMemory;
+    const file = zcu.fileByIndex(file_index);
+
+    // Build ZIR instructions using MultiArrayList
+    const inst_len: usize = data.instructions_len;
+    var mal: std.MultiArrayList(Zir.Inst) = .{};
+    try mal.ensureTotalCapacity(gpa, inst_len);
+    mal.len = inst_len;
+
+    const slice = mal.slice();
+    const tag_items = slice.items(.tag);
+    @memcpy(
+        @as([*]u8, @ptrCast(tag_items.ptr))[0..inst_len],
+        data.instructions_tags[0..inst_len],
+    );
+    const data_items = slice.items(.data);
+    const data_byte_len = inst_len * @sizeOf(Zir.Inst.Data);
+    @memcpy(
+        @as([*]u8, @ptrCast(data_items.ptr))[0..data_byte_len],
+        data.instructions_data[0..data_byte_len],
+    );
+
+    const string_bytes = try gpa.dupe(u8, data.string_bytes[0..data.string_bytes_len]);
+    errdefer gpa.free(string_bytes);
+    const extra = try gpa.dupe(u32, data.extra[0..data.extra_len]);
+    errdefer gpa.free(extra);
+
+    const zir: Zir = .{
+        .instructions = slice,
+        .string_bytes = string_bytes,
+        .extra = extra,
+    };
+
+    // Module stubs always use "comptime {}\n" (not exe mode)
+    if (file.source == null) {
+        const stub_source = "comptime {}\n";
+        const source = try gpa.allocSentinel(u8, stub_source.len, 0);
+        @memcpy(source, stub_source);
+        file.source = source;
+        file.tree = try std.zig.Ast.parse(gpa, source, .zig);
+    }
+
+    if (file.zir) |*old_zir| old_zir.deinit(gpa);
+
+    file.zir = zir;
+    file.status = .success;
+    file.zir_injected = true;
+
+    if (file.mod == null) {
+        file.mod = target_mod;
     }
 }
 
@@ -1883,6 +1966,35 @@ pub export fn zir_builder_inject(
     return 0;
 }
 
+/// Inject finalized ZIR into a named module (not root).
+/// The module must have been registered first via zir_compilation_add_module or
+/// zir_compilation_add_module_source. The builder handle is consumed.
+pub export fn zir_builder_inject_module(
+    builder_handle: ?*ZirBuilderHandle,
+    compilation_handle: ?*ZirContext,
+    module_name: [*:0]const u8,
+) callconv(.c) i32 {
+    const b = getBuilder(builder_handle) orelse return -1;
+    const ctx = compilation_handle orelse return -1;
+
+    const fzir = b.finalize() catch return -1;
+    const zir_data = ZirData{
+        .instructions_tags = @constCast(fzir.instructions_tags.ptr),
+        .instructions_data = @constCast(fzir.instructions_data.ptr),
+        .instructions_len = fzir.instructions_len,
+        .string_bytes = @constCast(fzir.string_bytes.ptr),
+        .string_bytes_len = fzir.string_bytes_len,
+        .extra = @constCast(fzir.extra.ptr),
+        .extra_len = fzir.extra_len,
+    };
+    addZirToModuleImpl(ctx, std.mem.sliceTo(module_name, 0), &zir_data) catch return -1;
+
+    b.deinit();
+    std.heap.page_allocator.destroy(b);
+
+    return 0;
+}
+
 /// Emit a `decl_ref` instruction that yields a reference to a named declaration.
 /// Used to get a function Ref without calling it (for use with call_ref inside branches).
 pub export fn zir_builder_emit_decl_ref(
@@ -1907,6 +2019,55 @@ pub export fn zir_builder_get_union_ret_type_ref(
     const body = b.active_body orelse return 0;
     if (body.union_ret_type_inst == null) return 0;
     const ref = body.addRetType() catch return 0;
+    return @intFromEnum(ref);
+}
+
+/// Emit a parameter whose type is @import(module_name).field_name.
+/// Returns the param Ref or 0xFFFFFFFF on error.
+pub export fn zir_builder_emit_param_imported_type(
+    handle: ?*ZirBuilderHandle,
+    param_name_ptr: [*]const u8,
+    param_name_len: u32,
+    module_name_ptr: [*]const u8,
+    module_name_len: u32,
+    field_name_ptr: [*]const u8,
+    field_name_len: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const param_name = param_name_ptr[0..param_name_len];
+    const module_name = module_name_ptr[0..module_name_len];
+    const field_name = field_name_ptr[0..field_name_len];
+    const ref = body.addParamImportedType(param_name, module_name, field_name) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Set the current function's return type to @import(module_name).field_name.
+/// Must be called after beginFunction and before body instructions.
+pub export fn zir_builder_set_imported_return_type(
+    handle: ?*ZirBuilderHandle,
+    module_name_ptr: [*]const u8,
+    module_name_len: u32,
+    field_name_ptr: [*]const u8,
+    field_name_len: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    const module_name = module_name_ptr[0..module_name_len];
+    const field_name = field_name_ptr[0..field_name_len];
+    body.setImportedReturnType(module_name, field_name) catch return -1;
+    return 0;
+}
+
+/// Emit `?T` (optional type). Returns a Ref for the optional type.
+pub export fn zir_builder_emit_optional_type(
+    handle: ?*ZirBuilderHandle,
+    child_type: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const child_ref: Zir.Inst.Ref = @enumFromInt(child_type);
+    const ref = body.addOptionalType(child_ref) catch return 0xFFFFFFFF;
     return @intFromEnum(ref);
 }
 
