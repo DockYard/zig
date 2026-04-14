@@ -367,6 +367,9 @@ fn workerUpdateFile(
     prog_node: std.Progress.Node,
     group: *Io.Group,
 ) void {
+    // Skip the AstGen pipeline for files with pre-injected ZIR.
+    if (file.zir_injected) return;
+
     const io = comp.io;
     const tid: Zcu.PerThread.Id = .acquire(io);
     defer tid.release(io);

@@ -962,6 +962,11 @@ pub const File = struct {
     /// pipeline generally shouldn't care about this.
     is_builtin: bool,
 
+    /// Whether this file's ZIR was injected directly via the C-ABI (bypassing AstGen).
+    /// When true, the compilation pipeline skips source loading, parsing, and AstGen
+    /// for this file. The injected ZIR is used directly by Sema.
+    zir_injected: bool = false,
+
     /// The path of this file. It is important that this path has a "canonical form" because files
     /// are deduplicated based on path; `Compilation.Path` guarantees this. Owned by this `File`,
     /// allocated into `gpa`.
@@ -1315,6 +1320,10 @@ pub const SrcLoc = struct {
     pub const Span = Ast.Span;
 
     pub fn span(src_loc: SrcLoc, zcu: *const Zcu) !Span {
+        // ZIR-injected files have no real source — return a safe dummy span.
+        if (src_loc.file_scope.zir_injected)
+            return Span{ .start = 0, .end = 1, .main = 0 };
+
         switch (src_loc.lazy) {
             .unneeded => unreachable,
 

@@ -227,8 +227,25 @@ pub fn build(b: *std.Build) !void {
 
     test_step.dependOn(&exe.step);
 
+    // ── lib target: build libzap_compiler.a ──────────────────────────
+    const lib = addCompilerLibStep(b, .{
+        .optimize = optimize,
+        .target = target,
+        .strip = strip,
+        .sanitize_thread = sanitize_thread,
+        .single_threaded = single_threaded,
+    });
+    lib.use_llvm = use_llvm;
+    lib.use_lld = use_llvm;
+    if (link_libc) lib.root_module.link_libc = true;
+    const install_lib = b.addInstallArtifact(lib, .{});
+    const lib_step = b.step("lib", "Build libzap_compiler.a static library for ZIR API");
+    lib_step.dependOn(&install_lib.step);
+
     const exe_options = b.addOptions();
     exe.root_module.addOptions("build_options", exe_options);
+    // The lib target shares the same build_options as the exe.
+    lib.root_module.addOptions("build_options", exe_options);
 
     exe_options.addOption(u32, "mem_leak_frames", mem_leak_frames);
     exe_options.addOption(bool, "skip_non_native", skip_non_native);
@@ -352,6 +369,18 @@ pub fn build(b: *std.Build) !void {
             exe.root_module.linkSystemLibrary("version", .{});
             exe.root_module.linkSystemLibrary("uuid", .{});
             exe.root_module.linkSystemLibrary("ole32", .{});
+        }
+
+        // Apply the same LLVM configuration to the lib target.
+        if (cmake_cfg) |cfg| {
+            try addCmakeCfgOptionsToExe(b, cfg, lib, use_zig_libcxx);
+        } else {
+            try addStaticLlvmOptionsToModule(lib.root_module, .{
+                .llvm_has_m68k = llvm_has_m68k,
+                .llvm_has_csky = llvm_has_csky,
+                .llvm_has_arc = llvm_has_arc,
+                .llvm_has_xtensa = llvm_has_xtensa,
+            });
         }
     }
 
@@ -787,6 +816,24 @@ fn addCompilerStep(b: *std.Build, options: AddCompilerModOptions) *std.Build.Ste
     exe.link_data_sections = function_data_sections;
 
     return exe;
+}
+
+/// Build libzap_compiler.a — a static library exposing the ZIR C-ABI surface.
+/// This uses the same compiler module as the executable but produces a .a
+/// instead of an executable. The C-ABI symbols are force-exported via the
+/// comptime block in main.zig.
+fn addCompilerLibStep(b: *std.Build, options: AddCompilerModOptions) *std.Build.Step.Compile {
+    const lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "zap_compiler",
+        .root_module = addCompilerMod(b, options),
+    });
+
+    const function_data_sections = options.target.result.cpu.arch.isArm() or options.target.result.cpu.arch.isPowerPC();
+    lib.link_function_sections = function_data_sections;
+    lib.link_data_sections = function_data_sections;
+
+    return lib;
 }
 
 const exe_cflags = [_][]const u8{
