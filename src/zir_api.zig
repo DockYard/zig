@@ -966,6 +966,17 @@ pub export fn zir_builder_emit_int(handle: ?*ZirBuilderHandle, value: i64) callc
     return @intFromEnum(ref);
 }
 
+/// Emit a typed integer literal: `@as(dest_type, value)`.
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_int_typed(handle: ?*ZirBuilderHandle, value: i64, dest_type: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const int_ref = body.addInt(value) catch return 0xFFFFFFFF;
+    const type_ref: Zir.Inst.Ref = @enumFromInt(dest_type);
+    const ref = body.addAs(type_ref, int_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
 /// Emit a float literal. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
 pub export fn zir_builder_emit_float(handle: ?*ZirBuilderHandle, value: f64) callconv(.c) u32 {
     const b = getBuilder(handle) orelse return 0xFFFFFFFF;
@@ -1568,6 +1579,31 @@ pub export fn zir_builder_emit_if_else_bodies(
         else_ref,
     ) catch return 0xFFFFFFFF;
     return @intFromEnum(ref);
+}
+
+/// Emit a block_inline + condbr_inline with full instruction bodies.
+/// The then-branch body should end with a ret instruction (function dispatch).
+/// The else-branch body continues execution past the block.
+/// Unlike emit_if_else_bodies (which uses runtime block/condbr and requires
+/// matching branch result types), this uses inline variants that properly
+/// handle branches where one path returns from the function.
+pub export fn zir_builder_emit_cond_branch_with_bodies(
+    handle: ?*ZirBuilderHandle,
+    condition: u32,
+    then_insts_ptr: [*]const u32,
+    then_insts_len: u32,
+    else_insts_ptr: [*]const u32,
+    else_insts_len: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    const cond_ref: Zir.Inst.Ref = @enumFromInt(condition);
+    body.addCondBranchWithBodies(
+        cond_ref,
+        then_insts_ptr[0..then_insts_len],
+        else_insts_ptr[0..else_insts_len],
+    ) catch return -1;
+    return 0;
 }
 
 /// Pop the last instruction index from the active instruction list and return it.

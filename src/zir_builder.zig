@@ -1344,6 +1344,64 @@ pub const FuncBody = struct {
         return Builder.instRef(block_idx);
     }
 
+    /// Emit a block_inline + condbr where the then-branch contains full
+    /// instruction bodies ending with ret. Uses block_inline (no runtime
+    /// block scope) with runtime condbr (runtime condition evaluation).
+    /// The then-branch should end with a ret or unreachable — no break is added.
+    /// The else-branch gets a break_inline(void) appended so execution continues.
+    pub fn addCondBranchWithBodies(
+        self: *FuncBody,
+        condition: Zir.Inst.Ref,
+        then_insts: []const u32,
+        else_insts: []const u32,
+    ) !void {
+        const b = self.builder;
+        const gpa = b.gpa;
+
+        // block_inline wrapping the condbr
+        const block_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, 1); // body_len = 1 (the condbr)
+        const block_body_slot: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, 0); // placeholder for condbr index
+
+        const block_idx = try b.addInst(.block_inline, Builder.encodePlNode(.zero, block_payload_idx));
+
+        // break_inline for the else branch — continues past the block
+        const break_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @bitCast(@as(i32, std.math.maxInt(i32)))); // src_node = none
+        try b.extra.append(gpa, block_idx);
+        const break_idx = try b.addInst(.break_inline, Builder.encodeBreak(.void_value, break_payload_idx));
+
+        // Runtime condbr with full bodies
+        // then_body = then_insts (ending with ret — no break needed)
+        // else_body = else_insts + break(void)
+        const then_body_len: u32 = @intCast(then_insts.len);
+        const else_body_len: u32 = @intCast(else_insts.len + 1); // +1 for break
+
+        const condbr_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @intFromEnum(condition));
+        try b.extra.append(gpa, then_body_len);
+        try b.extra.append(gpa, else_body_len);
+        for (then_insts) |idx| {
+            try b.extra.append(gpa, idx);
+        }
+        for (else_insts) |idx| {
+            try b.extra.append(gpa, idx);
+        }
+        try b.extra.append(gpa, break_idx);
+        const condbr_idx = try b.addInst(.condbr, Builder.encodePlNode(.zero, condbr_payload_idx));
+
+        // Fix up block body
+        b.extra.items[block_body_slot] = condbr_idx;
+
+        // Track block as body instruction
+        if (self.body_tracking) {
+            try self.body_inst_indices.append(gpa, block_idx);
+        } else if (self.non_body_capture) |capture| {
+            try capture.append(gpa, block_idx);
+        }
+    }
+
     /// Return the current instruction count in the builder.
     /// Used by callers to track instruction index ranges for branch bodies.
     pub fn getInstCount(self: *FuncBody) u32 {
