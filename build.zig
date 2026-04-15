@@ -823,10 +823,27 @@ fn addCompilerStep(b: *std.Build, options: AddCompilerModOptions) *std.Build.Ste
 /// instead of an executable. The C-ABI symbols are force-exported via the
 /// comptime block in main.zig.
 fn addCompilerLibStep(b: *std.Build, options: AddCompilerModOptions) *std.Build.Step.Compile {
+    // Use zir_api.zig as the library root instead of main.zig to avoid
+    // exporting a duplicate `main` symbol when Zap links against this library.
+    const lib_mod = b.createModule(.{
+        .root_source_file = b.path("src/zir_api.zig"),
+        .target = options.target,
+        .optimize = options.optimize,
+        .strip = options.strip,
+        .sanitize_thread = options.sanitize_thread,
+        .single_threaded = options.single_threaded,
+        .valgrind = options.valgrind,
+    });
+    const aro_mod = b.createModule(.{
+        .root_source_file = b.path("lib/compiler/aro/aro.zig"),
+    });
+    lib_mod.addImport("aro", aro_mod);
+    // zir_api.zig imports from the compiler package — add dependencies
+    // that main.zig normally provides via the module graph.
     const lib = b.addLibrary(.{
         .linkage = .static,
         .name = "zap_compiler",
-        .root_module = addCompilerMod(b, options),
+        .root_module = lib_mod,
     });
 
     const function_data_sections = options.target.result.cpu.arch.isArm() or options.target.result.cpu.arch.isPowerPC();
