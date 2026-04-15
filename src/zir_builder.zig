@@ -25,11 +25,11 @@ pub const Builder = struct {
     pub fn init(gpa: Allocator) !Builder {
         var self = Builder{
             .gpa = gpa,
-            .tags = .{},
-            .data = .{},
-            .extra = .{},
-            .string_bytes = .{},
-            .decl_indices = .{},
+            .tags = .empty,
+            .data = .empty,
+            .extra = .empty,
+            .string_bytes = .empty,
+            .decl_indices = .empty,
             .active_body = null,
         };
 
@@ -71,9 +71,9 @@ pub const Builder = struct {
 
     /// Convert an instruction index to a Zir.Inst.Ref.
     /// Named refs (void_value, bool_true, etc.) occupy indices 0..123.
-    /// Instruction refs start at ref_start_index = 124.
+    /// Instruction refs are offset by Ref.static_len from instruction indices.
     pub fn instRef(index: u32) Zir.Inst.Ref {
-        return @enumFromInt(@as(u32, @intFromEnum(Zir.Inst.Index.ref_start_index)) + index);
+        return @enumFromInt(@as(u32, @intCast(Zir.Inst.Ref.static_len)) + index);
     }
 
     /// Append a single instruction, return its index.
@@ -119,8 +119,8 @@ pub const Builder = struct {
         const body = try self.gpa.create(FuncBody);
         body.* = FuncBody{
             .builder = self,
-            .body_inst_indices = .{},
-            .param_inst_indices = .{},
+            .body_inst_indices = .empty,
+            .param_inst_indices = .empty,
             .name = name,
             .decl_inst = decl_inst,
             .restore_inst = restore_inst,
@@ -488,7 +488,7 @@ pub const FuncBody = struct {
     /// When non-empty, the function returns a tuple type. endFunction will
     /// emit a ret_ty body that computes the struct type from these element
     /// type Refs (e.g., .i64_type, .slice_const_u8_type).
-    tuple_ret_types: std.ArrayListUnmanaged(Zir.Inst.Ref) = .{},
+    tuple_ret_types: std.ArrayListUnmanaged(Zir.Inst.Ref) = .empty,
     /// When set, the function returns a union type declared inline.
     /// endFunction will emit a ret_ty body containing this union_decl
     /// instruction and a break_inline, matching AstGen's encoding for
@@ -506,7 +506,7 @@ pub const FuncBody = struct {
     /// ret_ty = { body_len: 0, is_generic: true } = 0x80000000
     is_generic_return: bool = false,
     /// The individual element type Refs for the tuple return type.
-    tuple_element_type_refs: std.ArrayListUnmanaged(Zir.Inst.Ref) = .{},
+    tuple_element_type_refs: std.ArrayListUnmanaged(Zir.Inst.Ref) = .empty,
     /// When false, emitBodyInst/emitBodyInstVoid still emit instructions via
     /// addInst but do NOT append the index to body_inst_indices. This allows
     /// emitting instructions that live inside sub-bodies (e.g. condbr branches)
@@ -1598,10 +1598,13 @@ pub const FuncBody = struct {
         try b.extra.append(b.gpa, @intFromEnum(operand));
         try b.extra.append(b.gpa, @bitCast(Zir.Inst.SwitchBlock.Bits{
             .has_multi_cases = false,
-            .special_prongs = .none,
-            .any_has_tag_capture = false,
-            .any_non_inline_capture = any_non_inline_capture,
+            .any_ranges = false,
+            .has_else = false,
+            .has_under = false,
             .has_continue = false,
+            .any_maybe_runtime_capture = any_non_inline_capture,
+            .payload_capture_inst_is_placeholder = false,
+            .tag_capture_inst_is_placeholder = false,
             .scalar_cases_len = @intCast(prongs.len),
         }));
 
@@ -1616,6 +1619,7 @@ pub const FuncBody = struct {
                 .capture = if (p.has_capture) .by_val else .none,
                 .is_inline = false,
                 .has_tag_capture = false,
+                .is_comptime_unreach = false,
             }));
 
             // Body instruction indices
@@ -1668,24 +1672,21 @@ pub const FuncBody = struct {
         try b.extra.append(b.gpa, 0); // src_node = 0
 
         const small: Zir.Inst.UnionDecl.Small = .{
-            .has_tag_type = false,
             .has_captures_len = false,
-            .has_body_len = false,
-            .has_fields_len = true,
             .has_decls_len = false,
+            .has_fields_len = true,
             .name_strategy = .anon,
-            .layout = .auto,
-            .auto_enum_tag = true, // union(enum)
-            .any_aligned_fields = false,
+            .kind = .tagged_enum, // union(enum)
+            .any_field_aligns = false,
+            .any_field_values = false,
         };
 
         // --- Trailing conditional fields (ordered by flag bits) ---
-        // has_tag_type=false → skip
         // has_captures_len=false → skip
-        // has_body_len=false → skip
+        // has_decls_len=false → skip
         // has_fields_len=true → emit fields_len
         try b.extra.append(b.gpa, fields_len);
-        // has_decls_len=false → skip
+        // no more trailing fields
 
         // --- Captures (none) ---
         // --- Decls (none) ---

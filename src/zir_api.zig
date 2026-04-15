@@ -132,12 +132,13 @@ pub export fn zir_compilation_update(ctx: *ZirContext) i32 {
         const count = error_bundle.errorMessageCount();
         logErr("error count from update catch: {d}", .{count});
         if (count > 0) {
-            const stderr = std.debug.lockStderrWriter(&.{});
-            defer std.debug.unlockStderrWriter();
+            var stderr_buf2: [256]u8 = undefined;
+            const stderr_locked2 = std.debug.lockStderr(&stderr_buf2);
+            defer std.debug.unlockStderr();
             error_bundle.renderToWriter(.{
                 .include_source_line = false,
                 .include_reference_trace = false,
-            }, stderr) catch |render_err| {
+            }, &stderr_locked2.file_writer.interface) catch |render_err| {
                 logErr("renderToWriter failed: {s}", .{@errorName(render_err)});
             };
         } else {
@@ -158,8 +159,10 @@ pub export fn zir_compilation_update(ctx: *ZirContext) i32 {
 }
 
 fn dumpErrorBundle(eb: std.zig.ErrorBundle) void {
-    const w = std.debug.lockStderrWriter(&.{});
-    defer std.debug.unlockStderrWriter();
+    var buf: [256]u8 = undefined;
+    const locked = std.debug.lockStderr(&buf);
+    defer std.debug.unlockStderr();
+    const w = &locked.file_writer.interface;
     const count = eb.errorMessageCount();
     w.print("\n=== {d} compilation error(s) ===\n", .{count}) catch return;
 
@@ -214,10 +217,11 @@ pub export fn zir_compilation_print_errors(ctx: *ZirContext) void {
     }
 
     logErr("error count: {d}", .{count});
-    const stderr = std.debug.lockStderrWriter(&.{});
-    defer std.debug.unlockStderrWriter();
+    var stderr_buf: [256]u8 = undefined;
+    const stderr_locked = std.debug.lockStderr(&stderr_buf);
+    defer std.debug.unlockStderr();
+    const stderr = &stderr_locked.file_writer.interface;
     error_bundle.renderToWriter(.{
-        .ttyconf = .no_color,
         .include_source_line = false,
         .include_reference_trace = false,
     }, stderr) catch {};
@@ -362,7 +366,8 @@ fn addModuleImpl(ctx: *ZirContext, name: []const u8, source_path: []const u8) !v
         const new_file = try gpa.create(Zcu.File);
         const pt: Zcu.PerThread = .activate(zcu, .main);
         defer pt.deactivate();
-        const new_file_index = try zcu.intern_pool.createFile(gpa, pt.tid, .{
+        const io = ctx.io();
+        const new_file_index = try zcu.intern_pool.createFile(gpa, io, pt.tid, .{
             .bin_digest = path.digest(),
             .file = new_file,
             .root_type = .none,
@@ -426,7 +431,7 @@ fn addModuleSourceImpl(ctx: *ZirContext, name: []const u8, source: []const u8) !
             return error.OutOfMemory;
         };
         defer file.close(io);
-        file.writeStreaming(io, source) catch |err| {
+        file.writeStreamingAll(io, source) catch |err| {
             logErr("addModuleSource: writeStreaming failed: {s}", .{@errorName(err)});
             return error.OutOfMemory;
         };
@@ -521,9 +526,7 @@ fn addLinkLibImpl(ctx: *ZirContext, lib_name: []const u8) !void {
 }
 
 fn logErr(comptime fmt: []const u8, args: anytype) void {
-    const stderr = std.debug.lockStderrWriter(&.{});
-    defer std.debug.unlockStderrWriter();
-    stderr.print("zir_api: " ++ fmt ++ "\n", args) catch {};
+    std.debug.print("zir_api: " ++ fmt ++ "\n", args);
 }
 
 fn createImpl(
@@ -581,7 +584,7 @@ fn createImpl(
     };
 
     ctx.dirs = .{
-        .cwd = try introspect.getResolvedCwd(ar),
+        .cwd = try introspect.getResolvedCwd(io, ar),
         .zig_lib = .{ .handle = zig_lib_handle, .path = try ar.dupe(u8, zig_lib_dir_path) },
         .local_cache = .{ .handle = local_cache_handle, .path = try ar.dupe(u8, local_cache_dir_path) },
         .global_cache = .{ .handle = global_cache_handle, .path = try ar.dupe(u8, global_cache_dir_path) },
@@ -591,7 +594,7 @@ fn createImpl(
     const target_query = std.zig.parseTargetQueryOrReportFatalError(ar, .{
         .arch_os_abi = "native",
     });
-    const native_target = std.zig.resolveTargetQueryOrFatal(target_query);
+    const native_target = std.zig.resolveTargetQueryOrFatal(io, target_query);
     const resolved_target: Package.Module.ResolvedTarget = .{
         .result = native_target,
         .is_native_os = target_query.isNativeOs(),
@@ -651,7 +654,7 @@ fn createImpl(
     {
         var file = cwd.createFile(io, stub_full, .{}) catch return error.OutOfMemory;
         defer file.close(io);
-        file.writeStreaming(io, stub_source) catch return error.OutOfMemory;
+        file.writeStreamingAll(io, stub_source) catch return error.OutOfMemory;
     }
 
     // Resolve the path canonically using the Compilation's directory system.
@@ -677,7 +680,7 @@ fn createImpl(
     // When LLVM is available, the compiler can build compiler_rt itself,
     // but it needs self_exe_path to find the lib/ directory.
     const self_exe_path: ?[]const u8 = if (build_options.have_llvm)
-        (std.process.executablePathAlloc(ar) catch null)
+        (std.process.executablePathAlloc(io, ar) catch null)
     else
         null;
 
@@ -687,10 +690,14 @@ fn createImpl(
     else
         .default;
 
+    // Create an environment map for the compilation context.
+    var environ_map = std.process.Environ.Map.init(ar);
+
     var create_diag: Compilation.CreateDiagnostic = undefined;
     ctx.compilation = Compilation.create(gpa, ar, io, &create_diag, .{
         .dirs = ctx.dirs,
         .thread_limit = @min(std.Thread.getCpuCount() catch 1, 4),
+        .environ_map = &environ_map,
         .self_exe_path = self_exe_path,
         .config = config,
         .root_mod = root_mod,
@@ -1318,8 +1325,8 @@ pub export fn zir_builder_add_switch_block(
 
     const ref = body.addSwitchBlock(@enumFromInt(operand), prongs) catch return 0xFFFFFFFFFFFFFFFF;
     const ref_u32: u32 = @intFromEnum(ref);
-    // The instruction index is ref minus the ref_start_index offset
-    const inst_idx: u32 = ref_u32 - @intFromEnum(Zir.Inst.Index.ref_start_index);
+    // The instruction index is ref minus the Ref.static_len offset
+    const inst_idx: u32 = ref_u32 - @as(u32, @intCast(Zir.Inst.Ref.static_len));
     return @as(u64, ref_u32) | (@as(u64, inst_idx) << 32);
 }
 
@@ -1487,7 +1494,7 @@ pub export fn zir_builder_get_inst_count(
 /// Supports nested case/cond expressions that require inner captures
 /// while an outer capture is still active.
 const MAX_CAPTURE_DEPTH = 16;
-var capture_bufs: [MAX_CAPTURE_DEPTH]std.ArrayListUnmanaged(u32) = [_]std.ArrayListUnmanaged(u32){.{}} ** MAX_CAPTURE_DEPTH;
+var capture_bufs: [MAX_CAPTURE_DEPTH]std.ArrayListUnmanaged(u32) = [_]std.ArrayListUnmanaged(u32){.empty} ** MAX_CAPTURE_DEPTH;
 var capture_saved_tracking: [MAX_CAPTURE_DEPTH]bool = [_]bool{true} ** MAX_CAPTURE_DEPTH;
 var capture_saved_non_body: [MAX_CAPTURE_DEPTH]?*std.ArrayListUnmanaged(u32) = [_]?*std.ArrayListUnmanaged(u32){null} ** MAX_CAPTURE_DEPTH;
 var capture_depth: u32 = 0;
