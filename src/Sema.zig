@@ -6087,7 +6087,10 @@ fn lookupIdentifier(sema: *Sema, block: *Block, name: InternPool.NullTerminatedS
         }
         namespace = zcu.namespacePtr(namespace).parent.unwrap() orelse break;
     }
-    unreachable; // AstGen detects use of undeclared identifiers.
+    // AstGen normally detects undeclared identifiers, but externally-injected ZIR
+    // (from the Zap compiler) may reference names not present in the current namespace.
+    // Return a compile error instead of crashing.
+    return sema.fail(block, block.nodeOffset(@enumFromInt(0)), "use of undeclared identifier '{f}'", .{name.fmt(&zcu.intern_pool)});
 }
 
 /// This looks up a member of a specific namespace.
@@ -25848,7 +25851,19 @@ fn fieldPtrLoad(
     const pt = sema.pt;
     const zcu = pt.zcu;
     const object_ptr_ty = sema.typeOf(object_ptr);
-    assert(object_ptr_ty.zigTypeTag(zcu) == .pointer);
+    // For ZIR injected by external compilers (Zap), the operand may be a
+    // non-pointer type/namespace value.  Fall back to fieldVal which handles
+    // value-level field access (equivalent to the removed field_val instruction).
+    if (object_ptr_ty.zigTypeTag(zcu) != .pointer) {
+        return fieldVal(sema, block, src, object_ptr, field_name, field_name_src);
+    }
+    // For slices ([]const u8, etc.), delegate to fieldVal which has proper
+    // handling for .len and .ptr fields. fieldPtrLoad's childType() on a slice
+    // returns the element type (u8), not the slice struct, so the pointer path
+    // would incorrectly try field access on the element type.
+    if (object_ptr_ty.ptrSize(zcu) == .slice) {
+        return fieldVal(sema, block, src, object_ptr, field_name, field_name_src);
+    }
     const pointee_ty = object_ptr_ty.childType(zcu);
     try sema.ensureLayoutResolved(pointee_ty, src, .ptr_access);
     if (try pointee_ty.onePossibleValue(pt)) |opv| {

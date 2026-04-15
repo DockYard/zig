@@ -353,7 +353,7 @@ pub const Builder = struct {
         }
 
         // Fix up instruction 0 (struct_decl) with real extended data
-        const small: u16 = 0x0004; // StructDecl.Small with has_decls_len = true (bit 2)
+        const small: u16 = 0x0002; // StructDecl.Small with has_decls_len = true (bit 1 in 0.16)
         self.data.items[0] = encodeExtended(
             @intFromEnum(Zir.Inst.Extended.struct_decl),
             small,
@@ -513,7 +513,7 @@ pub const FuncBody = struct {
     /// without polluting the function's main body.
     body_tracking: bool = true,
     /// Call modifier for the next addCall (reset to 0 after use).
-    /// 0=auto, 2=never_inline, 3=no_optimizations
+    /// 0=auto, 1=never_tail, 2=never_inline, 3=no_suspend, 4=always_tail, 5=always_inline, 6=compile_time
     call_modifier: u3 = 0,
 
     /// When non-null AND body_tracking is false, "would-be body" instruction
@@ -683,7 +683,8 @@ pub const FuncBody = struct {
         const import_inst = try b.addInst(.import, Builder.encodePlTok(.zero, import_payload_idx));
         const import_ref = Builder.instRef(import_inst);
 
-        // 2. Emit field_ptr_load instruction
+        // 2. Emit field_ptr_load instruction (Sema's fieldPtrLoad handles non-pointer
+        //    operands by falling through to fieldVal for comptime namespace access)
         const field_name_idx = try b.internString(field_name);
         const field_payload_idx: u32 = @intCast(b.extra.items.len);
         try b.extra.append(b.gpa, @intFromEnum(import_ref));
@@ -770,6 +771,8 @@ pub const FuncBody = struct {
 
     /// Emit field access on an object (a.b syntax). Returns a Ref to the field value.
     /// Uses the `.field_ptr_load` instruction with `.pl_node` data and `Field` payload.
+    /// In 0.16, Sema's fieldPtrLoad handles non-pointer operands by delegating to
+    /// fieldVal for comptime namespace access (fork modification in Sema.zig).
     pub fn addFieldPtrLoad(self: *FuncBody, object: Zir.Inst.Ref, field_name: []const u8) !Zir.Inst.Ref {
         const name_idx = try self.builder.internString(field_name);
         // Field payload in extra: { lhs: Ref, field_name_start: NullTerminatedString }

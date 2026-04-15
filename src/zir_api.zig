@@ -563,9 +563,20 @@ fn createImpl(
     const ar = ctx.arena_state.allocator();
 
     // Initialize the Io.Threaded instance (replaces thread pool in 0.16).
+    const thread_limit = @min(std.Thread.getCpuCount() catch 1, 4);
     ctx.io_impl = .init(gpa, .{
         .stack_size = 16 * 1024 * 1024,
     });
+    // Match thread limits to keep InternPool's PerThread happy.
+    // Main thread doesn't count, so limit = thread_limit - 1.
+    const limit: Io.Limit = .limited(thread_limit - 1);
+    ctx.io_impl.setAsyncLimit(limit);
+    ctx.io_impl.concurrent_limit = limit;
+    // Allocate per-thread IDs for the Zig compiler's concurrent work.
+    Zcu.PerThread.Id.allocate(ar, @max(thread_limit, 2)) catch {
+        logErr("failed to allocate PerThread IDs", .{});
+        return error.OutOfMemory;
+    };
     const io = ctx.io();
 
     // Open directory handles using the Io interface.
@@ -696,7 +707,7 @@ fn createImpl(
     var create_diag: Compilation.CreateDiagnostic = undefined;
     ctx.compilation = Compilation.create(gpa, ar, io, &create_diag, .{
         .dirs = ctx.dirs,
-        .thread_limit = @min(std.Thread.getCpuCount() catch 1, 4),
+        .thread_limit = thread_limit,
         .environ_map = &environ_map,
         .self_exe_path = self_exe_path,
         .config = config,
