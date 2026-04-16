@@ -22,6 +22,14 @@ pub const Builder = struct {
     /// Active function body, if any
     active_body: ?*FuncBody,
 
+    /// Nestable capture stack used by begin_capture / end_capture.
+    /// Supports nested case/cond expressions that require inner captures
+    /// while an outer capture is still active.
+    capture_bufs: [16]std.ArrayListUnmanaged(u32) = [_]std.ArrayListUnmanaged(u32){.empty} ** 16,
+    capture_saved_tracking: [16]bool = [_]bool{true} ** 16,
+    capture_saved_non_body: [16]?*std.ArrayListUnmanaged(u32) = [_]?*std.ArrayListUnmanaged(u32){null} ** 16,
+    capture_depth: u32 = 0,
+
     pub fn init(gpa: Allocator) !Builder {
         var self = Builder{
             .gpa = gpa,
@@ -54,6 +62,9 @@ pub const Builder = struct {
         self.extra.deinit(self.gpa);
         self.string_bytes.deinit(self.gpa);
         self.decl_indices.deinit(self.gpa);
+        for (&self.capture_bufs) |*buf| {
+            buf.deinit(self.gpa);
+        }
         if (self.active_body) |body| {
             body.body_inst_indices.deinit(self.gpa);
             body.param_inst_indices.deinit(self.gpa);

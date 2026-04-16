@@ -335,6 +335,67 @@ pub export fn zir_compilation_destroy(ctx: *ZirContext) void {
     gpa.destroy(ctx);
 }
 
+/// Prepare the compilation for an incremental update.
+///
+/// For every file in `module_roots` that was ZIR-injected, saves the current
+/// `file.zir` into `file.prev_zir` so the incremental pipeline can diff old
+/// vs new ZIR during the next `zir_compilation_update`.
+///
+/// Must be called BEFORE injecting new ZIR and calling update.
+/// Returns 0 on success, -1 on error.
+pub export fn zir_compilation_prepare_update(ctx: ?*ZirContext) callconv(.c) i32 {
+    const c = ctx orelse return -1;
+    const gpa = c.gpa;
+    const zcu = c.compilation.zcu orelse return -1;
+
+    for (zcu.module_roots.values()) |opt_file_index| {
+        const file_index = opt_file_index.unwrap() orelse continue;
+        const file = zcu.fileByIndex(file_index);
+
+        if (!file.zir_injected) continue;
+
+        if (file.zir) |current_zir| {
+            // If prev_zir already exists, free it first.
+            if (file.prev_zir) |prev| {
+                prev.deinit(gpa);
+                gpa.destroy(prev);
+            }
+
+            // Allocate a new Zir on the heap and copy the current ZIR into it.
+            const prev_zir_ptr = gpa.create(Zir) catch return -1;
+            prev_zir_ptr.* = current_zir;
+            file.prev_zir = prev_zir_ptr;
+
+            // Clear the current ZIR so new ZIR can be injected.
+            file.zir = null;
+        }
+    }
+
+    return 0;
+}
+
+/// Mark a named module's root file as changed for incremental recompilation.
+///
+/// Looks up `name` in the root module's dependencies, finds its root file in
+/// `module_roots`, and sets `file.module_changed = true`. This tells the
+/// incremental pipeline to invalidate and re-analyze that module.
+///
+/// Returns 0 on success, -1 if the module was not found.
+pub export fn zir_compilation_invalidate_file(ctx: ?*ZirContext, name: [*:0]const u8) callconv(.c) i32 {
+    const c = ctx orelse return -1;
+    const zcu = c.compilation.zcu orelse return -1;
+
+    const mod_name = mem.sliceTo(name, 0);
+    const target_mod = c.root_mod.deps.get(mod_name) orelse return -1;
+
+    const file_opt = zcu.module_roots.get(target_mod) orelse return -1;
+    const file_index = file_opt.unwrap() orelse return -1;
+    const file = zcu.fileByIndex(file_index);
+
+    file.module_changed = true;
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // Internal: compilation creation
 // ---------------------------------------------------------------------------
@@ -1550,15 +1611,6 @@ pub export fn zir_builder_get_inst_count(
     return body.getInstCount();
 }
 
-/// Nestable capture stack used by begin_capture / end_capture.
-/// Supports nested case/cond expressions that require inner captures
-/// while an outer capture is still active.
-const MAX_CAPTURE_DEPTH = 16;
-var capture_bufs: [MAX_CAPTURE_DEPTH]std.ArrayListUnmanaged(u32) = [_]std.ArrayListUnmanaged(u32){.empty} ** MAX_CAPTURE_DEPTH;
-var capture_saved_tracking: [MAX_CAPTURE_DEPTH]bool = [_]bool{true} ** MAX_CAPTURE_DEPTH;
-var capture_saved_non_body: [MAX_CAPTURE_DEPTH]?*std.ArrayListUnmanaged(u32) = [_]?*std.ArrayListUnmanaged(u32){null} ** MAX_CAPTURE_DEPTH;
-var capture_depth: u32 = 0;
-
 /// Begin capturing would-be-body instruction indices. Disables body tracking
 /// and directs top-level instruction indices into an internal capture buffer.
 /// Supports nesting: each begin_capture pushes a new capture level.
@@ -1569,15 +1621,15 @@ pub export fn zir_builder_begin_capture(
 ) callconv(.c) void {
     const b = getBuilder(handle) orelse return;
     const body = b.active_body orelse return;
-    if (capture_depth >= MAX_CAPTURE_DEPTH) return;
+    if (b.capture_depth >= b.capture_bufs.len) return;
     // Save current state at this depth
-    capture_saved_tracking[capture_depth] = body.body_tracking;
-    capture_saved_non_body[capture_depth] = body.non_body_capture;
+    b.capture_saved_tracking[b.capture_depth] = body.body_tracking;
+    b.capture_saved_non_body[b.capture_depth] = body.non_body_capture;
     // Start fresh capture at this depth
-    capture_bufs[capture_depth].clearRetainingCapacity();
+    b.capture_bufs[b.capture_depth].clearRetainingCapacity();
     body.body_tracking = false;
-    body.non_body_capture = &capture_bufs[capture_depth];
-    capture_depth += 1;
+    body.non_body_capture = &b.capture_bufs[b.capture_depth];
+    b.capture_depth += 1;
 }
 
 /// End capture mode: restores the previous capture state and returns a
@@ -1588,26 +1640,26 @@ pub export fn zir_builder_end_capture(
     handle: ?*ZirBuilderHandle,
     out_len: *u32,
 ) callconv(.c) [*]const u32 {
-    if (capture_depth == 0) {
-        out_len.* = 0;
-        return @as([*]const u32, @ptrCast(&capture_bufs[0].items));
-    }
     const b = getBuilder(handle) orelse {
         out_len.* = 0;
-        capture_depth -= 1;
-        return capture_bufs[capture_depth].items.ptr;
+        // Return a valid pointer to empty data
+        return @as([*]const u32, @ptrCast(&[_]u32{}));
     };
+    if (b.capture_depth == 0) {
+        out_len.* = 0;
+        return @as([*]const u32, @ptrCast(&b.capture_bufs[0].items));
+    }
     const body = b.active_body orelse {
         out_len.* = 0;
-        capture_depth -= 1;
-        return capture_bufs[capture_depth].items.ptr;
+        b.capture_depth -= 1;
+        return b.capture_bufs[b.capture_depth].items.ptr;
     };
-    capture_depth -= 1;
+    b.capture_depth -= 1;
     // Restore previous capture state
-    body.body_tracking = capture_saved_tracking[capture_depth];
-    body.non_body_capture = capture_saved_non_body[capture_depth];
-    out_len.* = @intCast(capture_bufs[capture_depth].items.len);
-    return capture_bufs[capture_depth].items.ptr;
+    body.body_tracking = b.capture_saved_tracking[b.capture_depth];
+    body.non_body_capture = b.capture_saved_non_body[b.capture_depth];
+    out_len.* = @intCast(b.capture_bufs[b.capture_depth].items.len);
+    return b.capture_bufs[b.capture_depth].items.ptr;
 }
 
 /// Emit an if-then-else with full branch instruction bodies.
