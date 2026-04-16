@@ -1915,6 +1915,591 @@ pub const FuncBody = struct {
         self.error_union_ret_type_inst = error_union_inst;
     }
 
+    /// Emit a short-circuit boolean AND: if `lhs` is true, evaluate the rhs
+    /// body and return its result; otherwise return false.
+    ///
+    /// Layout in extra:
+    ///   BoolBr { .lhs = lhs, .body_len = rhs_insts.len + 1 }
+    ///   followed by body_len instruction indices (rhs body + break_inline)
+    ///
+    /// The `bool_br_and` instruction itself acts as an implicit block; the
+    /// break_inline targets it to deliver the rhs result.
+    pub fn addBoolBrAnd(
+        self: *FuncBody,
+        lhs: Zir.Inst.Ref,
+        rhs_insts: []const u32,
+        rhs_result: Zir.Inst.Ref,
+    ) !Zir.Inst.Ref {
+        return self.addBoolBrImpl(.bool_br_and, lhs, rhs_insts, rhs_result);
+    }
+
+    /// Emit a short-circuit boolean OR: if `lhs` is false, evaluate the rhs
+    /// body and return its result; otherwise return true.
+    ///
+    /// Same payload layout as `addBoolBrAnd` but uses `.bool_br_or`.
+    pub fn addBoolBrOr(
+        self: *FuncBody,
+        lhs: Zir.Inst.Ref,
+        rhs_insts: []const u32,
+        rhs_result: Zir.Inst.Ref,
+    ) !Zir.Inst.Ref {
+        return self.addBoolBrImpl(.bool_br_or, lhs, rhs_insts, rhs_result);
+    }
+
+    /// Shared implementation for `addBoolBrAnd` and `addBoolBrOr`.
+    fn addBoolBrImpl(
+        self: *FuncBody,
+        tag: Zir.Inst.Tag,
+        lhs: Zir.Inst.Ref,
+        rhs_insts: []const u32,
+        rhs_result: Zir.Inst.Ref,
+    ) !Zir.Inst.Ref {
+        const b = self.builder;
+        const gpa = b.gpa;
+
+        const body_len: u32 = @intCast(rhs_insts.len + 1); // +1 for break_inline
+
+        // 1. Emit the bool_br instruction with a placeholder payload index.
+        //    We need its instruction index so the break_inline can reference it.
+        const bool_br_idx = try b.addInst(tag, Builder.encodePlNode(.zero, 0)); // payload patched below
+
+        // 2. Emit break_inline targeting the bool_br instruction.
+        //    Break payload: { operand_src_node: i32(maxInt) = none, block_inst: bool_br_idx }
+        const break_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @bitCast(@as(i32, std.math.maxInt(i32)))); // operand_src_node = none
+        try b.extra.append(gpa, bool_br_idx); // block_inst = the bool_br itself
+        const break_idx = try b.addInst(.break_inline, Builder.encodeBreak(rhs_result, break_payload_idx));
+
+        // 3. Build the BoolBr payload in extra.
+        const real_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @intFromEnum(lhs)); // BoolBr.lhs
+        try b.extra.append(gpa, body_len); // BoolBr.body_len
+
+        // 4. Trailing body: rhs instruction indices followed by break_inline.
+        for (rhs_insts) |idx| {
+            try b.extra.append(gpa, idx);
+        }
+        try b.extra.append(gpa, break_idx);
+
+        // 5. Patch the bool_br instruction's payload index to point to our BoolBr.
+        b.data.items[bool_br_idx] = Builder.encodePlNode(.zero, real_payload_idx);
+
+        // 6. Track the bool_br as a body instruction.
+        if (self.body_tracking) {
+            try self.body_inst_indices.append(gpa, bool_br_idx);
+        } else if (self.non_body_capture) |capture| {
+            try capture.append(gpa, bool_br_idx);
+        }
+
+        return Builder.instRef(bool_br_idx);
+    }
+
+    /// Emit an `alloc` instruction (immutable allocation).
+    /// Allocates stack space for a value of the given type. After storing
+    /// a value, `addMakePtrConst` should be called to freeze the pointer.
+    /// Uses `un_node` field; operand is the type Ref.
+    pub fn addAlloc(self: *FuncBody, type_ref: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.alloc, Builder.encodeUnNode(.zero, type_ref));
+    }
+
+    /// Emit an `alloc_mut` instruction (mutable allocation).
+    /// Same as `addAlloc` but the resulting pointer is mutable and does not
+    /// require `make_ptr_const`.
+    /// Uses `un_node` field; operand is the type Ref.
+    pub fn addAllocMut(self: *FuncBody, type_ref: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.alloc_mut, Builder.encodeUnNode(.zero, type_ref));
+    }
+
+    /// Emit a `load` instruction: dereference a pointer to get its value.
+    /// Uses `un_node` field; operand is the pointer Ref.
+    pub fn addLoad(self: *FuncBody, ptr_ref: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.load, Builder.encodeUnNode(.zero, ptr_ref));
+    }
+
+    /// Emit a `make_ptr_const` instruction: freeze an `alloc` pointer into
+    /// a constant pointer. Must be called after the value has been stored.
+    /// Uses `un_node` field; operand is the alloc Ref.
+    pub fn addMakePtrConst(self: *FuncBody, alloc_ref: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.make_ptr_const, Builder.encodeUnNode(.zero, alloc_ref));
+    }
+
+    /// Emit `@Vector(len, elem_type)`. Returns a Ref to the vector type.
+    /// ZIR tag: `.vector_type`, data: `pl_node`, payload: `Bin` { lhs=len, rhs=elem_type }.
+    pub fn addVectorType(self: *FuncBody, len: Zir.Inst.Ref, elem_type: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.addBinOp(.vector_type, len, elem_type);
+    }
+
+    /// Emit `@splat(dest_type, scalar)`. Returns a Ref to the splatted vector.
+    /// ZIR tag: `.splat`, data: `pl_node`, payload: `Bin` { lhs=dest_type, rhs=scalar }.
+    pub fn addSplat(self: *FuncBody, dest_type: Zir.Inst.Ref, scalar: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.addBinOp(.splat, dest_type, scalar);
+    }
+
+    /// Emit `@shuffle(elem_type, a, b, mask)`. Returns a Ref to the shuffled vector.
+    /// ZIR tag: `.shuffle`, data: `pl_node`, payload: `Shuffle`.
+    pub fn addShuffle(self: *FuncBody, elem_type: Zir.Inst.Ref, a: Zir.Inst.Ref, b: Zir.Inst.Ref, mask: Zir.Inst.Ref) !Zir.Inst.Ref {
+        const payload_idx: u32 = @intCast(self.builder.extra.items.len);
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(elem_type));
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(a));
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(b));
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(mask));
+        return self.emitBodyInst(.shuffle, Builder.encodePlNode(.zero, payload_idx));
+    }
+
+    /// Emit `@reduce(operation, operand)`. Returns a Ref to the reduced scalar.
+    /// ZIR tag: `.reduce`, data: `pl_node`, payload: `Bin` { lhs=operation, rhs=operand }.
+    pub fn addReduce(self: *FuncBody, operation: Zir.Inst.Ref, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.addBinOp(.reduce, operation, operand);
+    }
+
+    /// Emit `operand[start..]` (slice with no end). Returns a Ref to the subslice.
+    /// ZIR tag: `.slice_start`, data: `pl_node`, payload: `SliceStart`.
+    pub fn addSliceStart(self: *FuncBody, operand: Zir.Inst.Ref, start: Zir.Inst.Ref) !Zir.Inst.Ref {
+        const payload_idx: u32 = @intCast(self.builder.extra.items.len);
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(operand));
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(start));
+        return self.emitBodyInst(.slice_start, Builder.encodePlNode(.zero, payload_idx));
+    }
+
+    /// Emit `operand[start..end]` (slice with end). Returns a Ref to the subslice.
+    /// ZIR tag: `.slice_end`, data: `pl_node`, payload: `SliceEnd`.
+    pub fn addSliceEnd(self: *FuncBody, operand: Zir.Inst.Ref, start: Zir.Inst.Ref, end: Zir.Inst.Ref) !Zir.Inst.Ref {
+        const payload_idx: u32 = @intCast(self.builder.extra.items.len);
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(operand));
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(start));
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(end));
+        return self.emitBodyInst(.slice_end, Builder.encodePlNode(.zero, payload_idx));
+    }
+
+    /// Emit `operand[start..][0..length]` (slice with length). Returns a Ref to the subslice.
+    /// ZIR tag: `.slice_length`, data: `pl_node`, payload: `SliceLength`.
+    pub fn addSliceLength(self: *FuncBody, operand: Zir.Inst.Ref, start: Zir.Inst.Ref, length: Zir.Inst.Ref) !Zir.Inst.Ref {
+        const payload_idx: u32 = @intCast(self.builder.extra.items.len);
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(operand));
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(start));
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(length));
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(Zir.Inst.Ref.none)); // sentinel = none
+        try self.builder.extra.append(self.builder.gpa, 0); // start_src_node_offset = 0
+        return self.emitBodyInst(.slice_length, Builder.encodePlNode(.zero, payload_idx));
+    }
+
+    /// Emit `E!T` (error union type). Returns a Ref to the error union type.
+    /// ZIR tag: `.error_union_type`, data: `pl_node`, payload: `Bin` { lhs=error_set, rhs=payload }.
+    pub fn addErrorUnionType(self: *FuncBody, error_set: Zir.Inst.Ref, payload: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.addBinOp(.error_union_type, error_set, payload);
+    }
+
+    /// Emit `err_union_code(operand)` — extract the error code from an error union.
+    /// ZIR tag: `.err_union_code`, data: `un_node`.
+    pub fn addErrUnionCode(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.err_union_code, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit `@intFromError(operand)` — convert an error to its integer representation.
+    /// Extended instruction: `.int_from_error`, operand is payload index to `UnNode`.
+    pub fn addIntFromError(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        const payload_idx: u32 = @intCast(self.builder.extra.items.len);
+        try self.builder.extra.append(self.builder.gpa, 0); // node = 0
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(operand));
+        return self.emitBodyInst(
+            .extended,
+            Builder.encodeExtended(@intFromEnum(Zir.Inst.Extended.int_from_error), 0, payload_idx),
+        );
+    }
+
+    /// Emit `@errorFromInt(operand)` — convert an integer to an error value.
+    /// Extended instruction: `.error_from_int`, operand is payload index to `UnNode`.
+    pub fn addErrorFromInt(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        const payload_idx: u32 = @intCast(self.builder.extra.items.len);
+        try self.builder.extra.append(self.builder.gpa, 0); // node = 0
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(operand));
+        return self.emitBodyInst(
+            .extended,
+            Builder.encodeExtended(@intFromEnum(Zir.Inst.Extended.error_from_int), 0, payload_idx),
+        );
+    }
+
+    /// Emit `@sizeOf(type_ref)`. Returns a Ref to the size value.
+    /// ZIR tag: `.size_of`, data: `un_node`.
+    pub fn addSizeOf(self: *FuncBody, type_ref: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.size_of, Builder.encodeUnNode(.zero, type_ref));
+    }
+
+    /// Emit `@alignOf(type_ref)`. Returns a Ref to the alignment value.
+    /// ZIR tag: `.align_of`, data: `un_node`.
+    pub fn addAlignOf(self: *FuncBody, type_ref: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.align_of, Builder.encodeUnNode(.zero, type_ref));
+    }
+
+    /// Emit `@bitSizeOf(type_ref)`. Returns a Ref to the bit size value.
+    /// ZIR tag: `.bit_size_of`, data: `un_node`.
+    pub fn addBitSizeOf(self: *FuncBody, type_ref: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.bit_size_of, Builder.encodeUnNode(.zero, type_ref));
+    }
+
+    /// Emit `@offsetOf(type_ref, field_name)`. Returns a Ref to the offset value.
+    /// ZIR tag: `.offset_of`, data: `pl_node`, payload: `Bin` { lhs=type, rhs=field_name_str }.
+    pub fn addOffsetOf(self: *FuncBody, type_ref: Zir.Inst.Ref, field_name: []const u8) !Zir.Inst.Ref {
+        const field_name_ref = try self.addStr(field_name);
+        return self.addBinOp(.offset_of, type_ref, field_name_ref);
+    }
+
+    /// Emit `@tagName(operand)`. Returns a Ref to the tag name string.
+    /// ZIR tag: `.tag_name`, data: `un_node`.
+    pub fn addTagName(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.tag_name, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit `@typeName(type_ref)`. Returns a Ref to the type name string.
+    /// ZIR tag: `.type_name`, data: `un_node`.
+    pub fn addTypeName(self: *FuncBody, type_ref: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.type_name, Builder.encodeUnNode(.zero, type_ref));
+    }
+
+    /// Emit `@intFromPtr(operand)`. Returns a Ref to the usize integer.
+    /// ZIR tag: `.int_from_ptr`, data: `un_node`.
+    pub fn addIntFromPtr(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.int_from_ptr, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit `@ptrFromInt(type_ref, operand)`. Returns a Ref to the pointer.
+    /// ZIR tag: `.ptr_from_int`, data: `pl_node`, payload: `Bin` { lhs=dest_type, rhs=operand }.
+    pub fn addPtrFromInt(self: *FuncBody, dest_type: Zir.Inst.Ref, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.addBinOp(.ptr_from_int, dest_type, operand);
+    }
+
+    /// Emit `@hasDecl(type_ref, name)`. Returns a bool Ref.
+    /// ZIR tag: `.has_decl`, data: `pl_node`, payload: `Bin` { lhs=type, rhs=name_str }.
+    pub fn addHasDecl(self: *FuncBody, type_ref: Zir.Inst.Ref, name: []const u8) !Zir.Inst.Ref {
+        const name_ref = try self.addStr(name);
+        return self.addBinOp(.has_decl, type_ref, name_ref);
+    }
+
+    /// Emit `@hasField(type_ref, name)`. Returns a bool Ref.
+    /// ZIR tag: `.has_field`, data: `pl_node`, payload: `Bin` { lhs=type, rhs=name_str }.
+    pub fn addHasField(self: *FuncBody, type_ref: Zir.Inst.Ref, name: []const u8) !Zir.Inst.Ref {
+        const name_ref = try self.addStr(name);
+        return self.addBinOp(.has_field, type_ref, name_ref);
+    }
+
+    /// Emit a `loop` instruction: an infinite loop whose body is the given
+    /// instruction sequence. The body should contain a `repeat` instruction
+    /// to jump back to the top, and a conditional break to exit.
+    ///
+    /// Layout in extra:
+    ///   Block { .body_len = body_insts.len }
+    ///   followed by body_len instruction indices
+    pub fn addLoop(self: *FuncBody, body_insts: []const u32) !Zir.Inst.Ref {
+        const b = self.builder;
+        const gpa = b.gpa;
+
+        // Build Block payload in extra: { body_len } followed by body indices.
+        const payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @as(u32, @intCast(body_insts.len))); // Block.body_len
+        for (body_insts) |idx| {
+            try b.extra.append(gpa, idx);
+        }
+
+        // Emit the loop instruction.
+        const loop_idx = try b.addInst(.loop, Builder.encodePlNode(.zero, payload_idx));
+
+        // Track as body instruction.
+        if (self.body_tracking) {
+            try self.body_inst_indices.append(gpa, loop_idx);
+        } else if (self.non_body_capture) |capture| {
+            try capture.append(gpa, loop_idx);
+        }
+
+        return Builder.instRef(loop_idx);
+    }
+
+    /// Emit a `repeat` instruction: jump back to the beginning of the
+    /// enclosing `loop` block. Uses the `node` field.
+    pub fn addRepeat(self: *FuncBody) !void {
+        const b = self.builder;
+        const gpa = b.gpa;
+        const repeat_idx = try b.addInst(.repeat, .{ .node = .zero });
+
+        if (self.body_tracking) {
+            try self.body_inst_indices.append(gpa, repeat_idx);
+        } else if (self.non_body_capture) |capture| {
+            try capture.append(gpa, repeat_idx);
+        }
+    }
+
+    // ---- Math builtins (unary, un_node encoding) ----
+
+    /// Emit `@sqrt(operand)`. Uses `un_node`.
+    pub fn addSqrt(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.sqrt, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit `@sin(operand)`. Uses `un_node`.
+    pub fn addSin(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.sin, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit `@cos(operand)`. Uses `un_node`.
+    pub fn addCos(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.cos, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit `@exp(operand)`. Uses `un_node`.
+    pub fn addExp(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.exp, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit `@exp2(operand)`. Uses `un_node`.
+    pub fn addExp2(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.exp2, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit `@log(operand)`. Uses `un_node`.
+    pub fn addLog(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.log, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit `@log2(operand)`. Uses `un_node`.
+    pub fn addLog2(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.log2, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit `@log10(operand)`. Uses `un_node`.
+    pub fn addLog10(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.log10, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit `@abs(operand)`. Uses `un_node`.
+    pub fn addAbs(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.abs, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit `@floor(operand)`. Uses `un_node`.
+    pub fn addFloor(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.floor, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit `@ceil(operand)`. Uses `un_node`.
+    pub fn addCeil(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.ceil, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit `@round(operand)`. Uses `un_node`.
+    pub fn addRound(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.round, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit `@trunc(operand)` (float truncation toward zero). Uses `un_node`.
+    pub fn addTruncFloat(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.trunc, Builder.encodeUnNode(.zero, operand));
+    }
+
+    // ---- Saturating arithmetic (binary, pl_node with Bin payload) ----
+
+    /// Emit saturating addition (`+|`). Uses `pl_node` with `Bin` payload.
+    pub fn addAddSat(self: *FuncBody, lhs: Zir.Inst.Ref, rhs: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.addBinOp(.add_sat, lhs, rhs);
+    }
+
+    /// Emit saturating subtraction (`-|`). Uses `pl_node` with `Bin` payload.
+    pub fn addSubSat(self: *FuncBody, lhs: Zir.Inst.Ref, rhs: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.addBinOp(.sub_sat, lhs, rhs);
+    }
+
+    /// Emit saturating multiplication (`*|`). Uses `pl_node` with `Bin` payload.
+    pub fn addMulSat(self: *FuncBody, lhs: Zir.Inst.Ref, rhs: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.addBinOp(.mul_sat, lhs, rhs);
+    }
+
+    /// Emit saturating shift-left (`<<|`). Uses `pl_node` with `Bin` payload.
+    pub fn addShlSat(self: *FuncBody, lhs: Zir.Inst.Ref, rhs: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.addBinOp(.shl_sat, lhs, rhs);
+    }
+
+    // ---- Overflow-detecting arithmetic (Extended with BinNode payload) ----
+
+    /// Emit `@addWithOverflow(lhs, rhs)`. Returns a struct {result, overflow_bit}.
+    /// Uses `.extended` with `Extended.add_with_overflow` and `BinNode` payload.
+    pub fn addAddWithOverflow(self: *FuncBody, lhs: Zir.Inst.Ref, rhs: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.addOverflowOp(.add_with_overflow, lhs, rhs);
+    }
+
+    /// Emit `@subWithOverflow(lhs, rhs)`. Returns a struct {result, overflow_bit}.
+    /// Uses `.extended` with `Extended.sub_with_overflow` and `BinNode` payload.
+    pub fn addSubWithOverflow(self: *FuncBody, lhs: Zir.Inst.Ref, rhs: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.addOverflowOp(.sub_with_overflow, lhs, rhs);
+    }
+
+    /// Emit `@mulWithOverflow(lhs, rhs)`. Returns a struct {result, overflow_bit}.
+    /// Uses `.extended` with `Extended.mul_with_overflow` and `BinNode` payload.
+    pub fn addMulWithOverflow(self: *FuncBody, lhs: Zir.Inst.Ref, rhs: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.addOverflowOp(.mul_with_overflow, lhs, rhs);
+    }
+
+    /// Shared implementation for overflow-detecting arithmetic builtins.
+    /// These use `.extended` tag with a `BinNode` payload in extra:
+    ///   { node: Ast.Node.Offset, lhs: Ref, rhs: Ref }
+    fn addOverflowOp(self: *FuncBody, extended_tag: Zir.Inst.Extended, lhs: Zir.Inst.Ref, rhs: Zir.Inst.Ref) !Zir.Inst.Ref {
+        const b = self.builder;
+        const payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, 0); // node = 0 (synthetic)
+        try b.extra.append(b.gpa, @intFromEnum(lhs));
+        try b.extra.append(b.gpa, @intFromEnum(rhs));
+        return self.emitBodyInst(
+            .extended,
+            Builder.encodeExtended(@intFromEnum(extended_tag), 0, payload_idx),
+        );
+    }
+
+    // ---- Bit manipulation (unary, un_node encoding) ----
+
+    /// Emit `@clz(operand)`. Uses `un_node`.
+    pub fn addClz(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.clz, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit `@ctz(operand)`. Uses `un_node`.
+    pub fn addCtz(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.ctz, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit `@popCount(operand)`. Uses `un_node`.
+    pub fn addPopCount(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.pop_count, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit `@byteSwap(operand)`. Uses `un_node`.
+    pub fn addByteSwap(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.byte_swap, Builder.encodeUnNode(.zero, operand));
+    }
+
+    /// Emit `@bitReverse(operand)`. Uses `un_node`.
+    pub fn addBitReverse(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.bit_reverse, Builder.encodeUnNode(.zero, operand));
+    }
+
+    // ---- Type reification builtins ----
+
+    /// Emit `@Int(signedness, bit_count)`.
+    /// Uses `.reify_int` tag with `pl_node` data and `Bin` payload.
+    /// `signedness` is a Ref to a signedness enum value, `bit_count` is a Ref to a u16 value.
+    pub fn addReifyInt(self: *FuncBody, signedness: Zir.Inst.Ref, bit_count: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.addBinOp(.reify_int, signedness, bit_count);
+    }
+
+    /// Emit `@Struct(layout, backing_ty, field_names, field_types, field_attrs)`.
+    /// Uses `.extended` tag with `Extended.reify_struct` and `ReifyStruct` payload.
+    /// All parameters are Refs to comptime-resolved values.
+    pub fn addReifyStruct(
+        self: *FuncBody,
+        layout: Zir.Inst.Ref,
+        backing_ty: Zir.Inst.Ref,
+        field_names: Zir.Inst.Ref,
+        field_types: Zir.Inst.Ref,
+        field_attrs: Zir.Inst.Ref,
+    ) !Zir.Inst.Ref {
+        const b = self.builder;
+        const payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, 0); // src_line
+        try b.extra.append(b.gpa, 0); // node (absolute)
+        try b.extra.append(b.gpa, @intFromEnum(layout));
+        try b.extra.append(b.gpa, @intFromEnum(backing_ty));
+        try b.extra.append(b.gpa, @intFromEnum(field_names));
+        try b.extra.append(b.gpa, @intFromEnum(field_types));
+        try b.extra.append(b.gpa, @intFromEnum(field_attrs));
+        return self.emitBodyInst(
+            .extended,
+            Builder.encodeExtended(@intFromEnum(Zir.Inst.Extended.reify_struct), @intFromEnum(Zir.Inst.NameStrategy.anon), payload_idx),
+        );
+    }
+
+    /// Emit `@Enum(tag_ty, mode, field_names, field_values)`.
+    /// Uses `.extended` tag with `Extended.reify_enum` and `ReifyEnum` payload.
+    /// All parameters are Refs to comptime-resolved values.
+    pub fn addReifyEnum(
+        self: *FuncBody,
+        tag_ty: Zir.Inst.Ref,
+        mode: Zir.Inst.Ref,
+        field_names: Zir.Inst.Ref,
+        field_values: Zir.Inst.Ref,
+    ) !Zir.Inst.Ref {
+        const b = self.builder;
+        const payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, 0); // src_line
+        try b.extra.append(b.gpa, 0); // node (absolute)
+        try b.extra.append(b.gpa, @intFromEnum(tag_ty));
+        try b.extra.append(b.gpa, @intFromEnum(mode));
+        try b.extra.append(b.gpa, @intFromEnum(field_names));
+        try b.extra.append(b.gpa, @intFromEnum(field_values));
+        return self.emitBodyInst(
+            .extended,
+            Builder.encodeExtended(@intFromEnum(Zir.Inst.Extended.reify_enum), @intFromEnum(Zir.Inst.NameStrategy.anon), payload_idx),
+        );
+    }
+
+    /// Emit `@Union(layout, arg_ty, field_names, field_types, field_attrs)`.
+    /// Uses `.extended` tag with `Extended.reify_union` and `ReifyUnion` payload.
+    /// All parameters are Refs to comptime-resolved values.
+    pub fn addReifyUnion(
+        self: *FuncBody,
+        layout: Zir.Inst.Ref,
+        arg_ty: Zir.Inst.Ref,
+        field_names: Zir.Inst.Ref,
+        field_types: Zir.Inst.Ref,
+        field_attrs: Zir.Inst.Ref,
+    ) !Zir.Inst.Ref {
+        const b = self.builder;
+        const payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, 0); // src_line
+        try b.extra.append(b.gpa, 0); // node (absolute)
+        try b.extra.append(b.gpa, @intFromEnum(layout));
+        try b.extra.append(b.gpa, @intFromEnum(arg_ty));
+        try b.extra.append(b.gpa, @intFromEnum(field_names));
+        try b.extra.append(b.gpa, @intFromEnum(field_types));
+        try b.extra.append(b.gpa, @intFromEnum(field_attrs));
+        return self.emitBodyInst(
+            .extended,
+            Builder.encodeExtended(@intFromEnum(Zir.Inst.Extended.reify_union), @intFromEnum(Zir.Inst.NameStrategy.anon), payload_idx),
+        );
+    }
+
+    /// Emit `@Pointer(size, attrs, elem_ty, sentinel)`.
+    /// Uses `.extended` tag with `Extended.reify_pointer` and `ReifyPointer` payload.
+    /// All parameters are Refs to comptime-resolved values.
+    pub fn addReifyPointer(
+        self: *FuncBody,
+        size: Zir.Inst.Ref,
+        attrs: Zir.Inst.Ref,
+        elem_ty: Zir.Inst.Ref,
+        sentinel: Zir.Inst.Ref,
+    ) !Zir.Inst.Ref {
+        const b = self.builder;
+        const payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, 0); // node
+        try b.extra.append(b.gpa, @intFromEnum(size));
+        try b.extra.append(b.gpa, @intFromEnum(attrs));
+        try b.extra.append(b.gpa, @intFromEnum(elem_ty));
+        try b.extra.append(b.gpa, @intFromEnum(sentinel));
+        return self.emitBodyInst(
+            .extended,
+            Builder.encodeExtended(@intFromEnum(Zir.Inst.Extended.reify_pointer), 0, payload_idx),
+        );
+    }
+
+    /// Emit `@Tuple(field_types)`.
+    /// Uses `.extended` tag with `Extended.reify_tuple` and `UnNode` payload.
+    /// `field_types` is a Ref to a comptime-resolved `[]const type` slice.
+    pub fn addReifyTuple(self: *FuncBody, field_types: Zir.Inst.Ref) !Zir.Inst.Ref {
+        const b = self.builder;
+        const payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, 0); // node
+        try b.extra.append(b.gpa, @intFromEnum(field_types));
+        return self.emitBodyInst(
+            .extended,
+            Builder.encodeExtended(@intFromEnum(Zir.Inst.Extended.reify_tuple), 0, payload_idx),
+        );
+    }
+
 };
 
 pub const FinalizedZir = struct {

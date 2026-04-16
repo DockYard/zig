@@ -2093,6 +2093,147 @@ pub export fn zir_builder_set_union_return_type(
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Type reification C-ABI exports
+// ---------------------------------------------------------------------------
+
+/// Emit `@Int(signedness, bit_count)` — create an integer type via type reification.
+/// `signedness_ref` is a Ref to a comptime signedness enum value.
+/// `bit_count_ref` is a Ref to a comptime u16 bit count value.
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_reify_int(
+    handle: ?*ZirBuilderHandle,
+    signedness_ref: u32,
+    bit_count_ref: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const sign_ref: Zir.Inst.Ref = @enumFromInt(signedness_ref);
+    const bits_ref: Zir.Inst.Ref = @enumFromInt(bit_count_ref);
+    const ref = body.addReifyInt(sign_ref, bits_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@Struct(layout, backing_ty, field_names, field_types, field_attrs)` —
+/// create a struct type via type reification.
+/// All parameters are Refs to comptime-resolved values:
+///   `layout_ref` — container layout enum value
+///   `backing_ty_ref` — optional backing integer type (use `none` for no backing type)
+///   `field_names_ref` — `[]const []const u8` of field names
+///   `field_types_ref` — `[]const type` of field types
+///   `field_attrs_ref` — `[]const StructFieldAttrs` of field attributes
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_reify_struct(
+    handle: ?*ZirBuilderHandle,
+    layout_ref: u32,
+    backing_ty_ref: u32,
+    field_names_ref: u32,
+    field_types_ref: u32,
+    field_attrs_ref: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const layout: Zir.Inst.Ref = @enumFromInt(layout_ref);
+    const backing_ty: Zir.Inst.Ref = @enumFromInt(backing_ty_ref);
+    const field_names: Zir.Inst.Ref = @enumFromInt(field_names_ref);
+    const field_types: Zir.Inst.Ref = @enumFromInt(field_types_ref);
+    const field_attrs: Zir.Inst.Ref = @enumFromInt(field_attrs_ref);
+    const ref = body.addReifyStruct(layout, backing_ty, field_names, field_types, field_attrs) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@Enum(tag_ty, mode, field_names, field_values)` —
+/// create an enum type via type reification.
+/// All parameters are Refs to comptime-resolved values:
+///   `tag_ty_ref` — integer tag type
+///   `mode_ref` — enum mode value
+///   `field_names_ref` — `[]const []const u8` of field names
+///   `field_values_ref` — `[]const TagInt` of explicit field values
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_reify_enum(
+    handle: ?*ZirBuilderHandle,
+    tag_ty_ref: u32,
+    mode_ref: u32,
+    field_names_ref: u32,
+    field_values_ref: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const tag_ty: Zir.Inst.Ref = @enumFromInt(tag_ty_ref);
+    const mode: Zir.Inst.Ref = @enumFromInt(mode_ref);
+    const field_names: Zir.Inst.Ref = @enumFromInt(field_names_ref);
+    const field_values: Zir.Inst.Ref = @enumFromInt(field_values_ref);
+    const ref = body.addReifyEnum(tag_ty, mode, field_names, field_values) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@Union(layout, arg_ty, field_names, field_types, field_attrs)` —
+/// create a union type via type reification.
+/// All parameters are Refs to comptime-resolved values:
+///   `layout_ref` — container layout enum value
+///   `arg_ty_ref` — optional tag type (use `none` for auto)
+///   `field_names_ref` — `[]const []const u8` of field names
+///   `field_types_ref` — `[]const type` of field types
+///   `field_attrs_ref` — `[]const UnionFieldAttrs` of field attributes
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_reify_union(
+    handle: ?*ZirBuilderHandle,
+    layout_ref: u32,
+    arg_ty_ref: u32,
+    field_names_ref: u32,
+    field_types_ref: u32,
+    field_attrs_ref: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const layout: Zir.Inst.Ref = @enumFromInt(layout_ref);
+    const arg_ty: Zir.Inst.Ref = @enumFromInt(arg_ty_ref);
+    const field_names: Zir.Inst.Ref = @enumFromInt(field_names_ref);
+    const field_types: Zir.Inst.Ref = @enumFromInt(field_types_ref);
+    const field_attrs: Zir.Inst.Ref = @enumFromInt(field_attrs_ref);
+    const ref = body.addReifyUnion(layout, arg_ty, field_names, field_types, field_attrs) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@Pointer(size, attrs, elem_ty, sentinel)` —
+/// create a pointer type via type reification.
+/// All parameters are Refs to comptime-resolved values:
+///   `size_ref` — pointer size enum value
+///   `attrs_ref` — pointer attributes struct value
+///   `elem_ty_ref` — element type
+///   `sentinel_ref` — sentinel value (use `none` for no sentinel)
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_reify_pointer(
+    handle: ?*ZirBuilderHandle,
+    size_ref: u32,
+    attrs_ref: u32,
+    elem_ty_ref: u32,
+    sentinel_ref: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const size: Zir.Inst.Ref = @enumFromInt(size_ref);
+    const attrs: Zir.Inst.Ref = @enumFromInt(attrs_ref);
+    const elem_ty: Zir.Inst.Ref = @enumFromInt(elem_ty_ref);
+    const sentinel: Zir.Inst.Ref = @enumFromInt(sentinel_ref);
+    const ref = body.addReifyPointer(size, attrs, elem_ty, sentinel) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@Tuple(field_types)` — create a tuple type via type reification.
+/// `field_types_ref` is a Ref to a comptime-resolved `[]const type` slice.
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_reify_tuple(
+    handle: ?*ZirBuilderHandle,
+    field_types_ref: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const field_types: Zir.Inst.Ref = @enumFromInt(field_types_ref);
+    const ref = body.addReifyTuple(field_types) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
 /// Finalize the builder and inject its ZIR into a compilation context.
 /// After this call the builder is consumed; the handle must not be reused
 /// (call `zir_builder_destroy` is not needed — resources are freed here).
@@ -2216,6 +2357,707 @@ pub export fn zir_builder_emit_optional_type(
     const body = b.active_body orelse return 0xFFFFFFFF;
     const child_ref: Zir.Inst.Ref = @enumFromInt(child_type);
     const ref = body.addOptionalType(child_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit a short-circuit boolean AND (`bool_br_and`).
+/// If `lhs` is true, evaluates the rhs body and returns its result; otherwise
+/// returns false.
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_bool_br_and(
+    handle: ?*ZirBuilderHandle,
+    lhs: u32,
+    rhs_body_ptr: [*]const u32,
+    rhs_body_len: u32,
+    rhs_result: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const lhs_ref: Zir.Inst.Ref = @enumFromInt(lhs);
+    const rhs_result_ref: Zir.Inst.Ref = @enumFromInt(rhs_result);
+    const ref = body.addBoolBrAnd(
+        lhs_ref,
+        rhs_body_ptr[0..rhs_body_len],
+        rhs_result_ref,
+    ) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit a short-circuit boolean OR (`bool_br_or`).
+/// If `lhs` is false, evaluates the rhs body and returns its result; otherwise
+/// returns true.
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_bool_br_or(
+    handle: ?*ZirBuilderHandle,
+    lhs: u32,
+    rhs_body_ptr: [*]const u32,
+    rhs_body_len: u32,
+    rhs_result: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const lhs_ref: Zir.Inst.Ref = @enumFromInt(lhs);
+    const rhs_result_ref: Zir.Inst.Ref = @enumFromInt(rhs_result);
+    const ref = body.addBoolBrOr(
+        lhs_ref,
+        rhs_body_ptr[0..rhs_body_len],
+        rhs_result_ref,
+    ) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit an `alloc` instruction (immutable allocation of stack space for a type).
+/// After storing a value, `zir_builder_emit_make_ptr_const` should be called.
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_alloc(
+    handle: ?*ZirBuilderHandle,
+    type_ref: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const t_ref: Zir.Inst.Ref = @enumFromInt(type_ref);
+    const ref = body.addAlloc(t_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit an `alloc_mut` instruction (mutable allocation of stack space).
+/// Unlike `alloc`, does not require `make_ptr_const` afterward.
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_alloc_mut(
+    handle: ?*ZirBuilderHandle,
+    type_ref: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const t_ref: Zir.Inst.Ref = @enumFromInt(type_ref);
+    const ref = body.addAllocMut(t_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit a `load` instruction: dereference a pointer to get its pointee value.
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_load(
+    handle: ?*ZirBuilderHandle,
+    ptr_ref: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const p_ref: Zir.Inst.Ref = @enumFromInt(ptr_ref);
+    const ref = body.addLoad(p_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit a `make_ptr_const` instruction: freeze an `alloc` pointer into
+/// a constant pointer after the value has been stored.
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_make_ptr_const(
+    handle: ?*ZirBuilderHandle,
+    alloc_ref: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const a_ref: Zir.Inst.Ref = @enumFromInt(alloc_ref);
+    const ref = body.addMakePtrConst(a_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit a `loop` instruction: an infinite loop containing the given body.
+/// The body should include a `repeat` instruction to jump back and a
+/// conditional break to exit.
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_loop(
+    handle: ?*ZirBuilderHandle,
+    body_ptr: [*]const u32,
+    body_len: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const ref = body.addLoop(body_ptr[0..body_len]) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit a `repeat` instruction: jump back to the beginning of the enclosing
+/// `loop` block.
+/// Returns 0 on success, -1 on error.
+pub export fn zir_builder_emit_repeat(
+    handle: ?*ZirBuilderHandle,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    body.addRepeat() catch return -1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Math builtins (unary operations on floats)
+// ---------------------------------------------------------------------------
+
+/// Emit `@sqrt(operand)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_sqrt(handle: ?*ZirBuilderHandle, operand: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addSqrt(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@sin(operand)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_sin(handle: ?*ZirBuilderHandle, operand: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addSin(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@cos(operand)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_cos(handle: ?*ZirBuilderHandle, operand: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addCos(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@exp(operand)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_exp(handle: ?*ZirBuilderHandle, operand: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addExp(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@exp2(operand)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_exp2(handle: ?*ZirBuilderHandle, operand: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addExp2(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@log(operand)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_log(handle: ?*ZirBuilderHandle, operand: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addLog(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@log2(operand)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_log2(handle: ?*ZirBuilderHandle, operand: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addLog2(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@log10(operand)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_log10(handle: ?*ZirBuilderHandle, operand: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addLog10(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@abs(operand)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_abs(handle: ?*ZirBuilderHandle, operand: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addAbs(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@floor(operand)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_floor(handle: ?*ZirBuilderHandle, operand: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addFloor(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@ceil(operand)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_ceil(handle: ?*ZirBuilderHandle, operand: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addCeil(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@round(operand)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_round(handle: ?*ZirBuilderHandle, operand: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addRound(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@trunc(operand)` (float truncation toward zero).
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_trunc_float(handle: ?*ZirBuilderHandle, operand: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addTruncFloat(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+// ---------------------------------------------------------------------------
+// Saturating arithmetic (binary operations)
+// ---------------------------------------------------------------------------
+
+/// Emit saturating addition (`+|`). Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_add_sat(handle: ?*ZirBuilderHandle, lhs: u32, rhs: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const lhs_ref: Zir.Inst.Ref = @enumFromInt(lhs);
+    const rhs_ref: Zir.Inst.Ref = @enumFromInt(rhs);
+    const ref = body.addAddSat(lhs_ref, rhs_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit saturating subtraction (`-|`). Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_sub_sat(handle: ?*ZirBuilderHandle, lhs: u32, rhs: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const lhs_ref: Zir.Inst.Ref = @enumFromInt(lhs);
+    const rhs_ref: Zir.Inst.Ref = @enumFromInt(rhs);
+    const ref = body.addSubSat(lhs_ref, rhs_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit saturating multiplication (`*|`). Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_mul_sat(handle: ?*ZirBuilderHandle, lhs: u32, rhs: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const lhs_ref: Zir.Inst.Ref = @enumFromInt(lhs);
+    const rhs_ref: Zir.Inst.Ref = @enumFromInt(rhs);
+    const ref = body.addMulSat(lhs_ref, rhs_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit saturating shift-left (`<<|`). Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_shl_sat(handle: ?*ZirBuilderHandle, lhs: u32, rhs: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const lhs_ref: Zir.Inst.Ref = @enumFromInt(lhs);
+    const rhs_ref: Zir.Inst.Ref = @enumFromInt(rhs);
+    const ref = body.addShlSat(lhs_ref, rhs_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+// ---------------------------------------------------------------------------
+// Overflow-detecting arithmetic (returns struct {result, overflow_bit})
+// ---------------------------------------------------------------------------
+
+/// Emit `@addWithOverflow(lhs, rhs)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_add_with_overflow(handle: ?*ZirBuilderHandle, lhs: u32, rhs: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const lhs_ref: Zir.Inst.Ref = @enumFromInt(lhs);
+    const rhs_ref: Zir.Inst.Ref = @enumFromInt(rhs);
+    const ref = body.addAddWithOverflow(lhs_ref, rhs_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@subWithOverflow(lhs, rhs)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_sub_with_overflow(handle: ?*ZirBuilderHandle, lhs: u32, rhs: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const lhs_ref: Zir.Inst.Ref = @enumFromInt(lhs);
+    const rhs_ref: Zir.Inst.Ref = @enumFromInt(rhs);
+    const ref = body.addSubWithOverflow(lhs_ref, rhs_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@mulWithOverflow(lhs, rhs)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_mul_with_overflow(handle: ?*ZirBuilderHandle, lhs: u32, rhs: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const lhs_ref: Zir.Inst.Ref = @enumFromInt(lhs);
+    const rhs_ref: Zir.Inst.Ref = @enumFromInt(rhs);
+    const ref = body.addMulWithOverflow(lhs_ref, rhs_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+// ---------------------------------------------------------------------------
+// Bit manipulation (unary operations)
+// ---------------------------------------------------------------------------
+
+/// Emit `@clz(operand)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_clz(handle: ?*ZirBuilderHandle, operand: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addClz(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@ctz(operand)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_ctz(handle: ?*ZirBuilderHandle, operand: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addCtz(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@popCount(operand)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_pop_count(handle: ?*ZirBuilderHandle, operand: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addPopCount(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@byteSwap(operand)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_byte_swap(handle: ?*ZirBuilderHandle, operand: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addByteSwap(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@bitReverse(operand)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_bit_reverse(handle: ?*ZirBuilderHandle, operand: u32) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addBitReverse(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+// ---------------------------------------------------------------------------
+// C-ABI exports: SIMD/Vector Operations
+// ---------------------------------------------------------------------------
+
+/// Emit `@Vector(len, elem_type)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_vector_type(
+    handle: ?*ZirBuilderHandle,
+    len: u32,
+    elem_type_ref: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const len_ref: Zir.Inst.Ref = @enumFromInt(len);
+    const elem_ref: Zir.Inst.Ref = @enumFromInt(elem_type_ref);
+    const ref = body.addVectorType(len_ref, elem_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@splat(scalar, len)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_splat(
+    handle: ?*ZirBuilderHandle,
+    scalar: u32,
+    len: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const len_ref: Zir.Inst.Ref = @enumFromInt(len);
+    const scalar_ref: Zir.Inst.Ref = @enumFromInt(scalar);
+    const ref = body.addSplat(len_ref, scalar_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@shuffle(a, b, mask)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+/// `a` and `b` are vector operands, `mask` is the shuffle mask.
+pub export fn zir_builder_emit_shuffle(
+    handle: ?*ZirBuilderHandle,
+    a: u32,
+    b: u32,
+    mask: u32,
+) callconv(.c) u32 {
+    const b_ = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b_.active_body orelse return 0xFFFFFFFF;
+    const a_ref: Zir.Inst.Ref = @enumFromInt(a);
+    const b_ref: Zir.Inst.Ref = @enumFromInt(b);
+    const mask_ref: Zir.Inst.Ref = @enumFromInt(mask);
+    // elem_type is .none — Sema infers it from the operands.
+    const ref = body.addShuffle(.none, a_ref, b_ref, mask_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@reduce(operand, operation)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+/// `operation` is an enum value (0=.And, 1=.Or, 2=.Xor, 3=.Min, 4=.Max, 5=.Add, 6=.Mul).
+pub export fn zir_builder_emit_reduce(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+    operation: u8,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    // The operation is passed as an enum_literal Ref in ZIR's Bin payload.
+    const op_name: []const u8 = switch (operation) {
+        0 => "And",
+        1 => "Or",
+        2 => "Xor",
+        3 => "Min",
+        4 => "Max",
+        5 => "Add",
+        6 => "Mul",
+        else => return 0xFFFFFFFF,
+    };
+    const op_ref = body.addEnumLiteral(op_name) catch return 0xFFFFFFFF;
+    const ref = body.addReduce(op_ref, operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+// ---------------------------------------------------------------------------
+// C-ABI exports: Slice Operations
+// ---------------------------------------------------------------------------
+
+/// Emit `operand[start..]` (slice with no end). Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_slice_start(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+    start: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const start_ref: Zir.Inst.Ref = @enumFromInt(start);
+    const ref = body.addSliceStart(operand_ref, start_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `operand[start..end]` (slice with end). Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_slice_end(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+    start: u32,
+    end: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const start_ref: Zir.Inst.Ref = @enumFromInt(start);
+    const end_ref: Zir.Inst.Ref = @enumFromInt(end);
+    const ref = body.addSliceEnd(operand_ref, start_ref, end_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `operand[start..][0..length]` (slice with length). Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_slice_length(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+    start: u32,
+    length: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const start_ref: Zir.Inst.Ref = @enumFromInt(start);
+    const length_ref: Zir.Inst.Ref = @enumFromInt(length);
+    const ref = body.addSliceLength(operand_ref, start_ref, length_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+// ---------------------------------------------------------------------------
+// C-ABI exports: Error Handling Extensions
+// ---------------------------------------------------------------------------
+
+/// Emit `E!T` (error union type). Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_error_union_type(
+    handle: ?*ZirBuilderHandle,
+    error_set: u32,
+    payload: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const error_set_ref: Zir.Inst.Ref = @enumFromInt(error_set);
+    const payload_ref: Zir.Inst.Ref = @enumFromInt(payload);
+    const ref = body.addErrorUnionType(error_set_ref, payload_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `err_union_code(operand)` — extract error code from error union.
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_err_union_code(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addErrUnionCode(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@intFromError(operand)` — convert error to integer.
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_int_from_error(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addIntFromError(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@errorFromInt(operand)` — convert integer to error.
+/// Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_error_from_int(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addErrorFromInt(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+// ---------------------------------------------------------------------------
+// C-ABI exports: Type Introspection
+// ---------------------------------------------------------------------------
+
+/// Emit `@sizeOf(type_ref)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_size_of(
+    handle: ?*ZirBuilderHandle,
+    type_ref: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const t_ref: Zir.Inst.Ref = @enumFromInt(type_ref);
+    const ref = body.addSizeOf(t_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@alignOf(type_ref)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_align_of(
+    handle: ?*ZirBuilderHandle,
+    type_ref: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const t_ref: Zir.Inst.Ref = @enumFromInt(type_ref);
+    const ref = body.addAlignOf(t_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@bitSizeOf(type_ref)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_bit_size_of(
+    handle: ?*ZirBuilderHandle,
+    type_ref: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const t_ref: Zir.Inst.Ref = @enumFromInt(type_ref);
+    const ref = body.addBitSizeOf(t_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@offsetOf(type_ref, field_name)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_offset_of(
+    handle: ?*ZirBuilderHandle,
+    type_ref: u32,
+    field_name: [*:0]const u8,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const t_ref: Zir.Inst.Ref = @enumFromInt(type_ref);
+    const ref = body.addOffsetOf(t_ref, mem.sliceTo(field_name, 0)) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+// ---------------------------------------------------------------------------
+// C-ABI exports: Type Naming
+// ---------------------------------------------------------------------------
+
+/// Emit `@tagName(operand)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_tag_name(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addTagName(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@typeName(type_ref)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_type_name(
+    handle: ?*ZirBuilderHandle,
+    type_ref: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const t_ref: Zir.Inst.Ref = @enumFromInt(type_ref);
+    const ref = body.addTypeName(t_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+// ---------------------------------------------------------------------------
+// C-ABI exports: Pointer/Int Conversions
+// ---------------------------------------------------------------------------
+
+/// Emit `@intFromPtr(operand)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_int_from_ptr(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addIntFromPtr(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@ptrFromInt(operand, type_ref)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_ptr_from_int(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+    type_ref: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const t_ref: Zir.Inst.Ref = @enumFromInt(type_ref);
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addPtrFromInt(t_ref, operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+// ---------------------------------------------------------------------------
+// C-ABI exports: Type Checking
+// ---------------------------------------------------------------------------
+
+/// Emit `@hasDecl(type_ref, name)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_has_decl(
+    handle: ?*ZirBuilderHandle,
+    type_ref: u32,
+    name: [*:0]const u8,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const t_ref: Zir.Inst.Ref = @enumFromInt(type_ref);
+    const ref = body.addHasDecl(t_ref, mem.sliceTo(name, 0)) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit `@hasField(type_ref, name)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_has_field(
+    handle: ?*ZirBuilderHandle,
+    type_ref: u32,
+    name: [*:0]const u8,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const t_ref: Zir.Inst.Ref = @enumFromInt(type_ref);
+    const ref = body.addHasField(t_ref, mem.sliceTo(name, 0)) catch return 0xFFFFFFFF;
     return @intFromEnum(ref);
 }
 

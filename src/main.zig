@@ -92,6 +92,14 @@ comptime {
     _ = &api.zir_builder_emit_tuple_decl_body;
     _ = &api.zir_builder_inject;
     _ = &api.zir_builder_inject_module;
+    _ = &api.zir_builder_emit_bool_br_and;
+    _ = &api.zir_builder_emit_bool_br_or;
+    _ = &api.zir_builder_emit_alloc;
+    _ = &api.zir_builder_emit_alloc_mut;
+    _ = &api.zir_builder_emit_load;
+    _ = &api.zir_builder_emit_make_ptr_const;
+    _ = &api.zir_builder_emit_loop;
+    _ = &api.zir_builder_emit_repeat;
 }
 const assert = std.debug.assert;
 const fs = std.fs;
