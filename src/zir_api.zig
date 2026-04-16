@@ -3177,3 +3177,100 @@ test "zir_api: injected executable update succeeds" {
 
     try testExpectSegmentVmaddrOrder(output_path, allocator);
 }
+
+test "zir_api: function value passed as callback argument" {
+    // Replicates the Zap pattern: apply(41, add_one) where add_one is
+    // passed as a function value callback.
+    //
+    // Equivalent Zig:
+    //   fn add_one(x: i64) i64 { return x + 1; }
+    //   fn apply(value: i64, callback: anytype) i64 { return callback(value); }
+    //   pub fn main() void { _ = apply(41, add_one); }
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io();
+    const cwd = Dir.cwd();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "local-cache");
+    try tmp.dir.createDirPath(io, "global-cache");
+
+    const zig_lib_dir = try testRepoLibDir(allocator, io);
+    defer allocator.free(zig_lib_dir);
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const tmp_dir = try cwd.openDir(io, tmp_path, .{});
+    const orig_dir = try cwd.openDir(io, ".", .{});
+    try std.process.setCurrentDir(io, tmp_dir);
+    defer std.process.setCurrentDir(io, orig_dir) catch {};
+
+    const local_cache_dir = try std.fs.path.join(allocator, &.{ tmp_path, "local-cache" });
+    defer allocator.free(local_cache_dir);
+    const global_cache_dir = try std.fs.path.join(allocator, &.{ tmp_path, "global-cache" });
+    defer allocator.free(global_cache_dir);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_path, "callback-test" });
+    defer allocator.free(output_path);
+
+    const ctx = try createImpl(
+        zig_lib_dir,
+        local_cache_dir,
+        global_cache_dir,
+        output_path,
+        "callback_test",
+        0, // exe
+        0, // debug
+        false,
+        true,
+        null,
+    );
+    defer zir_compilation_destroy(ctx);
+
+    // No runtime needed for this test.
+    try addModuleSourceImpl(ctx, "zap_runtime", "pub fn noop() void {}\n");
+
+    var builder = try zir_builder.Builder.init(allocator);
+    defer builder.deinit();
+
+    // --- fn add_one(x: i64) i64 { return x + 1; }
+    {
+        const body = try builder.beginFunction("add_one", .i64_type);
+        const param_x = try body.addParam("x", .i64_type);
+        const one = try body.addInt(1);
+        const result = try body.addBinOp(.add, param_x, one);
+        try body.addRetNode(result);
+        try builder.endFunction(body);
+    }
+
+    // --- fn apply(value: i64, callback: anytype) i64 { return callback(value); }
+    {
+        const body = try builder.beginFunction("apply", .i64_type);
+        const param_value = try body.addParam("value", .i64_type);
+        const param_callback = try body.addParam("callback", .none); // anytype
+        const result = try body.addCallRef(param_callback, &.{param_value});
+        try body.addRetNode(result);
+        try builder.endFunction(body);
+    }
+
+    // --- pub fn main() void { _ = apply(41, add_one); }
+    {
+        const body = try builder.beginFunction("main", .void);
+        const forty_one = try body.addInt(41);
+        const add_one_ref = try body.addDeclVal("add_one");
+        _ = try body.addCall("apply", &.{ forty_one, add_one_ref });
+        try body.addRetImplicit();
+        try builder.endFunction(body);
+    }
+
+    const fzir = try builder.finalize();
+    try addZirFromFinalized(ctx, fzir);
+
+    // The key assertion: compilation should succeed with no errors.
+    // If function values are handled correctly, Zig's Sema will
+    // monomorphize callback:anytype to *const fn(i64) i64 and
+    // the call_ref inside apply will work.
+    try std.testing.expectEqual(@as(i32, 0), zir_compilation_update(ctx));
+}
