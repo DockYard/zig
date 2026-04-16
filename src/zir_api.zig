@@ -706,7 +706,12 @@ fn createImpl(
         "comptime {}\n";
     cwd.createDirPath(io, stub_dir) catch {};
     const stub_full = try std.fmt.allocPrint(ar, "{s}/{s}", .{ stub_dir, stub_src_name });
-    {
+    // Only write stub if content changed (avoids redundant disk I/O on repeated builds)
+    const needs_write = blk: {
+        const existing = cwd.readFileAlloc(io, stub_full, ar, .limited(64)) catch break :blk true;
+        break :blk !mem.eql(u8, existing, stub_source);
+    };
+    if (needs_write) {
         var file = cwd.createFile(io, stub_full, .{}) catch return error.OutOfMemory;
         defer file.close(io);
         file.writeStreamingAll(io, stub_source) catch return error.OutOfMemory;
