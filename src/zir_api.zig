@@ -2263,23 +2263,26 @@ fn testExpectSegmentVmaddrOrder(file_path: []const u8, allocator: Allocator) !vo
 
 test "zir_api: injected executable update succeeds" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io();
+    const cwd = Dir.cwd();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("local-cache");
-    try tmp.dir.makePath("global-cache");
+    try tmp.dir.createDirPath(io, "local-cache");
+    try tmp.dir.createDirPath(io, "global-cache");
 
-    const zig_lib_dir = try testRepoLibDir(allocator);
+    const zig_lib_dir = try testRepoLibDir(allocator, io);
     defer allocator.free(zig_lib_dir);
 
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
     defer allocator.free(tmp_path);
 
-    const original_cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
-    defer allocator.free(original_cwd);
-    try std.posix.chdir(tmp_path);
-    defer std.posix.chdir(original_cwd) catch {};
+    // Change to temp dir for the test, restore on exit.
+    const tmp_dir = try cwd.openDir(io, tmp_path, .{});
+    const orig_dir = try cwd.openDir(io, ".", .{});
+    try std.process.setCurrentDir(io, tmp_dir);
+    defer std.process.setCurrentDir(io, orig_dir) catch {};
 
     const local_cache_dir = try std.fs.path.join(allocator, &.{ tmp_path, "local-cache" });
     defer allocator.free(local_cache_dir);
@@ -2298,6 +2301,7 @@ test "zir_api: injected executable update succeeds" {
         1,
         false,
         true,
+        null,
     );
     defer zir_compilation_destroy(ctx);
 
@@ -2314,8 +2318,8 @@ test "zir_api: injected executable update succeeds" {
 
     try std.testing.expectEqual(@as(i32, 0), zir_compilation_update(ctx));
 
-    const file = try std.fs.cwd().openFile(output_path, .{});
-    defer file.close();
+    const file = try cwd.openFile(io, output_path, .{});
+    defer file.close(io);
 
     try testExpectSegmentVmaddrOrder(output_path, allocator);
 }
