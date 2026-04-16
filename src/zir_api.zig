@@ -100,6 +100,39 @@ pub export fn zir_compilation_create(
         optimize_mode,
         is_dynamic,
         link_libc,
+        null,
+    ) catch null;
+}
+
+/// Create a new compilation context with an explicit target triple.
+///
+/// `target_triple` is a null-terminated target string (e.g., "wasm32-wasi",
+/// "aarch64-linux-gnu"). Pass null or "native" for native compilation.
+/// Returns null on failure.
+pub export fn zir_compilation_create_cross(
+    zig_lib_dir: [*:0]const u8,
+    local_cache_dir: [*:0]const u8,
+    global_cache_dir: [*:0]const u8,
+    output_path: [*:0]const u8,
+    root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
+    target_triple: ?[*:0]const u8,
+) ?*ZirContext {
+    const target_str: ?[]const u8 = if (target_triple) |t| mem.sliceTo(t, 0) else null;
+    return createImpl(
+        mem.sliceTo(zig_lib_dir, 0),
+        mem.sliceTo(local_cache_dir, 0),
+        mem.sliceTo(global_cache_dir, 0),
+        mem.sliceTo(output_path, 0),
+        mem.sliceTo(root_name, 0),
+        output_mode,
+        optimize_mode,
+        is_dynamic,
+        link_libc,
+        target_str,
     ) catch null;
 }
 
@@ -539,6 +572,7 @@ fn createImpl(
     optimize_mode_raw: u8,
     is_dynamic: bool,
     do_link_libc: bool,
+    target_triple_opt: ?[]const u8,
 ) !*ZirContext {
     // Use c_allocator (libc malloc) instead of page_allocator.
     // page_allocator creates one mmap per allocation, hitting the kernel's
@@ -601,13 +635,17 @@ fn createImpl(
         .global_cache = .{ .handle = global_cache_handle, .path = try ar.dupe(u8, global_cache_dir_path) },
     };
 
-    // Native target resolution.
+    // Target resolution — use explicit triple if provided, otherwise native.
+    const arch_os_abi: []const u8 = if (target_triple_opt) |t|
+        (if (mem.eql(u8, t, "native")) "native" else t)
+    else
+        "native";
     const target_query = std.zig.parseTargetQueryOrReportFatalError(ar, .{
-        .arch_os_abi = "native",
+        .arch_os_abi = arch_os_abi,
     });
-    const native_target = std.zig.resolveTargetQueryOrFatal(io, target_query);
+    const resolved_result = std.zig.resolveTargetQueryOrFatal(io, target_query);
     const resolved_target: Package.Module.ResolvedTarget = .{
-        .result = native_target,
+        .result = resolved_result,
         .is_native_os = target_query.isNativeOs(),
         .is_native_abi = target_query.isNativeAbi(),
         .is_explicit_dynamic_linker = false,
@@ -628,6 +666,12 @@ fn createImpl(
         else => .ReleaseSafe,
     };
 
+    // For WASM targets, disable libc linking (WASI provides its own).
+    const effective_link_libc = if (resolved_result.os.tag == .wasi or resolved_result.os.tag == .freestanding)
+        false
+    else
+        do_link_libc;
+
     // Compilation config.
     const config = Compilation.Config.resolve(.{
         .output_mode = output_mode_enum,
@@ -637,7 +681,7 @@ fn createImpl(
         .emit_bin = true,
         .root_optimize_mode = optimize_mode_enum,
         .root_strip = true,
-        .link_libc = do_link_libc,
+        .link_libc = effective_link_libc,
         .link_mode = if (output_mode_enum == .Lib and is_dynamic) .dynamic else null,
         .lto = .none,
         .use_llvm = build_options.have_llvm,
