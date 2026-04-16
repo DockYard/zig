@@ -2298,6 +2298,18 @@ pub export fn zir_builder_emit_decl_ref(
     return @intFromEnum(ref);
 }
 
+pub export fn zir_builder_emit_decl_val(
+    handle: ?*ZirBuilderHandle,
+    name_ptr: [*]const u8,
+    name_len: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const name = name_ptr[0..name_len];
+    const ref = body.addDeclVal(name) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
 /// Emit a `ret_type` instruction that yields the current function's return type.
 /// Returns the Ref as u32, or 0 if the function has no union return type.
 /// Use this as the type argument to `zir_builder_emit_union_init`.

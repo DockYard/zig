@@ -861,6 +861,11 @@ pub const FuncBody = struct {
         return self.emitBodyInst(.decl_ref, Builder.encodeStrTok(start, .zero));
     }
 
+    pub fn addDeclVal(self: *FuncBody, name: []const u8) !Zir.Inst.Ref {
+        const start = try self.builder.internString(name);
+        return self.emitBodyInst(.decl_val, Builder.encodeStrTok(start, .zero));
+    }
+
     /// Emit a `ret_type` instruction that yields the current function's return type.
     /// Used to reference the return type inside the function body (e.g., for @unionInit).
     pub fn addRetType(self: *FuncBody) !Zir.Inst.Ref {
