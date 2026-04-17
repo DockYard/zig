@@ -2504,7 +2504,6 @@ pub const FuncBody = struct {
             Builder.encodeExtended(@intFromEnum(Zir.Inst.Extended.reify_tuple), 0, payload_idx),
         );
     }
-
 };
 
 pub const FinalizedZir = struct {

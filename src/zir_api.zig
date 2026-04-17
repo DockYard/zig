@@ -3073,14 +3073,27 @@ pub export fn zir_builder_emit_has_field(
     return @intFromEnum(ref);
 }
 
+fn injectModuleZir(ctx: *ZirContext, name: []const u8, fzir: zir_builder.FinalizedZir) !void {
+    const data = ZirData{
+        .instructions_tags = @constCast(fzir.instructions_tags.ptr),
+        .instructions_data = @constCast(fzir.instructions_data.ptr),
+        .instructions_len = fzir.instructions_len,
+        .string_bytes = @constCast(fzir.string_bytes.ptr),
+        .string_bytes_len = fzir.string_bytes_len,
+        .extra = @constCast(fzir.extra.ptr),
+        .extra_len = fzir.extra_len,
+    };
+    try addZirToModuleImpl(ctx, name, &data);
+}
+
 fn testRepoLibDir(allocator: Allocator, io: Io) ![]u8 {
     const cwd = Dir.cwd();
-    return cwd.realpathAlloc(io, "lib", allocator) catch |err| switch (err) {
+    return cwd.realPathFileAlloc(io, "lib", allocator) catch |err| switch (err) {
         error.FileNotFound => blk: {
             const src_dir = std.fs.path.dirname(@src().file) orelse break :blk error.FileNotFound;
             const lib_path = try std.fs.path.join(allocator, &.{ src_dir, "..", "lib" });
             defer allocator.free(lib_path);
-            break :blk cwd.realpathAlloc(io, lib_path, allocator);
+            break :blk cwd.realPathFileAlloc(io, lib_path, allocator);
         },
         else => err,
     };
@@ -3088,7 +3101,7 @@ fn testRepoLibDir(allocator: Allocator, io: Io) ![]u8 {
 
 fn testExpectSegmentVmaddrOrder(file_path: []const u8, allocator: Allocator) !void {
     const cwd = Dir.cwd();
-    const io = std.testing.io();
+    const io = std.testing.io;
     const bytes = try cwd.readFileAlloc(io, file_path, allocator, .limited(16 * 1024 * 1024));
     defer allocator.free(bytes);
 
@@ -3117,7 +3130,7 @@ fn testExpectSegmentVmaddrOrder(file_path: []const u8, allocator: Allocator) !vo
 
 test "zir_api: injected executable update succeeds" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io();
+    const io = std.testing.io;
     const cwd = Dir.cwd();
 
     var tmp = std.testing.tmpDir(.{});
@@ -3188,7 +3201,7 @@ test "zir_api: function value passed as callback argument" {
     //   pub fn main() void { _ = apply(41, add_one); }
 
     const allocator = std.testing.allocator;
-    const io = std.testing.io();
+    const io = std.testing.io;
     const cwd = Dir.cwd();
 
     var tmp = std.testing.tmpDir(.{});
@@ -3273,4 +3286,110 @@ test "zir_api: function value passed as callback argument" {
     // monomorphize callback:anytype to *const fn(i64) i64 and
     // the call_ref inside apply will work.
     try std.testing.expectEqual(@as(i32, 0), zir_compilation_update(ctx));
+}
+
+test "zir_api: cross-module callback via anytype" {
+    // Replicates the Zap test failure: Module A has apply(value, callback:anytype),
+    // Module B calls A.apply(41, add_one) where add_one is in Module B.
+    // This tests whether anytype monomorphization works across injected ZIR modules.
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = Dir.cwd();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "local-cache");
+    try tmp.dir.createDirPath(io, "global-cache");
+
+    const zig_lib_dir = try testRepoLibDir(allocator, io);
+    defer allocator.free(zig_lib_dir);
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const tmp_dir = try cwd.openDir(io, tmp_path, .{});
+    const orig_dir = try cwd.openDir(io, ".", .{});
+    try std.process.setCurrentDir(io, tmp_dir);
+    defer std.process.setCurrentDir(io, orig_dir) catch {};
+
+    const local_cache_dir = try std.fs.path.join(allocator, &.{ tmp_path, "local-cache" });
+    defer allocator.free(local_cache_dir);
+    const global_cache_dir = try std.fs.path.join(allocator, &.{ tmp_path, "global-cache" });
+    defer allocator.free(global_cache_dir);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_path, "cross-callback-test" });
+    defer allocator.free(output_path);
+
+    const ctx = try createImpl(
+        zig_lib_dir,
+        local_cache_dir,
+        global_cache_dir,
+        output_path,
+        "cross_callback_test",
+        0,
+        0,
+        false,
+        true,
+        null,
+    );
+    defer zir_compilation_destroy(ctx);
+
+    try addModuleSourceImpl(ctx, "zap_runtime", "pub fn noop() void {}\n");
+
+    // --- Module "Helper": has apply(value, callback: anytype) ---
+    {
+        var builder = try zir_builder.Builder.init(allocator);
+
+        const body = try builder.beginFunction("apply", .i64_type);
+        const param_value = try body.addParam("value", .i64_type);
+        const param_callback = try body.addParam("callback", .none); // anytype
+        const result = try body.addCallRef(param_callback, &.{param_value});
+        try body.addRetNode(result);
+        try builder.endFunction(body);
+
+        const fzir = try builder.finalize();
+        try injectModuleZir(ctx, "Helper", fzir);
+        builder.deinit();
+    }
+
+    // --- Root module: calls @import("Helper").apply(41, add_one) ---
+    {
+        var builder = try zir_builder.Builder.init(allocator);
+
+        // fn add_one(x: i64) i64 { return x + 1; }
+        const add_one_body = try builder.beginFunction("add_one", .i64_type);
+        const param_x = try add_one_body.addParam("x", .i64_type);
+        const one = try add_one_body.addInt(1);
+        const sum = try add_one_body.addBinOp(.add, param_x, one);
+        try add_one_body.addRetNode(sum);
+        try builder.endFunction(add_one_body);
+
+        // pub fn main() void {
+        //     const add_one_ref = @declRef("add_one");
+        //     _ = @import("Helper").apply(41, add_one_ref);
+        // }
+        const main_body = try builder.beginFunction("main", .void);
+        const forty_one = try main_body.addInt(41);
+        const add_one_ref = try main_body.addDeclVal("add_one");
+
+        // @import("Helper").apply(41, add_one_ref)
+        const helper_import = try main_body.addImport("Helper");
+        const apply_ref = try main_body.addFieldPtrLoad(helper_import, "apply");
+        _ = try main_body.addCallRef(apply_ref, &.{ forty_one, add_one_ref });
+        try main_body.addRetImplicit();
+        try builder.endFunction(main_body);
+
+        const fzir = try builder.finalize();
+        try addZirFromFinalized(ctx, fzir);
+        builder.deinit();
+    }
+
+    // If cross-module anytype monomorphization works, this succeeds.
+    // If it fails, the callback parameter in Helper.apply resolves to void.
+    const update_result = zir_compilation_update(ctx);
+    if (update_result != 0) {
+        zir_compilation_print_errors(ctx);
+    }
+    try std.testing.expectEqual(@as(i32, 0), update_result);
 }
