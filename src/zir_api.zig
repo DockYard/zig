@@ -3393,3 +3393,115 @@ test "zir_api: cross-module callback via anytype" {
     }
     try std.testing.expectEqual(@as(i32, 0), update_result);
 }
+
+test "zir_api: three-module anytype chain (caller -> wrapper -> inner)" {
+    // Replicates the Zap failure: caller -> Enum.map(callback:anytype) -> runtime.mapFn(callback:anytype)
+    // Three separate ZIR modules where anytype must propagate through two module boundaries.
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = Dir.cwd();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "local-cache");
+    try tmp.dir.createDirPath(io, "global-cache");
+
+    const zig_lib_dir = try testRepoLibDir(allocator, io);
+    defer allocator.free(zig_lib_dir);
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const tmp_dir = try cwd.openDir(io, tmp_path, .{});
+    const orig_dir = try cwd.openDir(io, ".", .{});
+    try std.process.setCurrentDir(io, tmp_dir);
+    defer std.process.setCurrentDir(io, orig_dir) catch {};
+
+    const local_cache_dir = try std.fs.path.join(allocator, &.{ tmp_path, "local-cache" });
+    defer allocator.free(local_cache_dir);
+    const global_cache_dir = try std.fs.path.join(allocator, &.{ tmp_path, "global-cache" });
+    defer allocator.free(global_cache_dir);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_path, "three-chain-test" });
+    defer allocator.free(output_path);
+
+    const ctx = try createImpl(
+        zig_lib_dir,
+        local_cache_dir,
+        global_cache_dir,
+        output_path,
+        "three_chain_test",
+        0,
+        0,
+        false,
+        true,
+        null,
+    );
+    defer zir_compilation_destroy(ctx);
+
+    try addModuleSourceImpl(ctx, "zap_runtime", "pub fn noop() void {}\n");
+
+    // --- Module "Inner": has invoke(value: i64, callback: anytype) -> i64
+    {
+        var builder = try zir_builder.Builder.init(allocator);
+        const body = try builder.beginFunction("invoke", .i64_type);
+        const param_value = try body.addParam("value", .i64_type);
+        const param_callback = try body.addParam("callback", .none); // anytype
+        const result = try body.addCallRef(param_callback, &.{param_value});
+        try body.addRetNode(result);
+        try builder.endFunction(body);
+        const fzir = try builder.finalize();
+        try injectModuleZir(ctx, "Inner", fzir);
+        builder.deinit();
+    }
+
+    // --- Module "Wrapper": has wrap(value: i64, callback: anytype) -> i64
+    //     calls @import("Inner").invoke(value, callback)
+    {
+        var builder = try zir_builder.Builder.init(allocator);
+        const body = try builder.beginFunction("wrap", .i64_type);
+        const param_value = try body.addParam("value", .i64_type);
+        const param_callback = try body.addParam("callback", .none); // anytype
+        // @import("Inner").invoke(value, callback)
+        const inner_import = try body.addImport("Inner");
+        const invoke_ref = try body.addFieldPtrLoad(inner_import, "invoke");
+        const result = try body.addCallRef(invoke_ref, &.{ param_value, param_callback });
+        try body.addRetNode(result);
+        try builder.endFunction(body);
+        const fzir = try builder.finalize();
+        try injectModuleZir(ctx, "Wrapper", fzir);
+        builder.deinit();
+    }
+
+    // --- Root module: calls @import("Wrapper").wrap(41, add_one)
+    {
+        var builder = try zir_builder.Builder.init(allocator);
+
+        const add_one_body = try builder.beginFunction("add_one", .i64_type);
+        const param_x = try add_one_body.addParam("x", .i64_type);
+        const one = try add_one_body.addInt(1);
+        const sum = try add_one_body.addBinOp(.add, param_x, one);
+        try add_one_body.addRetNode(sum);
+        try builder.endFunction(add_one_body);
+
+        const main_body = try builder.beginFunction("main", .void);
+        const forty_one = try main_body.addInt(41);
+        const add_one_ref = try main_body.addDeclVal("add_one");
+        const wrapper_import = try main_body.addImport("Wrapper");
+        const wrap_ref = try main_body.addFieldPtrLoad(wrapper_import, "wrap");
+        _ = try main_body.addCallRef(wrap_ref, &.{ forty_one, add_one_ref });
+        try main_body.addRetImplicit();
+        try builder.endFunction(main_body);
+
+        const fzir = try builder.finalize();
+        try addZirFromFinalized(ctx, fzir);
+        builder.deinit();
+    }
+
+    const update_result = zir_compilation_update(ctx);
+    if (update_result != 0) {
+        zir_compilation_print_errors(ctx);
+    }
+    try std.testing.expectEqual(@as(i32, 0), update_result);
+}
