@@ -3086,6 +3086,54 @@ pub export fn zir_builder_emit_has_field(
     return @intFromEnum(ref);
 }
 
+/// Set the return type to a named type declared in the current module.
+/// Emits a decl_val instruction for the ret_ty body.
+/// Returns 0 on success, -1 on error.
+pub export fn zir_builder_set_decl_val_return_type(
+    handle: ?*ZirBuilderHandle,
+    name_ptr: [*]const u8,
+    name_len: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    body.setDeclValReturnType(name_ptr[0..name_len]) catch return -1;
+    return 0;
+}
+
+/// Add a named struct type declaration to the module.
+/// Field names and types are passed as parallel arrays.
+/// Each type is a u32 well-known ZIR Ref (e.g., i64_type).
+/// Returns 0 on success, -1 on error.
+pub export fn zir_builder_add_struct_type(
+    handle: ?*ZirBuilderHandle,
+    name_ptr: [*]const u8,
+    name_len: u32,
+    field_names_ptrs: [*]const [*]const u8,
+    field_names_lens: [*]const u32,
+    field_type_refs: [*]const u32,
+    fields_len: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const gpa = b.gpa;
+
+    const name = name_ptr[0..name_len];
+
+    const names = gpa.alloc([]const u8, fields_len) catch return -1;
+    defer gpa.free(names);
+    for (0..fields_len) |i| {
+        names[i] = field_names_ptrs[i][0..field_names_lens[i]];
+    }
+
+    const refs = gpa.alloc(Zir.Inst.Ref, fields_len) catch return -1;
+    defer gpa.free(refs);
+    for (0..fields_len) |i| {
+        refs[i] = @enumFromInt(field_type_refs[i]);
+    }
+
+    b.addStructTypeDecl(name, names, refs) catch return -1;
+    return 0;
+}
+
 fn injectModuleZir(ctx: *ZirContext, name: []const u8, fzir: zir_builder.FinalizedZir) !void {
     const data = ZirData{
         .instructions_tags = @constCast(fzir.instructions_tags.ptr),

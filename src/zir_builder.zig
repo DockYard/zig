@@ -212,6 +212,17 @@ pub const Builder = struct {
 
             const tuple_decl_ref = instRef(tuple_decl_idx);
             _ = try self.addInst(.break_inline, encodeBreak(tuple_decl_ref, brk_payload_idx));
+        } else if (body.decl_val_ret_type_inst) |decl_val_idx| {
+            // Named type return: break_inline with the decl_val ref.
+            ret_break_inline_idx = @intCast(self.tags.items.len);
+            const func_inst_predicted: u32 = ret_break_inline_idx + 1;
+
+            const brk_payload_idx: u32 = @intCast(self.extra.items.len);
+            try self.extra.append(self.gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+            try self.extra.append(self.gpa, func_inst_predicted);
+
+            const decl_val_ref = instRef(decl_val_idx);
+            _ = try self.addInst(.break_inline, encodeBreak(decl_val_ref, brk_payload_idx));
         }
 
         // Build Func payload in extra
@@ -234,6 +245,9 @@ pub const Builder = struct {
             try self.extra.append(self.gpa, 2);
         } else if (body.tuple_ret_type_inst != null) {
             // ret_ty body has 2 instructions: [tuple_decl, break_inline(func, tuple_decl)]
+            try self.extra.append(self.gpa, 2);
+        } else if (body.decl_val_ret_type_inst != null) {
+            // ret_ty body has 2 instructions: [decl_val, break_inline(func, decl_val)]
             try self.extra.append(self.gpa, 2);
         } else if (body.ret_type == .void) {
             // body_len=0 means void, is_generic=false → u32 value 0
@@ -264,6 +278,10 @@ pub const Builder = struct {
         } else if (body.tuple_ret_type_inst) |tuple_decl_idx| {
             // ret_ty body: [tuple_decl instruction index, break_inline instruction index]
             try self.extra.append(self.gpa, tuple_decl_idx);
+            try self.extra.append(self.gpa, ret_break_inline_idx);
+        } else if (body.decl_val_ret_type_inst) |decl_val_idx| {
+            // ret_ty body: [decl_val instruction index, break_inline instruction index]
+            try self.extra.append(self.gpa, decl_val_idx);
             try self.extra.append(self.gpa, ret_break_inline_idx);
         } else if (body.ret_type != .void) {
             try self.extra.append(self.gpa, @intFromEnum(body.ret_type));
@@ -470,6 +488,133 @@ pub const Builder = struct {
             .payload_index = payload_index,
         } };
     }
+
+    /// Add a named struct type declaration to the module.
+    /// Emits a struct_decl extended instruction inside a declaration,
+    /// making it a module-level named type. Field types are specified
+    /// as well-known ZIR type Refs (e.g., i64_type, bool_type).
+    pub fn addStructTypeDecl(
+        self: *Builder,
+        name: []const u8,
+        field_names: []const []const u8,
+        field_type_refs: []const Zir.Inst.Ref,
+    ) !void {
+        std.debug.assert(field_names.len == field_type_refs.len);
+        const fields_len: u32 = @intCast(field_names.len);
+
+        // Emit a declaration placeholder instruction
+        const decl_inst = try self.addInst(.declaration, encodeDeclaration(0, 0));
+
+        // For each field type, emit a break_inline instruction that yields
+        // the type Ref. These form the field type bodies.
+        // We need to predict the struct_decl instruction index for the
+        // break_inline targets.
+        var field_type_insts = std.ArrayListUnmanaged(u32).empty;
+        defer field_type_insts.deinit(self.gpa);
+
+        for (field_type_refs) |type_ref| {
+            // The break_inline targets the struct_decl instruction, which
+            // we haven't emitted yet. We'll predict its index.
+            // Each field type body is 1 instruction: break_inline
+            const brk_payload_idx: u32 = @intCast(self.extra.items.len);
+            // operand_src_node = none
+            try self.extra.append(self.gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+            // block_inst = 0 (placeholder — will be the struct_decl inst)
+            try self.extra.append(self.gpa, 0);
+
+            const brk_inst = try self.addInst(.break_inline, encodeBreak(type_ref, brk_payload_idx));
+            try field_type_insts.append(self.gpa, brk_inst);
+        }
+
+        // Emit struct_decl extended instruction
+        const struct_payload_idx: u32 = @intCast(self.extra.items.len);
+
+        // StructDecl fixed payload: fields_hash (4), src_line, src_node
+        try self.extra.append(self.gpa, 0); // fields_hash_0
+        try self.extra.append(self.gpa, 0); // fields_hash_1
+        try self.extra.append(self.gpa, 0); // fields_hash_2
+        try self.extra.append(self.gpa, 0); // fields_hash_3
+        try self.extra.append(self.gpa, 0); // src_line
+        try self.extra.append(self.gpa, 0); // src_node
+
+        // Trailing: fields_len (has_fields_len=true)
+        try self.extra.append(self.gpa, fields_len);
+
+        // Trailing: field names (NullTerminatedString × fields_len)
+        for (field_names) |fname| {
+            const name_idx = try self.internString(fname);
+            try self.extra.append(self.gpa, name_idx);
+        }
+
+        // Trailing: field type body lengths (u32 × fields_len)
+        // Each field type body is 1 instruction (the break_inline)
+        for (0..fields_len) |_| {
+            try self.extra.append(self.gpa, 1); // body_len = 1
+        }
+
+        // Trailing: field type bodies (concatenated instruction indices)
+        // Fix up break_inline targets to point to the struct_decl instruction
+        const struct_decl_idx: u32 = @intCast(self.tags.items.len);
+        for (field_type_insts.items) |brk_inst| {
+            // Fix the block_inst field in the break payload to point
+            // to the struct_decl instruction
+            // break payload is: [operand_src_node, block_inst]
+            // The break's data stores the payload index
+            const brk_data = self.data.items[brk_inst];
+            const brk_payload = brk_data.@"break".payload_index;
+            self.extra.items[brk_payload + 1] = struct_decl_idx;
+
+            // Append the break instruction index as the field type body
+            try self.extra.append(self.gpa, brk_inst);
+        }
+
+        // Small: has_fields_len=true, name_strategy=anon, layout=auto,
+        //        everything else false
+        // has_fields_len is bit 2 (0x0004)
+        const small: u16 = 0x0004;
+
+        _ = try self.addInst(
+            .extended,
+            encodeExtended(@intFromEnum(Zir.Inst.Extended.struct_decl), small, struct_payload_idx),
+        );
+
+        // Emit break_inline for the declaration (struct_decl → declaration)
+        const struct_decl_ref = instRef(struct_decl_idx);
+        const decl_break_payload_idx: u32 = @intCast(self.extra.items.len);
+        try self.extra.append(self.gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+        try self.extra.append(self.gpa, decl_inst);
+        const decl_break_inst = try self.addInst(.break_inline, encodeBreak(struct_decl_ref, decl_break_payload_idx));
+
+        // Build Declaration payload
+        const decl_payload_idx: u32 = @intCast(self.extra.items.len);
+
+        // src_hash (4 u32s, all zero)
+        try self.extra.append(self.gpa, 0);
+        try self.extra.append(self.gpa, 0);
+        try self.extra.append(self.gpa, 0);
+        try self.extra.append(self.gpa, 0);
+
+        // flags: pub_const_simple = id 7 (top 5 bits of u64)
+        try self.extra.append(self.gpa, 0);
+        try self.extra.append(self.gpa, 0x38000000);
+
+        // name
+        const decl_name_idx = try self.internString(name);
+        try self.extra.append(self.gpa, decl_name_idx);
+
+        // value_body_len = 2 (struct_decl + break_inline)
+        try self.extra.append(self.gpa, 2);
+
+        // value_body: struct_decl instruction, then break_inline
+        try self.extra.append(self.gpa, struct_decl_idx);
+        try self.extra.append(self.gpa, decl_break_inst);
+
+        // Fix up declaration instruction with real payload
+        self.data.items[decl_inst] = encodeDeclaration(0, decl_payload_idx);
+
+        // Track for root struct_decl
+        try self.decl_indices.append(self.gpa, decl_inst);
+    }
 };
 
 /// Return type for a function, mapping to Zir.Inst.Ref values.
@@ -529,6 +674,10 @@ pub const FuncBody = struct {
     /// endFunction will emit a ret_ty body containing [import, field_ptr_load, break_inline].
     imported_ret_type_inst: ?u32 = null,
     imported_ret_import_inst: ?u32 = null,
+    /// When set, the function returns a type referenced by name within
+    /// the current module (e.g., a struct type declared via addStructTypeDecl).
+    /// endFunction will emit a ret_ty body containing [decl_val, break_inline].
+    decl_val_ret_type_inst: ?u32 = null,
     /// When true, the function has a generic (inferred) return type.
     /// ret_ty = { body_len: 0, is_generic: true } = 0x80000000
     is_generic_return: bool = false,
@@ -1494,6 +1643,15 @@ pub const FuncBody = struct {
     /// Set a tuple return type from element type Refs.
     /// Emits a `tuple_decl` extended instruction in the declaration value body
     /// and stores its Ref for use by `endFunction`.
+    /// Set the function return type to a named type declared in the current module.
+    /// Emits a `decl_val` instruction referencing the type by name.
+    pub fn setDeclValReturnType(self: *FuncBody, type_name: []const u8) !void {
+        const b = self.builder;
+        const name_idx = try b.internString(type_name);
+        const decl_val_idx = try b.addInst(.decl_val, Builder.encodeStrTok(name_idx, .zero));
+        self.decl_val_ret_type_inst = decl_val_idx;
+    }
+
     pub fn setTupleReturnType(self: *FuncBody, types: []const Zir.Inst.Ref) !void {
         const b = self.builder;
         const fields_len: u16 = @intCast(types.len);
