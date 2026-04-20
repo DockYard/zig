@@ -889,6 +889,40 @@ pub const FuncBody = struct {
         return Builder.instRef(idx);
     }
 
+    /// Emit a parameter whose type is a named declaration in the current module.
+    /// Uses `decl_val` to reference the type by name (e.g., a struct type).
+    pub fn addParamDeclValType(self: *FuncBody, param_name: []const u8, type_name: []const u8) !Zir.Inst.Ref {
+        const b = self.builder;
+        const param_name_idx = try b.internString(param_name);
+
+        // Pre-compute param instruction index: follows 2 instructions (decl_val, break_inline)
+        const param_inst_idx: u32 = @intCast(b.tags.items.len + 2);
+
+        // 1. Emit decl_val instruction
+        const type_name_idx = try b.internString(type_name);
+        const decl_val_inst = try b.addInst(.decl_val, Builder.encodeStrTok(type_name_idx, .zero));
+        const decl_val_ref = Builder.instRef(decl_val_inst);
+
+        // 2. Emit break_inline
+        const break_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+        try b.extra.append(b.gpa, param_inst_idx);
+        const break_idx = try b.addInst(.break_inline, Builder.encodeBreak(decl_val_ref, break_payload_idx));
+
+        // Param payload
+        const payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, param_name_idx);
+        try b.extra.append(b.gpa, 2); // body_len=2, is_generic=false
+        try b.extra.append(b.gpa, decl_val_inst);
+        try b.extra.append(b.gpa, break_idx);
+
+        const idx = try b.addInst(.param, Builder.encodePlTok(.zero, payload_idx));
+        std.debug.assert(idx == param_inst_idx);
+
+        try self.param_inst_indices.append(b.gpa, idx);
+        return Builder.instRef(idx);
+    }
+
     /// Emit `?T` (optional type). Returns a Ref to the optional type.
     pub fn addOptionalType(self: *FuncBody, child_type: Zir.Inst.Ref) !Zir.Inst.Ref {
         return self.emitBodyInst(.optional_type, Builder.encodeUnNode(.zero, child_type));

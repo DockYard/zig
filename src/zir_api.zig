@@ -3086,6 +3086,25 @@ pub export fn zir_builder_emit_has_field(
     return @intFromEnum(ref);
 }
 
+/// Emit a parameter whose type is a named declaration in the current module.
+/// Uses decl_val to reference the type (e.g., a struct type).
+/// Returns the param Ref or 0xFFFFFFFF on error.
+pub export fn zir_builder_emit_param_decl_val_type(
+    handle: ?*ZirBuilderHandle,
+    param_name_ptr: [*]const u8,
+    param_name_len: u32,
+    type_name_ptr: [*]const u8,
+    type_name_len: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const ref = body.addParamDeclValType(
+        param_name_ptr[0..param_name_len],
+        type_name_ptr[0..type_name_len],
+    ) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
 /// Set the return type to a named type declared in the current module.
 /// Emits a decl_val instruction for the ret_ty body.
 /// Returns 0 on success, -1 on error.
