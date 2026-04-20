@@ -2323,6 +2323,19 @@ pub export fn zir_builder_get_union_ret_type_ref(
     return @intFromEnum(ref);
 }
 
+/// Emit a `ret_type` instruction that yields the current function's tuple return type.
+/// Returns the Ref as u32, or 0 if the function has no tuple return type.
+/// Use this as the type argument to `zir_builder_emit_struct_init_typed`.
+pub export fn zir_builder_get_tuple_ret_type_ref(
+    handle: ?*ZirBuilderHandle,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0;
+    const body = b.active_body orelse return 0;
+    if (body.tuple_ret_type_inst == null) return 0;
+    const ref = body.addRetType() catch return 0;
+    return @intFromEnum(ref);
+}
+
 /// Emit a parameter whose type is @import(module_name).field_name.
 /// Returns the param Ref or 0xFFFFFFFF on error.
 pub export fn zir_builder_emit_param_imported_type(

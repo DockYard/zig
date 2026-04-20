@@ -201,6 +201,17 @@ pub const Builder = struct {
             // Emit break_inline: operand = union_decl Ref, payload = break payload
             const union_decl_ref = instRef(union_decl_idx);
             _ = try self.addInst(.break_inline, encodeBreak(union_decl_ref, brk_payload_idx));
+        } else if (body.tuple_ret_type_inst) |tuple_decl_idx| {
+            // Same pattern as union return type: break_inline for the ret_ty body.
+            ret_break_inline_idx = @intCast(self.tags.items.len);
+            const func_inst_predicted: u32 = ret_break_inline_idx + 1;
+
+            const brk_payload_idx: u32 = @intCast(self.extra.items.len);
+            try self.extra.append(self.gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+            try self.extra.append(self.gpa, func_inst_predicted);
+
+            const tuple_decl_ref = instRef(tuple_decl_idx);
+            _ = try self.addInst(.break_inline, encodeBreak(tuple_decl_ref, brk_payload_idx));
         }
 
         // Build Func payload in extra
@@ -221,9 +232,9 @@ pub const Builder = struct {
         } else if (body.union_ret_type_inst != null) {
             // ret_ty body has 2 instructions: [union_decl, break_inline(func, union_decl)]
             try self.extra.append(self.gpa, 2);
-        } else if (body.tuple_ret_types.items.len > 0) {
-            // body_len=1 with the tuple_decl instruction Ref
-            try self.extra.append(self.gpa, 1);
+        } else if (body.tuple_ret_type_inst != null) {
+            // ret_ty body has 2 instructions: [tuple_decl, break_inline(func, tuple_decl)]
+            try self.extra.append(self.gpa, 2);
         } else if (body.ret_type == .void) {
             // body_len=0 means void, is_generic=false → u32 value 0
             try self.extra.append(self.gpa, 0);
@@ -250,8 +261,10 @@ pub const Builder = struct {
             // ret_ty body: [union_decl instruction index, break_inline instruction index]
             try self.extra.append(self.gpa, union_decl_idx);
             try self.extra.append(self.gpa, ret_break_inline_idx);
-        } else if (body.tuple_ret_types.items.len > 0) {
-            try self.extra.append(self.gpa, @intFromEnum(body.tuple_ret_types.items[0]));
+        } else if (body.tuple_ret_type_inst) |tuple_decl_idx| {
+            // ret_ty body: [tuple_decl instruction index, break_inline instruction index]
+            try self.extra.append(self.gpa, tuple_decl_idx);
+            try self.extra.append(self.gpa, ret_break_inline_idx);
         } else if (body.ret_type != .void) {
             try self.extra.append(self.gpa, @intFromEnum(body.ret_type));
         }
@@ -500,6 +513,9 @@ pub const FuncBody = struct {
     /// emit a ret_ty body that computes the struct type from these element
     /// type Refs (e.g., .i64_type, .slice_const_u8_type).
     tuple_ret_types: std.ArrayListUnmanaged(Zir.Inst.Ref) = .empty,
+    /// Raw instruction index of the tuple_decl emitted by setTupleReturnType.
+    /// Used by endFunction to emit the ret_ty body with [tuple_decl, break_inline].
+    tuple_ret_type_inst: ?u32 = null,
     /// When set, the function returns a union type declared inline.
     /// endFunction will emit a ret_ty body containing this union_decl
     /// instruction and a break_inline, matching AstGen's encoding for
@@ -1497,12 +1513,16 @@ pub const FuncBody = struct {
             Builder.encodeExtended(@intFromEnum(Zir.Inst.Extended.tuple_decl), fields_len, tuple_payload_idx),
         );
 
-        // Track as a param instruction so it's in the declaration value body
-        try self.param_inst_indices.append(b.gpa, tuple_decl_idx);
+        // NOTE: Do NOT add to param_inst_indices — the tuple_decl is part of
+        // the ret_ty body (emitted via endFunction), not the declaration body.
+        // Adding it to param_inst_indices breaks Sema's param processing.
 
         // Store the Ref for endFunction to use as the return type
         self.tuple_ret_types.clearRetainingCapacity();
         try self.tuple_ret_types.append(b.gpa, Builder.instRef(tuple_decl_idx));
+
+        // Store the raw instruction index for endFunction's break_inline emission
+        self.tuple_ret_type_inst = tuple_decl_idx;
 
         // Store element types for addStructInitTyped to re-emit tuple_decl in function body
         self.tuple_element_type_refs.clearRetainingCapacity();
