@@ -3120,8 +3120,10 @@ pub export fn zir_builder_set_decl_val_return_type(
 }
 
 /// Add a named struct type declaration to the module.
-/// Field names and types are passed as parallel arrays.
+/// Field names, types, and optional defaults are passed as parallel arrays.
 /// Each type is a u32 well-known ZIR Ref (e.g., i64_type).
+/// Each default is a u32 ZIR Ref (0 = no default).
+/// default_refs may be null if no fields have defaults.
 /// Returns 0 on success, -1 on error.
 pub export fn zir_builder_add_struct_type(
     handle: ?*ZirBuilderHandle,
@@ -3130,6 +3132,7 @@ pub export fn zir_builder_add_struct_type(
     field_names_ptrs: [*]const [*]const u8,
     field_names_lens: [*]const u32,
     field_type_refs: [*]const u32,
+    field_default_refs: ?[*]const u32,
     fields_len: u32,
 ) callconv(.c) i32 {
     const b = getBuilder(handle) orelse return -1;
@@ -3143,13 +3146,22 @@ pub export fn zir_builder_add_struct_type(
         names[i] = field_names_ptrs[i][0..field_names_lens[i]];
     }
 
-    const refs = gpa.alloc(Zir.Inst.Ref, fields_len) catch return -1;
-    defer gpa.free(refs);
+    const type_refs = gpa.alloc(Zir.Inst.Ref, fields_len) catch return -1;
+    defer gpa.free(type_refs);
     for (0..fields_len) |i| {
-        refs[i] = @enumFromInt(field_type_refs[i]);
+        type_refs[i] = @enumFromInt(field_type_refs[i]);
     }
 
-    b.addStructTypeDecl(name, names, refs) catch return -1;
+    const defaults: ?[]const Zir.Inst.Ref = if (field_default_refs) |d| blk: {
+        const defs = gpa.alloc(Zir.Inst.Ref, fields_len) catch return -1;
+        for (0..fields_len) |i| {
+            defs[i] = @enumFromInt(d[i]);
+        }
+        break :blk defs;
+    } else null;
+    defer if (defaults) |d| gpa.free(d);
+
+    b.addStructTypeDecl(name, names, type_refs, defaults) catch return -1;
     return 0;
 }
 

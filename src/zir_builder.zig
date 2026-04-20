@@ -493,85 +493,118 @@ pub const Builder = struct {
     /// Emits a struct_decl extended instruction inside a declaration,
     /// making it a module-level named type. Field types are specified
     /// as well-known ZIR type Refs (e.g., i64_type, bool_type).
+    /// Optional field_default_refs provides default values per field
+    /// (.none = no default).
     pub fn addStructTypeDecl(
         self: *Builder,
         name: []const u8,
         field_names: []const []const u8,
         field_type_refs: []const Zir.Inst.Ref,
+        field_default_refs: ?[]const Zir.Inst.Ref,
     ) !void {
         std.debug.assert(field_names.len == field_type_refs.len);
+        if (field_default_refs) |defaults| std.debug.assert(defaults.len == field_names.len);
         const fields_len: u32 = @intCast(field_names.len);
+
+        // Check if any field has a default value
+        const has_defaults = if (field_default_refs) |defaults| blk: {
+            for (defaults) |d| {
+                if (d != .none) break :blk true;
+            }
+            break :blk false;
+        } else false;
 
         // Emit a declaration placeholder instruction
         const decl_inst = try self.addInst(.declaration, encodeDeclaration(0, 0));
 
-        // For each field type, emit a break_inline instruction that yields
-        // the type Ref. These form the field type bodies.
-        // We need to predict the struct_decl instruction index for the
-        // break_inline targets.
+        // Emit break_inline instructions for field type bodies
         var field_type_insts = std.ArrayListUnmanaged(u32).empty;
         defer field_type_insts.deinit(self.gpa);
 
         for (field_type_refs) |type_ref| {
-            // The break_inline targets the struct_decl instruction, which
-            // we haven't emitted yet. We'll predict its index.
-            // Each field type body is 1 instruction: break_inline
             const brk_payload_idx: u32 = @intCast(self.extra.items.len);
-            // operand_src_node = none
             try self.extra.append(self.gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
-            // block_inst = 0 (placeholder — will be the struct_decl inst)
-            try self.extra.append(self.gpa, 0);
+            try self.extra.append(self.gpa, 0); // placeholder for struct_decl inst
 
             const brk_inst = try self.addInst(.break_inline, encodeBreak(type_ref, brk_payload_idx));
             try field_type_insts.append(self.gpa, brk_inst);
+        }
+
+        // Emit break_inline instructions for field default value bodies
+        var field_default_insts = std.ArrayListUnmanaged(u32).empty;
+        defer field_default_insts.deinit(self.gpa);
+
+        if (has_defaults) {
+            const defaults = field_default_refs.?;
+            for (defaults) |default_ref| {
+                if (default_ref == .none) {
+                    try field_default_insts.append(self.gpa, 0); // sentinel: no default
+                    continue;
+                }
+                const brk_payload_idx: u32 = @intCast(self.extra.items.len);
+                try self.extra.append(self.gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+                try self.extra.append(self.gpa, 0); // placeholder for struct_decl inst
+
+                const brk_inst = try self.addInst(.break_inline, encodeBreak(default_ref, brk_payload_idx));
+                try field_default_insts.append(self.gpa, brk_inst);
+            }
         }
 
         // Emit struct_decl extended instruction
         const struct_payload_idx: u32 = @intCast(self.extra.items.len);
 
         // StructDecl fixed payload: fields_hash (4), src_line, src_node
-        try self.extra.append(self.gpa, 0); // fields_hash_0
-        try self.extra.append(self.gpa, 0); // fields_hash_1
-        try self.extra.append(self.gpa, 0); // fields_hash_2
-        try self.extra.append(self.gpa, 0); // fields_hash_3
+        try self.extra.append(self.gpa, 0);
+        try self.extra.append(self.gpa, 0);
+        try self.extra.append(self.gpa, 0);
+        try self.extra.append(self.gpa, 0);
         try self.extra.append(self.gpa, 0); // src_line
         try self.extra.append(self.gpa, 0); // src_node
 
         // Trailing: fields_len (has_fields_len=true)
         try self.extra.append(self.gpa, fields_len);
 
-        // Trailing: field names (NullTerminatedString × fields_len)
+        // Trailing: field names
         for (field_names) |fname| {
             const name_idx = try self.internString(fname);
             try self.extra.append(self.gpa, name_idx);
         }
 
-        // Trailing: field type body lengths (u32 × fields_len)
-        // Each field type body is 1 instruction (the break_inline)
+        // Trailing: field type body lengths (1 per field)
         for (0..fields_len) |_| {
-            try self.extra.append(self.gpa, 1); // body_len = 1
+            try self.extra.append(self.gpa, 1);
         }
 
-        // Trailing: field type bodies (concatenated instruction indices)
-        // Fix up break_inline targets to point to the struct_decl instruction
+        // Trailing: field default body lengths (if any_field_defaults)
+        if (has_defaults) {
+            for (field_default_insts.items) |inst| {
+                try self.extra.append(self.gpa, if (inst == 0) @as(u32, 0) else @as(u32, 1));
+            }
+        }
+
+        // Trailing: field type bodies
         const struct_decl_idx: u32 = @intCast(self.tags.items.len);
         for (field_type_insts.items) |brk_inst| {
-            // Fix the block_inst field in the break payload to point
-            // to the struct_decl instruction
-            // break payload is: [operand_src_node, block_inst]
-            // The break's data stores the payload index
             const brk_data = self.data.items[brk_inst];
             const brk_payload = brk_data.@"break".payload_index;
             self.extra.items[brk_payload + 1] = struct_decl_idx;
-
-            // Append the break instruction index as the field type body
             try self.extra.append(self.gpa, brk_inst);
         }
 
-        // Small: has_fields_len=true, name_strategy=anon, layout=auto,
-        //        everything else false
-        // has_fields_len is bit 2 (0x0004)
-        const small: u16 = 0x0004;
+        // Trailing: field default value bodies (after type bodies)
+        if (has_defaults) {
+            for (field_default_insts.items) |inst| {
+                if (inst == 0) continue; // no default for this field
+                const brk_data = self.data.items[inst];
+                const brk_payload = brk_data.@"break".payload_index;
+                self.extra.items[brk_payload + 1] = struct_decl_idx;
+                try self.extra.append(self.gpa, inst);
+            }
+        }
+
+        // Small flags: has_fields_len (bit 2) + any_field_defaults (bit 9)
+        // has_fields_len = 0x0004, any_field_defaults = 0x0200
+        const small: u16 = 0x0004 | (if (has_defaults) @as(u16, 0x0200) else @as(u16, 0));
 
         _ = try self.addInst(
             .extended,
