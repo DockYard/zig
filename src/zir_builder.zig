@@ -2504,6 +2504,10 @@ pub const FuncBody = struct {
         return self.addBinOp(.enum_from_int, dest_type, operand);
     }
 
+    pub fn addIntFromEnum(self: *FuncBody, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.int_from_enum, Builder.encodeUnNode(.zero, operand));
+    }
+
     /// Emit `@hasDecl(type_ref, name)`. Returns a bool Ref.
     /// ZIR tag: `.has_decl`, data: `pl_node`, payload: `Bin` { lhs=type, rhs=name_str }.
     pub fn addHasDecl(self: *FuncBody, type_ref: Zir.Inst.Ref, name: []const u8) !Zir.Inst.Ref {

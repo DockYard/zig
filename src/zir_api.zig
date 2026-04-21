@@ -3043,6 +3043,17 @@ pub export fn zir_builder_emit_int_from_ptr(
 }
 
 /// Emit `@ptrFromInt(operand, type_ref)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_int_from_enum(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addIntFromEnum(operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
 pub export fn zir_builder_emit_enum_from_int(
     handle: ?*ZirBuilderHandle,
     operand: u32,
