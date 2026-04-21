@@ -3043,6 +3043,19 @@ pub export fn zir_builder_emit_int_from_ptr(
 }
 
 /// Emit `@ptrFromInt(operand, type_ref)`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+pub export fn zir_builder_emit_enum_from_int(
+    handle: ?*ZirBuilderHandle,
+    operand: u32,
+    type_ref: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const t_ref: Zir.Inst.Ref = @enumFromInt(type_ref);
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    const ref = body.addEnumFromInt(t_ref, operand_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
 pub export fn zir_builder_emit_ptr_from_int(
     handle: ?*ZirBuilderHandle,
     operand: u32,
@@ -3162,6 +3175,29 @@ pub export fn zir_builder_add_struct_type(
     defer if (defaults) |d| gpa.free(d);
 
     b.addStructTypeDecl(name, names, type_refs, defaults) catch return -1;
+    return 0;
+}
+
+pub export fn zir_builder_add_enum_type(
+    handle: ?*ZirBuilderHandle,
+    name_ptr: [*]const u8,
+    name_len: u32,
+    variant_names_ptrs: [*]const [*]const u8,
+    variant_names_lens: [*]const u32,
+    variants_len: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const gpa = b.gpa;
+
+    const name = name_ptr[0..name_len];
+
+    const names = gpa.alloc([]const u8, variants_len) catch return -1;
+    defer gpa.free(names);
+    for (0..variants_len) |i| {
+        names[i] = variant_names_ptrs[i][0..variant_names_lens[i]];
+    }
+
+    b.addEnumTypeDecl(name, names) catch return -1;
     return 0;
 }
 

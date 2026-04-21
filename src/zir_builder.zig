@@ -582,23 +582,24 @@ pub const Builder = struct {
             }
         }
 
-        // Trailing: field type bodies
+        // Trailing: field bodies — INTERLEAVED per field:
+        // field0_type, field0_default, field1_type, field1_default, ...
+        // (no align bodies since we don't emit those)
         const struct_decl_idx: u32 = @intCast(self.tags.items.len);
-        for (field_type_insts.items) |brk_inst| {
-            const brk_data = self.data.items[brk_inst];
-            const brk_payload = brk_data.@"break".payload_index;
-            self.extra.items[brk_payload + 1] = struct_decl_idx;
-            try self.extra.append(self.gpa, brk_inst);
-        }
+        for (field_type_insts.items, 0..) |type_brk_inst, i| {
+            // Fix type break target → struct_decl
+            const type_brk_data = self.data.items[type_brk_inst];
+            self.extra.items[type_brk_data.@"break".payload_index + 1] = struct_decl_idx;
+            try self.extra.append(self.gpa, type_brk_inst);
 
-        // Trailing: field default value bodies (after type bodies)
-        if (has_defaults) {
-            for (field_default_insts.items) |inst| {
-                if (inst == 0) continue; // no default for this field
-                const brk_data = self.data.items[inst];
-                const brk_payload = brk_data.@"break".payload_index;
-                self.extra.items[brk_payload + 1] = struct_decl_idx;
-                try self.extra.append(self.gpa, inst);
+            // Default body for this field (if any)
+            if (has_defaults) {
+                const default_inst = field_default_insts.items[i];
+                if (default_inst != 0) {
+                    const def_brk_data = self.data.items[default_inst];
+                    self.extra.items[def_brk_data.@"break".payload_index + 1] = struct_decl_idx;
+                    try self.extra.append(self.gpa, default_inst);
+                }
             }
         }
 
@@ -646,6 +647,87 @@ pub const Builder = struct {
         self.data.items[decl_inst] = encodeDeclaration(0, decl_payload_idx);
 
         // Track for root struct_decl
+        try self.decl_indices.append(self.gpa, decl_inst);
+    }
+
+    /// Add a named enum type declaration to the module.
+    /// Emits an enum_decl extended instruction inside a declaration,
+    /// making it a module-level named type. Variant names are simple
+    /// identifiers (unit variants with no associated data).
+    pub fn addEnumTypeDecl(
+        self: *Builder,
+        name: []const u8,
+        variant_names: []const []const u8,
+    ) !void {
+        const fields_len: u32 = @intCast(variant_names.len);
+
+        // Emit a declaration placeholder instruction
+        const decl_inst = try self.addInst(.declaration, encodeDeclaration(0, 0));
+
+        // Emit enum_decl extended instruction
+        const enum_payload_idx: u32 = @intCast(self.extra.items.len);
+
+        // EnumDecl fixed payload: fields_hash (4), src_line, src_node
+        try self.extra.append(self.gpa, 0); // fields_hash_0
+        try self.extra.append(self.gpa, 0); // fields_hash_1
+        try self.extra.append(self.gpa, 0); // fields_hash_2
+        try self.extra.append(self.gpa, 0); // fields_hash_3
+        try self.extra.append(self.gpa, 0); // src_line
+        try self.extra.append(self.gpa, 0); // src_node
+
+        // Trailing: fields_len (has_fields_len=true)
+        try self.extra.append(self.gpa, fields_len);
+
+        // Trailing: field names (NullTerminatedString for each)
+        for (variant_names) |vname| {
+            const name_idx = try self.internString(vname);
+            try self.extra.append(self.gpa, name_idx);
+        }
+
+        // Small flags: has_fields_len (bit 2) = 0x0004
+        const small: u16 = 0x0004;
+
+        const enum_decl_idx: u32 = @intCast(self.tags.items.len);
+        _ = try self.addInst(
+            .extended,
+            encodeExtended(@intFromEnum(Zir.Inst.Extended.enum_decl), small, enum_payload_idx),
+        );
+
+        // Emit break_inline for the declaration (enum_decl → declaration)
+        const enum_decl_ref = instRef(enum_decl_idx);
+        const decl_break_payload_idx: u32 = @intCast(self.extra.items.len);
+        try self.extra.append(self.gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+        try self.extra.append(self.gpa, decl_inst);
+        const decl_break_inst = try self.addInst(.break_inline, encodeBreak(enum_decl_ref, decl_break_payload_idx));
+
+        // Build Declaration payload
+        const decl_payload_idx: u32 = @intCast(self.extra.items.len);
+
+        // src_hash (4 u32s, all zero)
+        try self.extra.append(self.gpa, 0);
+        try self.extra.append(self.gpa, 0);
+        try self.extra.append(self.gpa, 0);
+        try self.extra.append(self.gpa, 0);
+
+        // flags: pub_const_simple = id 7 (top 5 bits of u64)
+        try self.extra.append(self.gpa, 0);
+        try self.extra.append(self.gpa, 0x38000000);
+
+        // name
+        const decl_name_idx = try self.internString(name);
+        try self.extra.append(self.gpa, decl_name_idx);
+
+        // value_body_len = 2 (enum_decl + break_inline)
+        try self.extra.append(self.gpa, 2);
+
+        // value_body: enum_decl instruction, then break_inline
+        try self.extra.append(self.gpa, enum_decl_idx);
+        try self.extra.append(self.gpa, decl_break_inst);
+
+        // Fix up declaration instruction with real payload
+        self.data.items[decl_inst] = encodeDeclaration(0, decl_payload_idx);
+
+        // Track for root enum_decl
         try self.decl_indices.append(self.gpa, decl_inst);
     }
 };
@@ -2416,6 +2498,10 @@ pub const FuncBody = struct {
     /// ZIR tag: `.ptr_from_int`, data: `pl_node`, payload: `Bin` { lhs=dest_type, rhs=operand }.
     pub fn addPtrFromInt(self: *FuncBody, dest_type: Zir.Inst.Ref, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
         return self.addBinOp(.ptr_from_int, dest_type, operand);
+    }
+
+    pub fn addEnumFromInt(self: *FuncBody, dest_type: Zir.Inst.Ref, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.addBinOp(.enum_from_int, dest_type, operand);
     }
 
     /// Emit `@hasDecl(type_ref, name)`. Returns a bool Ref.
