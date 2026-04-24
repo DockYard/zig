@@ -759,9 +759,47 @@ fn createImpl(
     const stub_src_name = try std.fmt.allocPrint(ar, "{s}.zig", .{root_name_str});
 
     // Builder mode uses a comptime stub since the entry point is custom (not main).
+    // For executables, disable the Io.Threaded vtable to avoid compiling 113
+    // unnecessary function pointers (socket, fork, pthread, etc.) that bloat
+    // the binary. simple_panic works because ReleaseSmall disables runtime safety.
     const stub_source = if (ctx.is_builder)
         "comptime {}\n"
     else if (output_mode_enum == .Exe)
+        "const std = @import(\"std\");\n" ++
+        "pub const std_options_debug_threaded_io: ?*std.Io.Threaded = null;\n" ++
+        "pub const std_options_debug_io: std.Io = std.Io.failing;\n" ++
+        "pub const panic = struct {\n" ++
+        "    pub fn call(msg: []const u8, _: ?usize) noreturn {\n" ++
+        "        _ = std.c.write(2, msg.ptr, msg.len);\n" ++
+        "        _ = std.c.write(2, \"\\n\", 1);\n" ++
+        "        @trap();\n" ++
+        "    }\n" ++
+        "    pub fn sentinelMismatch(_: anytype, _: anytype) noreturn { @trap(); }\n" ++
+        "    pub fn unwrapError(_: anyerror) noreturn { @trap(); }\n" ++
+        "    pub fn outOfBounds(_: usize, _: usize) noreturn { @trap(); }\n" ++
+        "    pub fn startGreaterThanEnd(_: usize, _: usize) noreturn { @trap(); }\n" ++
+        "    pub fn inactiveUnionField(_: anytype, _: anytype) noreturn { @trap(); }\n" ++
+        "    pub fn sliceCastLenRemainder(_: usize) noreturn { @trap(); }\n" ++
+        "    pub fn reachedUnreachable() noreturn { @trap(); }\n" ++
+        "    pub fn unwrapNull() noreturn { @trap(); }\n" ++
+        "    pub fn castToNull() noreturn { @trap(); }\n" ++
+        "    pub fn incorrectAlignment() noreturn { @trap(); }\n" ++
+        "    pub fn invalidErrorCode() noreturn { @trap(); }\n" ++
+        "    pub fn integerOutOfBounds() noreturn { @trap(); }\n" ++
+        "    pub fn integerOverflow() noreturn { @trap(); }\n" ++
+        "    pub fn shlOverflow() noreturn { @trap(); }\n" ++
+        "    pub fn shrOverflow() noreturn { @trap(); }\n" ++
+        "    pub fn divideByZero() noreturn { @trap(); }\n" ++
+        "    pub fn exactDivisionRemainder() noreturn { @trap(); }\n" ++
+        "    pub fn integerPartOutOfBounds() noreturn { @trap(); }\n" ++
+        "    pub fn corruptSwitch() noreturn { @trap(); }\n" ++
+        "    pub fn shiftRhsTooBig() noreturn { @trap(); }\n" ++
+        "    pub fn invalidEnumValue() noreturn { @trap(); }\n" ++
+        "    pub fn forLenMismatch() noreturn { @trap(); }\n" ++
+        "    pub fn copyLenMismatch() noreturn { @trap(); }\n" ++
+        "    pub fn memcpyAlias() noreturn { @trap(); }\n" ++
+        "    pub fn noreturnReturned() noreturn { @trap(); }\n" ++
+        "};\n" ++
         "pub fn main() void {}\n"
     else
         "comptime {}\n";
@@ -769,7 +807,7 @@ fn createImpl(
     const stub_full = try std.fmt.allocPrint(ar, "{s}/{s}", .{ stub_dir, stub_src_name });
     // Only write stub if content changed (avoids redundant disk I/O on repeated builds)
     const needs_write = blk: {
-        const existing = cwd.readFileAlloc(io, stub_full, ar, .limited(64)) catch break :blk true;
+        const existing = cwd.readFileAlloc(io, stub_full, ar, .limited(512)) catch break :blk true;
         break :blk !mem.eql(u8, existing, stub_source);
     };
     if (needs_write) {
@@ -908,7 +946,47 @@ fn addZirImpl(ctx: *ZirContext, name: []const u8, data: *const ZirData) !void {
     // Parse the stub source so that error reporting has a valid AST tree.
     // Without this, SrcLoc.span crashes when Sema tries to format errors.
     if (file.source == null) {
-        const stub_source = if (ctx.output_mode == .Exe) "pub fn main() void {}\n" else "comptime {}\n";
+        const stub_source = if (ctx.is_builder)
+            "comptime {}\n"
+        else if (ctx.output_mode == .Exe)
+            "const std = @import(\"std\");\n" ++
+            "pub const std_options_debug_threaded_io: ?*std.Io.Threaded = null;\n" ++
+            "pub const std_options_debug_io: std.Io = std.Io.failing;\n" ++
+            "pub const panic = struct {\n" ++
+            "    pub fn call(msg: []const u8, _: ?usize) noreturn {\n" ++
+            "        _ = std.c.write(2, msg.ptr, msg.len);\n" ++
+            "        _ = std.c.write(2, \"\\n\", 1);\n" ++
+            "        @trap();\n" ++
+            "    }\n" ++
+            "    pub fn sentinelMismatch(_: anytype, _: anytype) noreturn { @trap(); }\n" ++
+            "    pub fn unwrapError(_: anyerror) noreturn { @trap(); }\n" ++
+            "    pub fn outOfBounds(_: usize, _: usize) noreturn { @trap(); }\n" ++
+            "    pub fn startGreaterThanEnd(_: usize, _: usize) noreturn { @trap(); }\n" ++
+            "    pub fn inactiveUnionField(_: anytype, _: anytype) noreturn { @trap(); }\n" ++
+            "    pub fn sliceCastLenRemainder(_: usize) noreturn { @trap(); }\n" ++
+            "    pub fn reachedUnreachable() noreturn { @trap(); }\n" ++
+            "    pub fn unwrapNull() noreturn { @trap(); }\n" ++
+            "    pub fn castToNull() noreturn { @trap(); }\n" ++
+            "    pub fn incorrectAlignment() noreturn { @trap(); }\n" ++
+            "    pub fn invalidErrorCode() noreturn { @trap(); }\n" ++
+            "    pub fn integerOutOfBounds() noreturn { @trap(); }\n" ++
+            "    pub fn integerOverflow() noreturn { @trap(); }\n" ++
+            "    pub fn shlOverflow() noreturn { @trap(); }\n" ++
+            "    pub fn shrOverflow() noreturn { @trap(); }\n" ++
+            "    pub fn divideByZero() noreturn { @trap(); }\n" ++
+            "    pub fn exactDivisionRemainder() noreturn { @trap(); }\n" ++
+            "    pub fn integerPartOutOfBounds() noreturn { @trap(); }\n" ++
+            "    pub fn corruptSwitch() noreturn { @trap(); }\n" ++
+            "    pub fn shiftRhsTooBig() noreturn { @trap(); }\n" ++
+            "    pub fn invalidEnumValue() noreturn { @trap(); }\n" ++
+            "    pub fn forLenMismatch() noreturn { @trap(); }\n" ++
+            "    pub fn copyLenMismatch() noreturn { @trap(); }\n" ++
+            "    pub fn memcpyAlias() noreturn { @trap(); }\n" ++
+            "    pub fn noreturnReturned() noreturn { @trap(); }\n" ++
+            "};\n" ++
+            "pub fn main() void {}\n"
+        else
+            "comptime {}\n";
         const source = try gpa.allocSentinel(u8, stub_source.len, 0);
         @memcpy(source, stub_source);
         file.source = source;
@@ -1270,6 +1348,17 @@ pub export fn zir_builder_emit_ret_void(handle: ?*ZirBuilderHandle) callconv(.c)
     const b = getBuilder(handle) orelse return -1;
     const body = b.active_body orelse return -1;
     body.addRetImplicit() catch return -1;
+    return 0;
+}
+
+/// Emit an `unreachable` instruction, marking the current code path as dead.
+/// Must be emitted after calls to noreturn functions (e.g., panic) so that
+/// Sema and LLVM know the path never continues.
+/// Returns 0 on success, -1 on error.
+pub export fn zir_builder_emit_unreachable(handle: ?*ZirBuilderHandle) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    body.addUnreachable() catch return -1;
     return 0;
 }
 
@@ -1810,6 +1899,23 @@ pub export fn zir_builder_emit_err_union_payload_unsafe(
     const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
     const ref = body.addErrUnionPayloadUnsafe(operand_ref) catch return 0xFFFFFFFF;
     return @intFromEnum(ref);
+}
+
+/// Emit `@setRuntimeSafety(enabled)` — controls whether safety checks
+/// (overflow, bounds, null) are active in the current scope.
+/// Pass bool_true (0x34) for enabled, bool_false (0x35) for disabled.
+pub export fn zir_builder_emit_set_runtime_safety(
+    handle: ?*ZirBuilderHandle,
+    enabled: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const enabled_ref: Zir.Inst.Ref = @enumFromInt(enabled);
+    _ = body.emitBodyInst(.set_runtime_safety, .{ .un_node = .{
+        .src_node = .zero,
+        .operand = enabled_ref,
+    } }) catch return 0xFFFFFFFF;
+    return 0;
 }
 
 /// Emit an inline if-else expression using block_inline/condbr_inline.
@@ -3186,6 +3292,51 @@ pub export fn zir_builder_add_struct_type(
     defer if (defaults) |d| gpa.free(d);
 
     b.addStructTypeDecl(name, names, type_refs, defaults) catch return -1;
+    return 0;
+}
+
+/// Begin a struct declaration scope with fields. Between this call and
+/// the matching `zir_builder_end_struct_decl`, any functions emitted via
+/// `zir_builder_begin_func`/`zir_builder_end_func` become declarations
+/// (methods) of the struct rather than of the parent scope.
+/// Returns 0 on success, -1 on error.
+pub export fn zir_builder_begin_struct_decl(
+    handle: ?*ZirBuilderHandle,
+    name_ptr: [*]const u8,
+    name_len: u32,
+    field_name_ptrs: [*]const [*]const u8,
+    field_name_lens: [*]const u32,
+    field_type_refs: [*]const u32,
+    field_count: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const gpa = b.gpa;
+
+    const name = name_ptr[0..name_len];
+
+    const names = gpa.alloc([]const u8, field_count) catch return -1;
+    defer gpa.free(names);
+    for (0..field_count) |i| {
+        names[i] = field_name_ptrs[i][0..field_name_lens[i]];
+    }
+
+    const type_refs = gpa.alloc(Zir.Inst.Ref, field_count) catch return -1;
+    defer gpa.free(type_refs);
+    for (0..field_count) |i| {
+        type_refs[i] = @enumFromInt(field_type_refs[i]);
+    }
+
+    b.beginStructDecl(name, names, type_refs, field_count) catch return -1;
+    return 0;
+}
+
+/// End a struct declaration scope. Emits the struct_decl instruction with
+/// both fields and any function declarations emitted since the matching
+/// `zir_builder_begin_struct_decl`. Restores the parent scope.
+/// Returns 0 on success, -1 on error.
+pub export fn zir_builder_end_struct_decl(handle: ?*ZirBuilderHandle) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    b.endStructDecl() catch return -1;
     return 0;
 }
 

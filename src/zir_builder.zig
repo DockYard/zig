@@ -30,6 +30,17 @@ pub const Builder = struct {
     capture_saved_non_body: [16]?*std.ArrayListUnmanaged(u32) = [_]?*std.ArrayListUnmanaged(u32){null} ** 16,
     capture_depth: u32 = 0,
 
+    /// Stack of saved decl_indices for nested struct scopes.
+    /// When beginStructDecl is called, the current decl_indices is pushed here
+    /// and a fresh empty list is started. endStructDecl pops and restores.
+    struct_scope_stack: [8]std.ArrayListUnmanaged(u32) = [_]std.ArrayListUnmanaged(u32){.empty} ** 8,
+    /// Saved field information for each struct scope level, used by endStructDecl.
+    struct_scope_field_names: [8]?[]const []const u8 = [_]?[]const []const u8{null} ** 8,
+    struct_scope_field_type_refs: [8]?[]const Zir.Inst.Ref = [_]?[]const Zir.Inst.Ref{null} ** 8,
+    struct_scope_field_counts: [8]u32 = [_]u32{0} ** 8,
+    struct_scope_names: [8]?[]const u8 = [_]?[]const u8{null} ** 8,
+    struct_scope_depth: u32 = 0,
+
     pub fn init(gpa: Allocator) !Builder {
         var self = Builder{
             .gpa = gpa,
@@ -63,6 +74,9 @@ pub const Builder = struct {
         self.string_bytes.deinit(self.gpa);
         self.decl_indices.deinit(self.gpa);
         for (&self.capture_bufs) |*buf| {
+            buf.deinit(self.gpa);
+        }
+        for (&self.struct_scope_stack) |*buf| {
             buf.deinit(self.gpa);
         }
         if (self.active_body) |body| {
@@ -487,6 +501,199 @@ pub const Builder = struct {
             .src_node = @enumFromInt(src_node),
             .payload_index = payload_index,
         } };
+    }
+
+    /// Begin a struct declaration scope. Saves the current decl_indices
+    /// and starts a new empty list so that functions emitted between
+    /// beginStructDecl and endStructDecl become declarations of the struct
+    /// rather than of the parent scope.
+    ///
+    /// Field information is stored for use by endStructDecl.
+    /// The caller should emit function declarations (via beginFunction/endFunction)
+    /// between this call and the matching endStructDecl.
+    pub fn beginStructDecl(
+        self: *Builder,
+        name: []const u8,
+        field_names: []const []const u8,
+        field_type_refs: []const Zir.Inst.Ref,
+        field_count: u32,
+    ) !void {
+        std.debug.assert(field_names.len == field_type_refs.len);
+        std.debug.assert(field_names.len == field_count);
+        std.debug.assert(self.struct_scope_depth < 8);
+
+        const depth = self.struct_scope_depth;
+
+        // Save the current decl_indices into the stack
+        self.struct_scope_stack[depth] = self.decl_indices;
+
+        // Start a fresh decl_indices for the struct's own declarations
+        self.decl_indices = .empty;
+
+        // Store field information for endStructDecl
+        // We need to dupe the slices since the caller may free them
+        const names_copy = try self.gpa.alloc([]const u8, field_count);
+        for (0..field_count) |i| {
+            names_copy[i] = field_names[i];
+        }
+        self.struct_scope_field_names[depth] = names_copy;
+
+        const type_refs_copy = try self.gpa.alloc(Zir.Inst.Ref, field_count);
+        @memcpy(type_refs_copy, field_type_refs);
+        self.struct_scope_field_type_refs[depth] = type_refs_copy;
+
+        self.struct_scope_field_counts[depth] = field_count;
+        self.struct_scope_names[depth] = name;
+        self.struct_scope_depth += 1;
+    }
+
+    /// End a struct declaration scope. Emits the struct_decl extended instruction
+    /// with both fields and declarations (functions emitted since beginStructDecl).
+    /// Restores the parent scope's decl_indices and adds the struct's declaration
+    /// instruction to the parent scope.
+    pub fn endStructDecl(self: *Builder) !void {
+        std.debug.assert(self.struct_scope_depth > 0);
+        self.struct_scope_depth -= 1;
+        const depth = self.struct_scope_depth;
+
+        const name = self.struct_scope_names[depth].?;
+        const field_names = self.struct_scope_field_names[depth].?;
+        const field_type_refs = self.struct_scope_field_type_refs[depth].?;
+        const fields_len: u32 = self.struct_scope_field_counts[depth];
+
+        // The struct's own declarations (functions emitted between begin/end)
+        const struct_decl_indices = self.decl_indices;
+
+        // Restore the parent scope's decl_indices
+        self.decl_indices = self.struct_scope_stack[depth];
+
+        // Now emit the struct_decl with both fields and declarations
+        // Emit a declaration placeholder instruction
+        const decl_inst = try self.addInst(.declaration, encodeDeclaration(0, 0));
+
+        // Emit break_inline instructions for field type bodies
+        var field_type_insts = std.ArrayListUnmanaged(u32).empty;
+        defer field_type_insts.deinit(self.gpa);
+
+        for (field_type_refs) |type_ref| {
+            const brk_payload_idx: u32 = @intCast(self.extra.items.len);
+            try self.extra.append(self.gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+            try self.extra.append(self.gpa, 0); // placeholder for struct_decl inst
+
+            const brk_inst = try self.addInst(.break_inline, encodeBreak(type_ref, brk_payload_idx));
+            try field_type_insts.append(self.gpa, brk_inst);
+        }
+
+        // Emit struct_decl extended instruction
+        const struct_payload_idx: u32 = @intCast(self.extra.items.len);
+
+        // StructDecl fixed payload: fields_hash (4), src_line, src_node
+        try self.extra.append(self.gpa, 0);
+        try self.extra.append(self.gpa, 0);
+        try self.extra.append(self.gpa, 0);
+        try self.extra.append(self.gpa, 0);
+        try self.extra.append(self.gpa, 0); // src_line
+        try self.extra.append(self.gpa, 0); // src_node
+
+        // Trailing lengths follow the bit order of StructDecl.Small:
+        // bit 0: has_captures_len (not used)
+        // bit 1: has_decls_len -> decls_len
+        // bit 2: has_fields_len -> fields_len
+        const decls_len: u32 = @intCast(struct_decl_indices.items.len);
+
+        // decls_len (bit 1 < bit 2, so decls_len comes before fields_len)
+        try self.extra.append(self.gpa, decls_len);
+
+        // fields_len
+        try self.extra.append(self.gpa, fields_len);
+
+        // Trailing data order (from getStructDecl):
+        // captures, capture_names, decls, field_names, field_type_body_lens,
+        // field_align_body_lens, field_default_body_lens, field_comptime_bits,
+        // backing_int_type_body, field_bodies
+
+        // decl indices
+        for (struct_decl_indices.items) |idx| {
+            try self.extra.append(self.gpa, idx);
+        }
+
+        // field names
+        for (field_names) |fname| {
+            const name_idx = try self.internString(fname);
+            try self.extra.append(self.gpa, name_idx);
+        }
+
+        // field type body lengths (1 per field — each type is a single break_inline)
+        for (0..fields_len) |_| {
+            try self.extra.append(self.gpa, 1);
+        }
+
+        // field bodies — interleaved per field (type only, no align or defaults)
+        const struct_decl_idx: u32 = @intCast(self.tags.items.len);
+        for (field_type_insts.items) |type_brk_inst| {
+            // Fix type break target -> struct_decl
+            const type_brk_data = self.data.items[type_brk_inst];
+            self.extra.items[type_brk_data.@"break".payload_index + 1] = struct_decl_idx;
+            try self.extra.append(self.gpa, type_brk_inst);
+        }
+
+        // Small flags: has_decls_len (bit 1) + has_fields_len (bit 2)
+        // has_decls_len = 0x0002, has_fields_len = 0x0004
+        const small: u16 = 0x0002 | 0x0004;
+
+        _ = try self.addInst(
+            .extended,
+            encodeExtended(@intFromEnum(Zir.Inst.Extended.struct_decl), small, struct_payload_idx),
+        );
+
+        // Emit break_inline for the declaration (struct_decl -> declaration)
+        const struct_decl_ref = instRef(struct_decl_idx);
+        const decl_break_payload_idx: u32 = @intCast(self.extra.items.len);
+        try self.extra.append(self.gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+        try self.extra.append(self.gpa, decl_inst);
+        const decl_break_inst = try self.addInst(.break_inline, encodeBreak(struct_decl_ref, decl_break_payload_idx));
+
+        // Build Declaration payload
+        const decl_payload_idx: u32 = @intCast(self.extra.items.len);
+
+        // src_hash (4 u32s, all zero)
+        try self.extra.append(self.gpa, 0);
+        try self.extra.append(self.gpa, 0);
+        try self.extra.append(self.gpa, 0);
+        try self.extra.append(self.gpa, 0);
+
+        // flags: pub_const_simple = id 7 (top 5 bits of u64)
+        try self.extra.append(self.gpa, 0);
+        try self.extra.append(self.gpa, 0x38000000);
+
+        // name
+        const decl_name_idx = try self.internString(name);
+        try self.extra.append(self.gpa, decl_name_idx);
+
+        // value_body_len = 2 (struct_decl + break_inline)
+        try self.extra.append(self.gpa, 2);
+
+        // value_body: struct_decl instruction, then break_inline
+        try self.extra.append(self.gpa, struct_decl_idx);
+        try self.extra.append(self.gpa, decl_break_inst);
+
+        // Fix up declaration instruction with real payload
+        self.data.items[decl_inst] = encodeDeclaration(0, decl_payload_idx);
+
+        // Track for parent scope's struct_decl
+        try self.decl_indices.append(self.gpa, decl_inst);
+
+        // Clean up saved field data
+        self.gpa.free(field_names);
+        self.gpa.free(field_type_refs);
+        self.struct_scope_field_names[depth] = null;
+        self.struct_scope_field_type_refs[depth] = null;
+        self.struct_scope_field_counts[depth] = 0;
+        self.struct_scope_names[depth] = null;
+
+        // Free the struct's decl_indices list (we've consumed it)
+        var struct_decls_mut = struct_decl_indices;
+        struct_decls_mut.deinit(self.gpa);
     }
 
     /// Add a named struct type declaration to the module.
@@ -1491,6 +1698,12 @@ pub const FuncBody = struct {
     pub fn addRetImplicit(self: *FuncBody) !void {
         try self.emitBodyInstVoid(.ret_implicit, Builder.encodeUnTok(.zero, .void_value));
         self.has_explicit_return = true;
+    }
+
+    /// Add an `unreachable` instruction, marking a code path that should never be reached.
+    /// Used after calls to noreturn functions (e.g., panic) to inform Sema/LLVM.
+    pub fn addUnreachable(self: *FuncBody) !void {
+        try self.emitBodyInstVoid(.@"unreachable", .{ .@"unreachable" = .{ .src_node = .zero } });
     }
 
     /// Add an inline if-then-else expression using block_inline/condbr_inline.
