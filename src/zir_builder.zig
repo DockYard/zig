@@ -398,6 +398,7 @@ pub const Builder = struct {
         body.param_inst_indices.deinit(self.gpa);
         body.tuple_ret_types.deinit(self.gpa);
         body.tuple_element_type_refs.deinit(self.gpa);
+        body.custom_ret_type_body.deinit(self.gpa);
         self.gpa.destroy(body);
         self.active_body = null;
     }
