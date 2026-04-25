@@ -87,6 +87,7 @@ comptime {
     _ = &api.zir_builder_emit_ptr_cast;
     _ = &api.zir_builder_emit_ptr_cast_full;
     _ = &api.zir_builder_set_imported_return_type;
+    _ = &api.zir_builder_set_custom_return_type;
     _ = &api.zir_builder_emit_param_imported_type;
     _ = &api.zir_builder_get_union_ret_type_ref;
     _ = &api.zir_builder_emit_tuple_decl;

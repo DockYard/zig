@@ -226,6 +226,17 @@ pub const Builder = struct {
 
             const tuple_decl_ref = instRef(tuple_decl_idx);
             _ = try self.addInst(.break_inline, encodeBreak(tuple_decl_ref, brk_payload_idx));
+        } else if (body.custom_ret_type_result) |result_idx| {
+            // Custom return type: break_inline targeting the result of arbitrary instructions.
+            ret_break_inline_idx = @intCast(self.tags.items.len);
+            const func_inst_predicted: u32 = ret_break_inline_idx + 1;
+
+            const brk_payload_idx: u32 = @intCast(self.extra.items.len);
+            try self.extra.append(self.gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+            try self.extra.append(self.gpa, func_inst_predicted);
+
+            const result_ref = instRef(result_idx);
+            _ = try self.addInst(.break_inline, encodeBreak(result_ref, brk_payload_idx));
         } else if (body.decl_val_ret_type_inst) |decl_val_idx| {
             // Named type return: break_inline with the decl_val ref.
             ret_break_inline_idx = @intCast(self.tags.items.len);
@@ -260,6 +271,9 @@ pub const Builder = struct {
         } else if (body.tuple_ret_type_inst != null) {
             // ret_ty body has 2 instructions: [tuple_decl, break_inline(func, tuple_decl)]
             try self.extra.append(self.gpa, 2);
+        } else if (body.custom_ret_type_result != null) {
+            // ret_ty body: custom instructions + break_inline
+            try self.extra.append(self.gpa, @intCast(body.custom_ret_type_body.items.len + 1));
         } else if (body.decl_val_ret_type_inst != null) {
             // ret_ty body has 2 instructions: [decl_val, break_inline(func, decl_val)]
             try self.extra.append(self.gpa, 2);
@@ -292,6 +306,12 @@ pub const Builder = struct {
         } else if (body.tuple_ret_type_inst) |tuple_decl_idx| {
             // ret_ty body: [tuple_decl instruction index, break_inline instruction index]
             try self.extra.append(self.gpa, tuple_decl_idx);
+            try self.extra.append(self.gpa, ret_break_inline_idx);
+        } else if (body.custom_ret_type_result != null) {
+            // ret_ty body: [custom instruction indices..., break_inline]
+            for (body.custom_ret_type_body.items) |inst_idx| {
+                try self.extra.append(self.gpa, inst_idx);
+            }
             try self.extra.append(self.gpa, ret_break_inline_idx);
         } else if (body.decl_val_ret_type_inst) |decl_val_idx| {
             // ret_ty body: [decl_val instruction index, break_inline instruction index]
@@ -1000,6 +1020,12 @@ pub const FuncBody = struct {
     /// the current struct (e.g., a struct type declared via addStructTypeDecl).
     /// endFunction will emit a ret_ty body containing [decl_val, break_inline].
     decl_val_ret_type_inst: ?u32 = null,
+    /// When set, the function returns a type computed by an arbitrary
+    /// sequence of ZIR instructions (e.g., generic container instantiation).
+    /// endFunction will emit a ret_ty body containing these instructions
+    /// plus a break_inline targeting the result instruction.
+    custom_ret_type_body: std.ArrayListUnmanaged(u32) = .empty,
+    custom_ret_type_result: ?u32 = null,
     /// When true, the function has a generic (inferred) return type.
     /// ret_ty = { body_len: 0, is_generic: true } = 0x80000000
     is_generic_return: bool = false,
@@ -2427,6 +2453,15 @@ pub const FuncBody = struct {
         const field_inst = try b.addInst(.field_ptr_load, Builder.encodePlNode(.zero, field_payload_idx));
         self.imported_ret_import_inst = import_inst;
         self.imported_ret_type_inst = field_inst;
+    }
+
+    /// Set the return type from arbitrary ZIR instructions.
+    /// The caller provides instruction indices that compute the type,
+    /// plus the result instruction whose ref is the final type.
+    /// Used for generic container return types like ListOf(T) or MapOf(K,V).
+    pub fn setCustomReturnType(self: *FuncBody, inst_indices: []const u32, result_inst: u32) !void {
+        try self.custom_ret_type_body.appendSlice(self.builder.gpa, inst_indices);
+        self.custom_ret_type_result = result_inst;
     }
 
     /// Emit `return null` — returns null from a function with optional return type.

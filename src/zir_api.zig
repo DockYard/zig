@@ -2491,6 +2491,22 @@ pub export fn zir_builder_emit_optional_type(
     return @intFromEnum(ref);
 }
 
+/// Set the return type from arbitrary ZIR instruction indices.
+/// The instructions compute the type (e.g., via generic container instantiation).
+/// `result_inst` is the instruction index whose ref is the final type.
+/// Returns 0 on success, -1 on error.
+pub export fn zir_builder_set_custom_return_type(
+    handle: ?*ZirBuilderHandle,
+    inst_indices_ptr: [*]const u32,
+    inst_indices_len: u32,
+    result_inst: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    body.setCustomReturnType(inst_indices_ptr[0..inst_indices_len], result_inst) catch return -1;
+    return 0;
+}
+
 /// Emit a short-circuit boolean AND (`bool_br_and`).
 /// If `lhs` is true, evaluates the rhs body and returns its result; otherwise
 /// returns false.
