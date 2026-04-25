@@ -59,7 +59,7 @@ pub const ZirContext = struct {
     is_builder: bool = false,
     /// The entry point function name for builder mode (e.g., "manifest").
     builder_entry: ?[]const u8 = null,
-    /// The module-qualified entry point (e.g., "FooBar__Builder__manifest").
+    /// The struct-qualified entry point (e.g., "FooBar__Builder__manifest").
     builder_entry_mangled: ?[]const u8 = null,
 
     pub fn arena(self: *ZirContext) Allocator {
@@ -260,33 +260,33 @@ pub export fn zir_compilation_print_errors(ctx: *ZirContext) void {
     }, stderr) catch {};
 }
 
-/// Add a named module dependency so the root module can @import it.
+/// Add a named struct dependency so the root can @import it.
 /// `name` is the import name (e.g., "zap_runtime").
 /// `source_path` is the full path to the .zig source file.
 /// Returns 0 on success, -1 on error.
-pub export fn zir_compilation_add_module(
+pub export fn zir_compilation_add_struct(
     ctx: *ZirContext,
     name: [*:0]const u8,
     source_path: [*:0]const u8,
 ) callconv(.c) i32 {
-    addModuleImpl(ctx, mem.sliceTo(name, 0), mem.sliceTo(source_path, 0)) catch return -1;
+    addStructImpl(ctx, mem.sliceTo(name, 0), mem.sliceTo(source_path, 0)) catch return -1;
     return 0;
 }
 
-/// Register a Zig module from an in-memory source buffer instead of a file path.
+/// Register a Zap struct from an in-memory source buffer instead of a file path.
 /// The source is written to a file in the compilation's cache directory,
-/// then registered as a module dependency of the root module.
+/// then registered as a dependency of the root.
 /// `name` is the import name (null-terminated C string).
 /// `source_ptr`/`source_len` is the Zig source code.
 /// Returns 0 on success, -1 on error.
-pub export fn zir_compilation_add_module_source(
+pub export fn zir_compilation_add_struct_source(
     ctx: ?*ZirContext,
     name: [*:0]const u8,
     source_ptr: [*]const u8,
     source_len: u32,
 ) callconv(.c) i32 {
     const c = ctx orelse return -1;
-    addModuleSourceImpl(c, mem.sliceTo(name, 0), source_ptr[0..source_len]) catch return -1;
+    addStructSourceImpl(c, mem.sliceTo(name, 0), source_ptr[0..source_len]) catch return -1;
     return 0;
 }
 
@@ -374,13 +374,13 @@ pub export fn zir_compilation_prepare_update(ctx: ?*ZirContext) callconv(.c) i32
     return 0;
 }
 
-/// Mark a named module's root file as changed for incremental recompilation.
+/// Mark a named struct's root file as changed for incremental recompilation.
 ///
-/// Looks up `name` in the root module's dependencies, finds its root file in
+/// Looks up `name` in the root dependencies, finds its root file in
 /// `module_roots`, and sets `file.module_changed = true`. This tells the
-/// incremental pipeline to invalidate and re-analyze that module.
+/// incremental pipeline to invalidate and re-analyze that struct.
 ///
-/// Returns 0 on success, -1 if the module was not found.
+/// Returns 0 on success, -1 if the struct was not found.
 pub export fn zir_compilation_invalidate_file(ctx: ?*ZirContext, name: [*:0]const u8) callconv(.c) i32 {
     const c = ctx orelse return -1;
     const zcu = c.compilation.zcu orelse return -1;
@@ -400,7 +400,7 @@ pub export fn zir_compilation_invalidate_file(ctx: ?*ZirContext, name: [*:0]cons
 // Internal: compilation creation
 // ---------------------------------------------------------------------------
 
-fn addModuleImpl(ctx: *ZirContext, name: []const u8, source_path: []const u8) !void {
+fn addStructImpl(ctx: *ZirContext, name: []const u8, source_path: []const u8) !void {
     const ar = ctx.arena();
 
     // Separate directory and filename from the source path.
@@ -411,7 +411,7 @@ fn addModuleImpl(ctx: *ZirContext, name: []const u8, source_path: []const u8) !v
     const mod_root = Compilation.Path.fromUnresolved(ar, ctx.dirs, &.{dir_path}) catch
         return error.OutOfMemory;
 
-    // Create the module as a child of the root module (inherits config).
+    // Create the Zig module as a child of the root (inherits config).
     const mod = Package.Module.create(ar, .{
         .paths = .{
             .root = mod_root,
@@ -424,28 +424,28 @@ fn addModuleImpl(ctx: *ZirContext, name: []const u8, source_path: []const u8) !v
         .parent = ctx.root_mod,
     }) catch return error.OutOfMemory;
 
-    // Register as a dependency of the root module.
+    // Register as a dependency of the root.
     const name_duped = try ar.dupe(u8, name);
     try ctx.root_mod.deps.put(ar, name_duped, mod);
 
-    // Share deps bidirectionally: new module gets existing deps, existing modules
-    // get new module. This allows cross-module @import to work between all Zap modules.
+    // Share deps bidirectionally: new struct gets existing deps, existing structs
+    // get new struct. This allows cross-struct @import to work between all Zap structs.
     for (ctx.root_mod.deps.keys(), ctx.root_mod.deps.values()) |dep_name, dep_mod| {
         if (dep_mod != mod) {
-            // Give new module access to existing deps
+            // Give new struct access to existing deps
             mod.deps.put(ar, dep_name, dep_mod) catch {};
-            // Give existing modules access to new module
+            // Give existing structs access to new struct
             dep_mod.deps.put(ar, name_duped, mod) catch {};
         }
     }
 
-    // Register the new module in module_roots so doImport can find its file.
+    // Register the new struct in module_roots so doImport can find its file.
     // We can't re-call populateModuleRootTable because it overwrites existing
-    // entries with undefined values. Instead, manually add just this module.
+    // entries with undefined values. Instead, manually add just this struct.
     const zcu = ctx.compilation.zcu orelse return error.OutOfMemory;
     const gpa = zcu.gpa;
 
-    // Build the path for the new module's source file.
+    // Build the path for the new struct's source file.
     const path = try mod.root.join(gpa, ctx.dirs, mod.root_src_path);
     errdefer path.deinit(gpa);
 
@@ -456,7 +456,7 @@ fn addModuleImpl(ctx: *ZirContext, name: []const u8, source_path: []const u8) !v
         path.deinit(gpa);
         try zcu.module_roots.put(gpa, mod, gop.key_ptr.*.toOptional());
     } else {
-        // Create a new File for this module.
+        // Create a new File for this struct.
         const new_file = try gpa.create(Zcu.File);
         const pt: Zcu.PerThread = .activate(zcu, .main);
         defer pt.deactivate();
@@ -487,7 +487,7 @@ fn addModuleImpl(ctx: *ZirContext, name: []const u8, source_path: []const u8) !v
 
     // Ensure all files in module_roots have sub_file_path set.
     // Files created by populateModuleRootTable leave sub_file_path undefined,
-    // and updateAliveFiles may not run for dynamically-added modules.
+    // and updateAliveFiles may not run for dynamically-added structs.
     for (zcu.module_roots.keys(), zcu.module_roots.values()) |m, opt_file_idx| {
         if (opt_file_idx.unwrap()) |file_idx| {
             const f = zcu.fileByIndex(file_idx);
@@ -501,7 +501,7 @@ fn addModuleImpl(ctx: *ZirContext, name: []const u8, source_path: []const u8) !v
     }
 }
 
-fn addModuleSourceImpl(ctx: *ZirContext, name: []const u8, source: []const u8) !void {
+fn addStructSourceImpl(ctx: *ZirContext, name: []const u8, source: []const u8) !void {
     const ar = ctx.arena();
 
     // Build a path within the local cache directory for the source file.
@@ -514,28 +514,28 @@ fn addModuleSourceImpl(ctx: *ZirContext, name: []const u8, source: []const u8) !
     const io = ctx.io();
     const cwd = Dir.cwd();
     cwd.createDirPath(io, sub_dir) catch |err| {
-        logErr("addModuleSource: createDirPath failed: {s}", .{@errorName(err)});
+        logErr("addStructSource: createDirPath failed: {s}", .{@errorName(err)});
         return error.OutOfMemory;
     };
 
     // Write the source to disk.
     {
         var file = cwd.createFile(io, full_path, .{}) catch |err| {
-            logErr("addModuleSource: createFile failed: {s}", .{@errorName(err)});
+            logErr("addStructSource: createFile failed: {s}", .{@errorName(err)});
             return error.OutOfMemory;
         };
         defer file.close(io);
         file.writeStreamingAll(io, source) catch |err| {
-            logErr("addModuleSource: writeStreaming failed: {s}", .{@errorName(err)});
+            logErr("addStructSource: writeStreaming failed: {s}", .{@errorName(err)});
             return error.OutOfMemory;
         };
     }
 
-    // Null-terminate the strings for the C-ABI add_module path.
+    // Null-terminate the strings for the C-ABI add_struct path.
     const full_path_z = try ar.dupeZ(u8, full_path);
 
-    // Register the module using the existing addModuleImpl.
-    try addModuleImpl(ctx, name, full_path_z);
+    // Register the struct using the existing addStructImpl.
+    try addStructImpl(ctx, name, full_path_z);
 }
 
 fn addLinkLibImpl(ctx: *ZirContext, lib_name: []const u8) !void {
@@ -751,9 +751,9 @@ fn createImpl(
         return error.OutOfMemory;
     };
 
-    // Root module.
+    // Root struct.
     // Write a stub source file to the cwd. The path uses .none root (cwd-relative)
-    // so that module-level imports resolve correctly against the cwd.
+    // so that struct-level imports resolve correctly against the cwd.
     const root_name_z = try ar.dupeZ(u8, root_name_str);
     const stub_dir = try std.fmt.allocPrint(ar, ".zap-cache/{s}.zig", .{root_name_str});
     const stub_src_name = try std.fmt.allocPrint(ar, "{s}.zig", .{root_name_str});
@@ -1009,18 +1009,18 @@ fn addZirImpl(ctx: *ZirContext, name: []const u8, data: *const ZirData) !void {
     }
 }
 
-/// Inject finalized ZIR into a NAMED module (not root).
-/// The module must have been registered via addModuleImpl/addModuleSourceImpl first.
-fn addZirToModuleImpl(ctx: *ZirContext, name: []const u8, data: *const ZirData) !void {
+/// Inject finalized ZIR into a NAMED struct (not root).
+/// The struct must have been registered via addStructImpl/addStructSourceImpl first.
+fn addZirToStructImpl(ctx: *ZirContext, name: []const u8, data: *const ZirData) !void {
     const gpa = ctx.gpa;
     const zcu = ctx.compilation.zcu orelse {
-        logErr("addZirToModule: zcu is null", .{});
+        logErr("addZirToStruct: zcu is null", .{});
         return error.OutOfMemory;
     };
 
-    // Find the named module in root_mod.deps
+    // Find the named struct in root_mod.deps
     const target_mod = ctx.root_mod.deps.get(name) orelse {
-        logErr("addZirToModule: module '{s}' not found in deps", .{name});
+        logErr("addZirToStruct: struct '{s}' not found in deps", .{name});
         return error.OutOfMemory;
     };
 
@@ -1061,7 +1061,7 @@ fn addZirToModuleImpl(ctx: *ZirContext, name: []const u8, data: *const ZirData) 
         .extra = extra,
     };
 
-    // Module stubs always use "comptime {}\n" (not exe mode)
+    // Struct stubs always use "comptime {}\n" (not exe mode)
     if (file.source == null) {
         const stub_source = "comptime {}\n";
         const source = try gpa.allocSentinel(u8, stub_source.len, 0);
@@ -1362,7 +1362,7 @@ pub export fn zir_builder_emit_unreachable(handle: ?*ZirBuilderHandle) callconv(
     return 0;
 }
 
-/// Emit `@import("module_name")`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
+/// Emit `@import("struct_name")`. Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
 pub export fn zir_builder_emit_import(
     handle: ?*ZirBuilderHandle,
     name_ptr: [*]const u8,
@@ -2361,13 +2361,13 @@ pub export fn zir_builder_inject(
     return 0;
 }
 
-/// Inject finalized ZIR into a named module (not root).
-/// The module must have been registered first via zir_compilation_add_module or
-/// zir_compilation_add_module_source. The builder handle is consumed.
-pub export fn zir_builder_inject_module(
+/// Inject finalized ZIR into a named struct (not root).
+/// The struct must have been registered first via zir_compilation_add_struct or
+/// zir_compilation_add_struct_source. The builder handle is consumed.
+pub export fn zir_builder_inject_struct(
     builder_handle: ?*ZirBuilderHandle,
     compilation_handle: ?*ZirContext,
-    module_name: [*:0]const u8,
+    struct_name: [*:0]const u8,
 ) callconv(.c) i32 {
     const b = getBuilder(builder_handle) orelse return -1;
     const ctx = compilation_handle orelse return -1;
@@ -2382,7 +2382,7 @@ pub export fn zir_builder_inject_module(
         .extra = @constCast(fzir.extra.ptr),
         .extra_len = fzir.extra_len,
     };
-    addZirToModuleImpl(ctx, std.mem.sliceTo(module_name, 0), &zir_data) catch return -1;
+    addZirToStructImpl(ctx, std.mem.sliceTo(struct_name, 0), &zir_data) catch return -1;
 
     b.deinit();
     std.heap.page_allocator.destroy(b);
@@ -2442,40 +2442,40 @@ pub export fn zir_builder_get_tuple_ret_type_ref(
     return @intFromEnum(ref);
 }
 
-/// Emit a parameter whose type is @import(module_name).field_name.
+/// Emit a parameter whose type is @import(struct_name).field_name.
 /// Returns the param Ref or 0xFFFFFFFF on error.
 pub export fn zir_builder_emit_param_imported_type(
     handle: ?*ZirBuilderHandle,
     param_name_ptr: [*]const u8,
     param_name_len: u32,
-    module_name_ptr: [*]const u8,
-    module_name_len: u32,
+    struct_name_ptr: [*]const u8,
+    struct_name_len: u32,
     field_name_ptr: [*]const u8,
     field_name_len: u32,
 ) callconv(.c) u32 {
     const b = getBuilder(handle) orelse return 0xFFFFFFFF;
     const body = b.active_body orelse return 0xFFFFFFFF;
     const param_name = param_name_ptr[0..param_name_len];
-    const module_name = module_name_ptr[0..module_name_len];
+    const struct_name = struct_name_ptr[0..struct_name_len];
     const field_name = field_name_ptr[0..field_name_len];
-    const ref = body.addParamImportedType(param_name, module_name, field_name) catch return 0xFFFFFFFF;
+    const ref = body.addParamImportedType(param_name, struct_name, field_name) catch return 0xFFFFFFFF;
     return @intFromEnum(ref);
 }
 
-/// Set the current function's return type to @import(module_name).field_name.
+/// Set the current function's return type to @import(struct_name).field_name.
 /// Must be called after beginFunction and before body instructions.
 pub export fn zir_builder_set_imported_return_type(
     handle: ?*ZirBuilderHandle,
-    module_name_ptr: [*]const u8,
-    module_name_len: u32,
+    struct_name_ptr: [*]const u8,
+    struct_name_len: u32,
     field_name_ptr: [*]const u8,
     field_name_len: u32,
 ) callconv(.c) i32 {
     const b = getBuilder(handle) orelse return -1;
     const body = b.active_body orelse return -1;
-    const module_name = module_name_ptr[0..module_name_len];
+    const struct_name = struct_name_ptr[0..struct_name_len];
     const field_name = field_name_ptr[0..field_name_len];
-    body.setImportedReturnType(module_name, field_name) catch return -1;
+    body.setImportedReturnType(struct_name, field_name) catch return -1;
     return 0;
 }
 
@@ -3216,7 +3216,7 @@ pub export fn zir_builder_emit_has_field(
     return @intFromEnum(ref);
 }
 
-/// Emit a parameter whose type is a named declaration in the current module.
+/// Emit a parameter whose type is a named declaration in the current struct.
 /// Uses decl_val to reference the type (e.g., a struct type).
 /// Returns the param Ref or 0xFFFFFFFF on error.
 pub export fn zir_builder_emit_param_decl_val_type(
@@ -3235,7 +3235,7 @@ pub export fn zir_builder_emit_param_decl_val_type(
     return @intFromEnum(ref);
 }
 
-/// Set the return type to a named type declared in the current module.
+/// Set the return type to a named type declared in the current struct.
 /// Emits a decl_val instruction for the ret_ty body.
 /// Returns 0 on success, -1 on error.
 pub export fn zir_builder_set_decl_val_return_type(
@@ -3249,7 +3249,7 @@ pub export fn zir_builder_set_decl_val_return_type(
     return 0;
 }
 
-/// Add a named struct type declaration to the module.
+/// Add a named struct type declaration to the struct.
 /// Field names, types, and optional defaults are passed as parallel arrays.
 /// Each type is a u32 well-known ZIR Ref (e.g., i64_type).
 /// Each default is a u32 ZIR Ref (0 = no default).
@@ -3363,7 +3363,7 @@ pub export fn zir_builder_add_enum_type(
     return 0;
 }
 
-fn injectModuleZir(ctx: *ZirContext, name: []const u8, fzir: zir_builder.FinalizedZir) !void {
+fn injectStructZir(ctx: *ZirContext, name: []const u8, fzir: zir_builder.FinalizedZir) !void {
     const data = ZirData{
         .instructions_tags = @constCast(fzir.instructions_tags.ptr),
         .instructions_data = @constCast(fzir.instructions_data.ptr),
@@ -3373,7 +3373,7 @@ fn injectModuleZir(ctx: *ZirContext, name: []const u8, fzir: zir_builder.Finaliz
         .extra = @constCast(fzir.extra.ptr),
         .extra_len = fzir.extra_len,
     };
-    try addZirToModuleImpl(ctx, name, &data);
+    try addZirToStructImpl(ctx, name, &data);
 }
 
 fn testRepoLibDir(allocator: Allocator, io: Io) ![]u8 {
@@ -3462,7 +3462,7 @@ test "zir_api: injected executable update succeeds" {
     );
     defer zir_compilation_destroy(ctx);
 
-    try addModuleSourceImpl(ctx, "zap_runtime", "pub fn noop() void {}\n");
+    try addStructSourceImpl(ctx, "zap_runtime", "pub fn noop() void {}\n");
 
     var builder = try zir_builder.Builder.init(allocator);
     defer builder.deinit();
@@ -3533,7 +3533,7 @@ test "zir_api: function value passed as callback argument" {
     defer zir_compilation_destroy(ctx);
 
     // No runtime needed for this test.
-    try addModuleSourceImpl(ctx, "zap_runtime", "pub fn noop() void {}\n");
+    try addStructSourceImpl(ctx, "zap_runtime", "pub fn noop() void {}\n");
 
     var builder = try zir_builder.Builder.init(allocator);
     defer builder.deinit();
@@ -3578,10 +3578,10 @@ test "zir_api: function value passed as callback argument" {
     try std.testing.expectEqual(@as(i32, 0), zir_compilation_update(ctx));
 }
 
-test "zir_api: cross-module callback via anytype" {
-    // Replicates the Zap test failure: Module A has apply(value, callback:anytype),
-    // Module B calls A.apply(41, add_one) where add_one is in Module B.
-    // This tests whether anytype monomorphization works across injected ZIR modules.
+test "zir_api: cross-struct callback via anytype" {
+    // Replicates the Zap test failure: Struct A has apply(value, callback:anytype),
+    // Struct B calls A.apply(41, add_one) where add_one is in Struct B.
+    // This tests whether anytype monomorphization works across injected ZIR structs.
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -3625,9 +3625,9 @@ test "zir_api: cross-module callback via anytype" {
     );
     defer zir_compilation_destroy(ctx);
 
-    try addModuleSourceImpl(ctx, "zap_runtime", "pub fn noop() void {}\n");
+    try addStructSourceImpl(ctx, "zap_runtime", "pub fn noop() void {}\n");
 
-    // --- Module "Helper": has apply(value, callback: anytype) ---
+    // --- Struct "Helper": has apply(value, callback: anytype) ---
     {
         var builder = try zir_builder.Builder.init(allocator);
 
@@ -3639,11 +3639,11 @@ test "zir_api: cross-module callback via anytype" {
         try builder.endFunction(body);
 
         const fzir = try builder.finalize();
-        try injectModuleZir(ctx, "Helper", fzir);
+        try injectStructZir(ctx, "Helper", fzir);
         builder.deinit();
     }
 
-    // --- Root module: calls @import("Helper").apply(41, add_one) ---
+    // --- Root struct: calls @import("Helper").apply(41, add_one) ---
     {
         var builder = try zir_builder.Builder.init(allocator);
 
@@ -3675,7 +3675,7 @@ test "zir_api: cross-module callback via anytype" {
         builder.deinit();
     }
 
-    // If cross-module anytype monomorphization works, this succeeds.
+    // If cross-struct anytype monomorphization works, this succeeds.
     // If it fails, the callback parameter in Helper.apply resolves to void.
     const update_result = zir_compilation_update(ctx);
     if (update_result != 0) {
@@ -3684,9 +3684,9 @@ test "zir_api: cross-module callback via anytype" {
     try std.testing.expectEqual(@as(i32, 0), update_result);
 }
 
-test "zir_api: three-module anytype chain (caller -> wrapper -> inner)" {
+test "zir_api: three-struct anytype chain (caller -> wrapper -> inner)" {
     // Replicates the Zap failure: caller -> Enum.map(callback:anytype) -> runtime.mapFn(callback:anytype)
-    // Three separate ZIR modules where anytype must propagate through two module boundaries.
+    // Three separate ZIR structs where anytype must propagate through two struct boundaries.
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -3730,9 +3730,9 @@ test "zir_api: three-module anytype chain (caller -> wrapper -> inner)" {
     );
     defer zir_compilation_destroy(ctx);
 
-    try addModuleSourceImpl(ctx, "zap_runtime", "pub fn noop() void {}\n");
+    try addStructSourceImpl(ctx, "zap_runtime", "pub fn noop() void {}\n");
 
-    // --- Module "Inner": has invoke(value: i64, callback: anytype) -> i64
+    // --- Struct "Inner": has invoke(value: i64, callback: anytype) -> i64
     {
         var builder = try zir_builder.Builder.init(allocator);
         const body = try builder.beginFunction("invoke", .i64_type);
@@ -3742,11 +3742,11 @@ test "zir_api: three-module anytype chain (caller -> wrapper -> inner)" {
         try body.addRetNode(result);
         try builder.endFunction(body);
         const fzir = try builder.finalize();
-        try injectModuleZir(ctx, "Inner", fzir);
+        try injectStructZir(ctx, "Inner", fzir);
         builder.deinit();
     }
 
-    // --- Module "Wrapper": has wrap(value: i64, callback: anytype) -> i64
+    // --- Struct "Wrapper": has wrap(value: i64, callback: anytype) -> i64
     //     calls @import("Inner").invoke(value, callback)
     {
         var builder = try zir_builder.Builder.init(allocator);
@@ -3760,11 +3760,11 @@ test "zir_api: three-module anytype chain (caller -> wrapper -> inner)" {
         try body.addRetNode(result);
         try builder.endFunction(body);
         const fzir = try builder.finalize();
-        try injectModuleZir(ctx, "Wrapper", fzir);
+        try injectStructZir(ctx, "Wrapper", fzir);
         builder.deinit();
     }
 
-    // --- Root module: calls @import("Wrapper").wrap(41, add_one)
+    // --- Root struct: calls @import("Wrapper").wrap(41, add_one)
     {
         var builder = try zir_builder.Builder.init(allocator);
 

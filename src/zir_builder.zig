@@ -696,9 +696,9 @@ pub const Builder = struct {
         struct_decls_mut.deinit(self.gpa);
     }
 
-    /// Add a named struct type declaration to the module.
+    /// Add a named struct type declaration to the struct.
     /// Emits a struct_decl extended instruction inside a declaration,
-    /// making it a module-level named type. Field types are specified
+    /// making it a struct-level named type. Field types are specified
     /// as well-known ZIR type Refs (e.g., i64_type, bool_type).
     /// Optional field_default_refs provides default values per field
     /// (.none = no default).
@@ -857,9 +857,9 @@ pub const Builder = struct {
         try self.decl_indices.append(self.gpa, decl_inst);
     }
 
-    /// Add a named enum type declaration to the module.
+    /// Add a named enum type declaration to the struct.
     /// Emits an enum_decl extended instruction inside a declaration,
-    /// making it a module-level named type. Variant names are simple
+    /// making it a struct-level named type. Variant names are simple
     /// identifiers (unit variants with no associated data).
     pub fn addEnumTypeDecl(
         self: *Builder,
@@ -997,7 +997,7 @@ pub const FuncBody = struct {
     imported_ret_type_inst: ?u32 = null,
     imported_ret_import_inst: ?u32 = null,
     /// When set, the function returns a type referenced by name within
-    /// the current module (e.g., a struct type declared via addStructTypeDecl).
+    /// the current struct (e.g., a struct type declared via addStructTypeDecl).
     /// endFunction will emit a ret_ty body containing [decl_val, break_inline].
     decl_val_ret_type_inst: ?u32 = null,
     /// When true, the function has a generic (inferred) return type.
@@ -1163,9 +1163,9 @@ pub const FuncBody = struct {
         return self.emitBodyInst(.bool_not, Builder.encodeUnNode(.zero, operand));
     }
 
-    /// Add a parameter whose type is @import(module_name).field_name.
+    /// Add a parameter whose type is @import(struct_name).field_name.
     /// The type body contains [import, field_ptr_load, break_inline].
-    pub fn addParamImportedType(self: *FuncBody, name: []const u8, module_name: []const u8, field_name: []const u8) !Zir.Inst.Ref {
+    pub fn addParamImportedType(self: *FuncBody, name: []const u8, struct_name: []const u8, field_name: []const u8) !Zir.Inst.Ref {
         const b = self.builder;
         const name_idx = try b.internString(name);
 
@@ -1174,7 +1174,7 @@ pub const FuncBody = struct {
         const param_inst_idx: u32 = @intCast(b.tags.items.len + 3);
 
         // 1. Emit import instruction
-        const path_idx = try b.internString(module_name);
+        const path_idx = try b.internString(struct_name);
         const import_payload_idx: u32 = @intCast(b.extra.items.len);
         try b.extra.append(b.gpa, @intFromEnum(Zir.Inst.Ref.none));
         try b.extra.append(b.gpa, path_idx);
@@ -1211,7 +1211,7 @@ pub const FuncBody = struct {
         return Builder.instRef(idx);
     }
 
-    /// Emit a parameter whose type is a named declaration in the current module.
+    /// Emit a parameter whose type is a named declaration in the current struct.
     /// Uses `decl_val` to reference the type by name (e.g., a struct type).
     pub fn addParamDeclValType(self: *FuncBody, param_name: []const u8, type_name: []const u8) !Zir.Inst.Ref {
         const b = self.builder;
@@ -1290,10 +1290,10 @@ pub const FuncBody = struct {
         return self.emitBodyInst(.typeof, Builder.encodeUnNode(.zero, operand));
     }
 
-    /// Emit `@import("module_name")`. Returns a Ref to the imported module.
+    /// Emit `@import("struct_name")`. Returns a Ref to the imported struct.
     /// Uses the `.import` instruction with `.pl_tok` data and `Import` payload.
-    pub fn addImport(self: *FuncBody, module_name: []const u8) !Zir.Inst.Ref {
-        const path_idx = try self.builder.internString(module_name);
+    pub fn addImport(self: *FuncBody, struct_name: []const u8) !Zir.Inst.Ref {
+        const path_idx = try self.builder.internString(struct_name);
         // Import payload in extra: { res_ty: Ref, path: NullTerminatedString }
         const payload_idx: u32 = @intCast(self.builder.extra.items.len);
         try self.builder.extra.append(self.builder.gpa, @intFromEnum(Zir.Inst.Ref.none)); // res_ty = .none
@@ -2005,7 +2005,7 @@ pub const FuncBody = struct {
     /// Set a tuple return type from element type Refs.
     /// Emits a `tuple_decl` extended instruction in the declaration value body
     /// and stores its Ref for use by `endFunction`.
-    /// Set the function return type to a named type declared in the current module.
+    /// Set the function return type to a named type declared in the current struct.
     /// Emits a `decl_val` instruction referencing the type by name.
     pub fn setDeclValReturnType(self: *FuncBody, type_name: []const u8) !void {
         const b = self.builder;
@@ -2408,12 +2408,12 @@ pub const FuncBody = struct {
         self.error_union_ret_type_inst = opt_type_inst;
     }
 
-    /// Set the return type to @import(module_name).field_name.
+    /// Set the return type to @import(struct_name).field_name.
     /// Used for list types: @import("zap_runtime").ListType.
-    pub fn setImportedReturnType(self: *FuncBody, module_name: []const u8, field_name: []const u8) !void {
+    pub fn setImportedReturnType(self: *FuncBody, struct_name: []const u8, field_name: []const u8) !void {
         const b = self.builder;
-        // Emit @import(module_name)
-        const path_idx = try b.internString(module_name);
+        // Emit @import(struct_name)
+        const path_idx = try b.internString(struct_name);
         const import_payload_idx: u32 = @intCast(b.extra.items.len);
         try b.extra.append(b.gpa, @intFromEnum(Zir.Inst.Ref.none));
         try b.extra.append(b.gpa, path_idx);

@@ -14,8 +14,8 @@ comptime {
     _ = &api.zir_compilation_update;
     _ = &api.zir_compilation_destroy;
     _ = &api.zir_compilation_print_errors;
-    _ = &api.zir_compilation_add_module;
-    _ = &api.zir_compilation_add_module_source;
+    _ = &api.zir_compilation_add_struct;
+    _ = &api.zir_compilation_add_struct_source;
     _ = &api.zir_compilation_set_builder_entry;
     _ = &api.zir_compilation_add_link_lib;
     _ = &api.zir_builder_create;
@@ -92,7 +92,7 @@ comptime {
     _ = &api.zir_builder_emit_tuple_decl;
     _ = &api.zir_builder_emit_tuple_decl_body;
     _ = &api.zir_builder_inject;
-    _ = &api.zir_builder_inject_module;
+    _ = &api.zir_builder_inject_struct;
     _ = &api.zir_builder_emit_bool_br_and;
     _ = &api.zir_builder_emit_bool_br_or;
     _ = &api.zir_builder_emit_alloc;
