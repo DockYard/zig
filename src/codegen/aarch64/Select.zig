@@ -12199,12 +12199,23 @@ pub const CallAbiIterator = struct {
                                 next_field_end = next_field_begin + field_ty.abiSize(zcu);
                                 break :next_field_begin next_field_begin;
                             } else std.mem.alignForward(u64, size, 8);
+                            // Cap each part at 8 bytes and emit multiple
+                            // 8-byte parts when a single field spans
+                            // more than one register slot. The previous
+                            // `field_end - part_offset` (uncapped)
+                            // produced `parts_len = 1, part_size = 16`
+                            // for a 16-byte struct holding a single
+                            // 16-byte field, tripping the
+                            // `parts_len == 2` assertion below. Mirrors
+                            // the partitioning logic in the
+                            // `.tuple_type` arm.
                             while (next_field_begin - part_offset >= 8) {
-                                const part_size = field_end - part_offset;
+                                const part_size = @min(field_end - part_offset, 8);
                                 part_sizes[parts_len] = part_size;
                                 assert(part_offset + part_size <= size);
                                 parts_len += 1;
-                                part_offset = next_field_begin;
+                                part_offset += part_size;
+                                if (part_offset >= field_end) part_offset = next_field_begin;
                             }
                         }
                         assert(parts_len == part_sizes.len);
