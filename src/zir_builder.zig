@@ -41,6 +41,15 @@ pub const Builder = struct {
     struct_scope_names: [8]?[]const u8 = [_]?[]const u8{null} ** 8,
     struct_scope_depth: u32 = 0,
 
+    /// Field information for the file's root struct_decl.
+    /// When `root_fields_len > 0`, finalize() emits the root struct_decl
+    /// with both decls and fields (small = has_decls_len | has_fields_len).
+    /// The names slice and each name within it are Builder-owned (duped from
+    /// the caller's input by setRootFields), as is the type-refs slice.
+    root_field_names: ?[]const []const u8 = null,
+    root_field_type_refs: ?[]const Zir.Inst.Ref = null,
+    root_fields_len: u32 = 0,
+
     pub fn init(gpa: Allocator) !Builder {
         var self = Builder{
             .gpa = gpa,
@@ -79,11 +88,73 @@ pub const Builder = struct {
         for (&self.struct_scope_stack) |*buf| {
             buf.deinit(self.gpa);
         }
+        if (self.root_field_names) |names| {
+            for (names) |name| self.gpa.free(name);
+            self.gpa.free(names);
+            self.root_field_names = null;
+        }
+        if (self.root_field_type_refs) |refs| {
+            self.gpa.free(refs);
+            self.root_field_type_refs = null;
+        }
         if (self.active_body) |body| {
             body.body_inst_indices.deinit(self.gpa);
             body.param_inst_indices.deinit(self.gpa);
             self.gpa.destroy(body);
         }
+    }
+
+    /// Configure the file's root struct_decl with fields. After this is
+    /// called, finalize() emits the root struct_decl with both decls and
+    /// fields (small = has_decls_len | has_fields_len). When this is not
+    /// called (or `field_names.len == 0`), finalize() preserves the
+    /// pre-existing decls-only behavior.
+    ///
+    /// The provided `field_names` slice and the strings inside it are
+    /// duplicated into Builder-owned storage; the caller may free its
+    /// inputs immediately after this call.
+    pub fn setRootFields(
+        self: *Builder,
+        field_names: []const []const u8,
+        field_type_refs: []const Zir.Inst.Ref,
+    ) !void {
+        std.debug.assert(field_names.len == field_type_refs.len);
+
+        // Free any previously-set root fields so this is idempotent.
+        if (self.root_field_names) |old_names| {
+            for (old_names) |name| self.gpa.free(name);
+            self.gpa.free(old_names);
+            self.root_field_names = null;
+        }
+        if (self.root_field_type_refs) |old_refs| {
+            self.gpa.free(old_refs);
+            self.root_field_type_refs = null;
+        }
+        self.root_fields_len = 0;
+
+        if (field_names.len == 0) return;
+
+        const names_copy = try self.gpa.alloc([]const u8, field_names.len);
+        errdefer self.gpa.free(names_copy);
+
+        // Track how many name strings we've successfully duped so a partial
+        // failure can clean up without leaking.
+        var duped: usize = 0;
+        errdefer {
+            var i: usize = 0;
+            while (i < duped) : (i += 1) self.gpa.free(names_copy[i]);
+        }
+        for (field_names, 0..) |name, i| {
+            names_copy[i] = try self.gpa.dupe(u8, name);
+            duped = i + 1;
+        }
+
+        const refs_copy = try self.gpa.dupe(Zir.Inst.Ref, field_type_refs);
+        errdefer self.gpa.free(refs_copy);
+
+        self.root_field_names = names_copy;
+        self.root_field_type_refs = refs_copy;
+        self.root_fields_len = @intCast(field_names.len);
     }
 
     /// Intern a null-terminated string in string_bytes. Returns the index.
@@ -191,6 +262,16 @@ pub const Builder = struct {
 
             const eu_ref = instRef(eu_inst_idx);
             _ = try self.addInst(.break_inline, encodeBreak(eu_ref, brk_payload_idx));
+        } else if (body.optional_ret_type_inst) |opt_inst_idx| {
+            ret_break_inline_idx = @intCast(self.tags.items.len);
+            const func_inst_predicted: u32 = ret_break_inline_idx + 1;
+
+            const brk_payload_idx: u32 = @intCast(self.extra.items.len);
+            try self.extra.append(self.gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+            try self.extra.append(self.gpa, func_inst_predicted);
+
+            const opt_ref = instRef(opt_inst_idx);
+            _ = try self.addInst(.break_inline, encodeBreak(opt_ref, brk_payload_idx));
         } else if (body.imported_ret_type_inst) |imported_inst_idx| {
             ret_break_inline_idx = @intCast(self.tags.items.len);
             const func_inst_predicted: u32 = ret_break_inline_idx + 1;
@@ -262,6 +343,9 @@ pub const Builder = struct {
         } else if (body.error_union_ret_type_inst != null) {
             // ret_ty body has 2 instructions: [error_union_type, break_inline(func, error_union_type)]
             try self.extra.append(self.gpa, 2);
+        } else if (body.optional_ret_type_inst != null) {
+            // ret_ty body has 2 instructions: [optional_type, break_inline(func, optional_type)]
+            try self.extra.append(self.gpa, 2);
         } else if (body.imported_ret_type_inst != null) {
             // ret_ty body has 3 instructions: [import, field_ptr_load, break_inline]
             try self.extra.append(self.gpa, 3);
@@ -293,6 +377,9 @@ pub const Builder = struct {
         if (body.error_union_ret_type_inst) |eu_inst_idx| {
             // ret_ty body: [error_union_type instruction, break_inline instruction]
             try self.extra.append(self.gpa, eu_inst_idx);
+            try self.extra.append(self.gpa, ret_break_inline_idx);
+        } else if (body.optional_ret_type_inst) |opt_inst_idx| {
+            try self.extra.append(self.gpa, opt_inst_idx);
             try self.extra.append(self.gpa, ret_break_inline_idx);
         } else if (body.imported_ret_type_inst) |imported_inst_idx| {
             // ret_ty body: [import, field_ptr_load, break_inline]
@@ -404,7 +491,44 @@ pub const Builder = struct {
     }
 
     /// Finalize the ZIR. Builds the root struct_decl and returns the result.
+    ///
+    /// When `setRootFields` has been called with a non-empty list, the root
+    /// struct_decl is emitted with both decls and fields (small =
+    /// has_decls_len | has_fields_len), mirroring the encoding produced by
+    /// `endStructDecl` for nested struct types. Otherwise the legacy
+    /// decls-only encoding is preserved unchanged.
     pub fn finalize(self: *Builder) !FinalizedZir {
+        const has_root_fields = self.root_fields_len > 0;
+
+        // The root struct_decl always lives at instruction index 0 (the
+        // placeholder reserved in init()). When emitting fields, we first
+        // need to emit one break_inline per field type referencing the
+        // struct_decl as the block target. Per the StructDecl encoding,
+        // each field's type is a body of length 1 — a single break_inline
+        // whose operand is the field type Ref and whose block_inst is the
+        // struct_decl instruction (index 0).
+        var root_field_type_insts: std.ArrayListUnmanaged(u32) = .empty;
+        defer root_field_type_insts.deinit(self.gpa);
+
+        if (has_root_fields) {
+            const type_refs = self.root_field_type_refs.?;
+            try root_field_type_insts.ensureTotalCapacity(self.gpa, type_refs.len);
+
+            for (type_refs) |type_ref| {
+                const brk_payload_idx: u32 = @intCast(self.extra.items.len);
+                // Break payload: { operand_src_node: none, block_inst }
+                try self.extra.append(self.gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+                // block_inst = 0 (the root struct_decl placeholder).
+                try self.extra.append(self.gpa, 0);
+
+                const brk_inst = try self.addInst(
+                    .break_inline,
+                    encodeBreak(type_ref, brk_payload_idx),
+                );
+                root_field_type_insts.appendAssumeCapacity(brk_inst);
+            }
+        }
+
         // Build StructDecl payload in extra
         const struct_payload_idx: u32 = @intCast(self.extra.items.len);
 
@@ -420,17 +544,54 @@ pub const Builder = struct {
         // src_node (Ast.Node.Index)
         try self.extra.append(self.gpa, 0);
 
-        // Trailing for has_decls_len:
-        // decls_len
-        try self.extra.append(self.gpa, @as(u32, @intCast(self.decl_indices.items.len)));
+        // Trailing lengths follow the bit order of StructDecl.Small:
+        // bit 0: has_captures_len (not used here)
+        // bit 1: has_decls_len -> decls_len
+        // bit 2: has_fields_len -> fields_len (only when has_root_fields)
+        const decls_len: u32 = @intCast(self.decl_indices.items.len);
+        try self.extra.append(self.gpa, decls_len);
+        if (has_root_fields) {
+            try self.extra.append(self.gpa, self.root_fields_len);
+        }
+
+        // Trailing data (matches getStructDecl in lib/std/zig/Zir.zig):
+        //   captures, capture_names, decls, field_names,
+        //   field_type_body_lens, field_align_body_lens,
+        //   field_default_body_lens, field_comptime_bits,
+        //   backing_int_type_body, field_bodies
 
         // decl indices
         for (self.decl_indices.items) |decl_idx| {
             try self.extra.append(self.gpa, decl_idx);
         }
 
-        // Fix up instruction 0 (struct_decl) with real extended data
-        const small: u16 = 0x0002; // StructDecl.Small with has_decls_len = true (bit 1 in 0.16)
+        if (has_root_fields) {
+            const field_names = self.root_field_names.?;
+
+            // field names (interned StringId u32 each)
+            for (field_names) |fname| {
+                const name_idx = try self.internString(fname);
+                try self.extra.append(self.gpa, name_idx);
+            }
+
+            // field type body lengths (one per field; each body is a single
+            // break_inline instruction).
+            for (0..self.root_fields_len) |_| {
+                try self.extra.append(self.gpa, 1);
+            }
+
+            // field bodies — one break_inline inst index per field.
+            // The break payloads were already written with block_inst = 0
+            // above, so no fixup is required (struct_decl_idx is always 0
+            // for the root).
+            for (root_field_type_insts.items) |brk_inst| {
+                try self.extra.append(self.gpa, brk_inst);
+            }
+        }
+
+        // Fix up instruction 0 (struct_decl) with real extended data.
+        // has_decls_len = 0x0002 (bit 1), has_fields_len = 0x0004 (bit 2).
+        const small: u16 = if (has_root_fields) 0x0002 | 0x0004 else 0x0002;
         self.data.items[0] = encodeExtended(
             @intFromEnum(Zir.Inst.Extended.struct_decl),
             small,
@@ -1013,6 +1174,12 @@ pub const FuncBody = struct {
     /// endFunction will emit a ret_ty body containing the error_union_type
     /// instruction and a break_inline.
     error_union_ret_type_inst: ?u32 = null,
+    /// When set, the function returns an optional type (?T).
+    /// endFunction will emit a ret_ty body containing the optional_type
+    /// instruction and a break_inline. Distinct from error_union_ret_type_inst
+    /// so that `error!?T` and `?error!T` can be expressed independently
+    /// (the previous code aliased both to the same field).
+    optional_ret_type_inst: ?u32 = null,
     /// When set, the function returns a type resolved via @import + field access.
     /// endFunction will emit a ret_ty body containing [import, field_ptr_load, break_inline].
     imported_ret_type_inst: ?u32 = null,
@@ -1229,6 +1396,97 @@ pub const FuncBody = struct {
         try b.extra.append(b.gpa, 3); // body_len=3, is_generic=false
         try b.extra.append(b.gpa, import_inst);
         try b.extra.append(b.gpa, field_inst);
+        try b.extra.append(b.gpa, break_idx);
+
+        const idx = try b.addInst(.param, Builder.encodePlTok(.zero, payload_idx));
+        std.debug.assert(idx == param_inst_idx);
+
+        try self.param_inst_indices.append(b.gpa, idx);
+        return Builder.instRef(idx);
+    }
+
+    /// Emit a parameter whose type is the root struct of an imported file
+    /// — i.e. `@import(import_name)` directly, with no field access. Used
+    /// when the imported file IS the type (Zig stdlib's `Uri.zig`,
+    /// `Build.zig` pattern). The import + break_inline are emitted INSIDE
+    /// the param's type body so Sema's body-walker registers the import
+    /// in `inst_map` before the break tries to resolve it.
+    ///
+    /// Mirrors `addParamImportedType` minus the `field_ptr_load` step;
+    /// the return is the param Ref, identical in shape to that path.
+    pub fn addParamImportedRootType(self: *FuncBody, name: []const u8, import_name: []const u8) !Zir.Inst.Ref {
+        const b = self.builder;
+        const name_idx = try b.internString(name);
+
+        // Pre-compute the param instruction index: it follows 2 instructions
+        // (import, break_inline)
+        const param_inst_idx: u32 = @intCast(b.tags.items.len + 2);
+
+        // 1. Emit import instruction
+        const path_idx = try b.internString(import_name);
+        const import_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, @intFromEnum(Zir.Inst.Ref.none));
+        try b.extra.append(b.gpa, path_idx);
+        const import_inst = try b.addInst(.import, Builder.encodePlTok(.zero, import_payload_idx));
+        const import_ref = Builder.instRef(import_inst);
+
+        // 2. Emit break_inline directly with import_ref — file IS the struct
+        const break_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+        try b.extra.append(b.gpa, param_inst_idx);
+        const break_idx = try b.addInst(.break_inline, Builder.encodeBreak(import_ref, break_payload_idx));
+
+        // Param payload
+        const payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, name_idx);
+        try b.extra.append(b.gpa, 2); // body_len=2, is_generic=false
+        try b.extra.append(b.gpa, import_inst);
+        try b.extra.append(b.gpa, break_idx);
+
+        const idx = try b.addInst(.param, Builder.encodePlTok(.zero, payload_idx));
+        std.debug.assert(idx == param_inst_idx);
+
+        try self.param_inst_indices.append(b.gpa, idx);
+        return Builder.instRef(idx);
+    }
+
+    /// Emit a parameter whose type is the current file's root struct —
+    /// i.e. `@This()`, with no field access. Used when a Zap struct's
+    /// own method takes its enclosing struct as a parameter (the file
+    /// IS the struct, so a self-reference is just `@This()`). Self
+    /// `@import` doesn't work — Zig's build module system rejects
+    /// "no module named X available within module X" — so the
+    /// canonical Zig idiom is `@This()`.
+    ///
+    /// The `@This()` + break_inline land INSIDE the param's type body
+    /// so Sema's body-walker resolves the break operand against an
+    /// inst it actually walked.
+    pub fn addParamThisType(self: *FuncBody, name: []const u8) !Zir.Inst.Ref {
+        const b = self.builder;
+        const name_idx = try b.internString(name);
+
+        // Pre-compute the param instruction index: it follows 2 instructions
+        // (this, break_inline)
+        const param_inst_idx: u32 = @intCast(b.tags.items.len + 2);
+
+        // 1. Emit `@This()` extended instruction
+        const this_inst = try b.addInst(
+            .extended,
+            Builder.encodeExtended(@intFromEnum(Zir.Inst.Extended.this), 0, 0),
+        );
+        const this_ref = Builder.instRef(this_inst);
+
+        // 2. Emit break_inline returning @This()
+        const break_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+        try b.extra.append(b.gpa, param_inst_idx);
+        const break_idx = try b.addInst(.break_inline, Builder.encodeBreak(this_ref, break_payload_idx));
+
+        // Param payload
+        const payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, name_idx);
+        try b.extra.append(b.gpa, 2); // body_len=2, is_generic=false
+        try b.extra.append(b.gpa, this_inst);
         try b.extra.append(b.gpa, break_idx);
 
         const idx = try b.addInst(.param, Builder.encodePlTok(.zero, payload_idx));
@@ -2035,6 +2293,7 @@ pub const FuncBody = struct {
     /// Set the function return type to a named type declared in the current struct.
     /// Emits a `decl_val` instruction referencing the type by name.
     pub fn setDeclValReturnType(self: *FuncBody, type_name: []const u8) !void {
+        self.clearReturnTypeState();
         const b = self.builder;
         const name_idx = try b.internString(type_name);
         const decl_val_idx = try b.addInst(.decl_val, Builder.encodeStrTok(name_idx, .zero));
@@ -2042,6 +2301,7 @@ pub const FuncBody = struct {
     }
 
     pub fn setTupleReturnType(self: *FuncBody, types: []const Zir.Inst.Ref) !void {
+        self.clearReturnTypeState();
         const b = self.builder;
         const fields_len: u16 = @intCast(types.len);
 
@@ -2072,6 +2332,51 @@ pub const FuncBody = struct {
         self.tuple_ret_type_inst = tuple_decl_idx;
 
         // Store element types for addStructInitTyped to re-emit tuple_decl in function body
+        self.tuple_element_type_refs.clearRetainingCapacity();
+        try self.tuple_element_type_refs.appendSlice(b.gpa, types);
+    }
+
+    /// Like `setTupleReturnType`, but also moves a set of supporting
+    /// instructions into the ret_ty body. Used when tuple element types
+    /// are complex (struct_ref, map, list, nested tuple) and require
+    /// supporting `import` / `field_val` / `call_ref` / `typeof`
+    /// instructions to construct the type ref. Without this, those
+    /// supporting instructions live in the function body while the
+    /// tuple_decl lives in the ret_ty body — and Sema's `resolveInst`
+    /// for the tuple_decl's operands hits a null `inst_map` entry.
+    pub fn setTupleReturnTypeWithBody(
+        self: *FuncBody,
+        support_inst_indices: []const u32,
+        types: []const Zir.Inst.Ref,
+    ) !void {
+        self.clearReturnTypeState();
+        const b = self.builder;
+        const fields_len: u16 = @intCast(types.len);
+
+        const tuple_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, 0); // src_node = 0
+        for (types) |elem_type| {
+            try b.extra.append(b.gpa, @intFromEnum(elem_type));
+            try b.extra.append(b.gpa, @intFromEnum(Zir.Inst.Ref.none));
+        }
+
+        const tuple_decl_idx = try b.addInst(
+            .extended,
+            Builder.encodeExtended(@intFromEnum(Zir.Inst.Extended.tuple_decl), fields_len, tuple_payload_idx),
+        );
+
+        // Route through the custom_ret_type machinery so endFunction emits
+        // the supporting instructions plus the tuple_decl as the ret_ty
+        // body (instead of the tuple_decl alone).
+        try self.custom_ret_type_body.appendSlice(b.gpa, support_inst_indices);
+        try self.custom_ret_type_body.append(b.gpa, tuple_decl_idx);
+        self.custom_ret_type_result = tuple_decl_idx;
+
+        // Mirror the tuple_ret_types/tuple_element_type_refs bookkeeping so
+        // call sites that introspect the tuple return type via
+        // `zir_builder_get_tuple_return_type` keep working.
+        self.tuple_ret_types.clearRetainingCapacity();
+        try self.tuple_ret_types.append(b.gpa, Builder.instRef(tuple_decl_idx));
         self.tuple_element_type_refs.clearRetainingCapacity();
         try self.tuple_element_type_refs.appendSlice(b.gpa, types);
     }
@@ -2245,6 +2550,7 @@ pub const FuncBody = struct {
     ///     [field_data...]          per field: name + conditional type/align/tag
     pub fn setUnionReturnType(self: *FuncBody, variant_names: []const []const u8, variant_types: []const Zir.Inst.Ref) !void {
         std.debug.assert(variant_names.len == variant_types.len);
+        self.clearReturnTypeState();
         const b = self.builder;
         const fields_len: u32 = @intCast(variant_names.len);
 
@@ -2425,19 +2731,41 @@ pub const FuncBody = struct {
 
     /// Mark this function as returning an optional type: `?T`
     /// where T is the current ret_type. Emits an optional_type instruction
-    /// and stores it for the ret_ty body.
+    /// and stores it in `optional_ret_type_inst` so it can be combined with
+    /// other return-shape setters without aliasing.
     pub fn setOptionalReturnType(self: *FuncBody) !void {
+        self.clearReturnTypeState();
         const b = self.builder;
         const payload_type_ref: Zir.Inst.Ref = @enumFromInt(@intFromEnum(self.ret_type));
-
-        // Emit optional_type instruction: .optional_type uses .un_node data
         const opt_type_inst = try b.addInst(.optional_type, Builder.encodeUnNode(.zero, payload_type_ref));
-        self.error_union_ret_type_inst = opt_type_inst;
+        self.optional_ret_type_inst = opt_type_inst;
+    }
+
+    /// Reset every "return type shape" field on this FuncBody so a new
+    /// setter call doesn't silently coexist with an earlier one. Each
+    /// public set*ReturnType entry point calls this before recording its
+    /// own state — the previous code left earlier setters' fields populated
+    /// and relied on `endFunction`'s if-else dispatch order to pick a
+    /// winner, which silently dropped subsequent setter intent.
+    pub fn clearReturnTypeState(self: *FuncBody) void {
+        self.tuple_ret_types.clearRetainingCapacity();
+        self.tuple_element_type_refs.clearRetainingCapacity();
+        self.tuple_ret_type_inst = null;
+        self.union_ret_type_inst = null;
+        self.error_union_ret_type_inst = null;
+        self.optional_ret_type_inst = null;
+        self.imported_ret_type_inst = null;
+        self.imported_ret_import_inst = null;
+        self.decl_val_ret_type_inst = null;
+        self.custom_ret_type_body.clearRetainingCapacity();
+        self.custom_ret_type_result = null;
+        self.is_generic_return = false;
     }
 
     /// Set the return type to @import(struct_name).field_name.
     /// Used for list types: @import("zap_runtime").ListType.
     pub fn setImportedReturnType(self: *FuncBody, struct_name: []const u8, field_name: []const u8) !void {
+        self.clearReturnTypeState();
         const b = self.builder;
         // Emit @import(struct_name)
         const path_idx = try b.internString(struct_name);
@@ -2456,11 +2784,47 @@ pub const FuncBody = struct {
         self.imported_ret_type_inst = field_inst;
     }
 
+    /// Set the return type to the root struct of an imported file —
+    /// `@import(import_name)` directly, with no field access. The
+    /// imported file IS the type (file-IS-the-struct emission model).
+    /// Mirrors `setImportedReturnType` minus the `field_ptr_load`
+    /// step.
+    pub fn setImportedRootReturnType(self: *FuncBody, import_name: []const u8) !void {
+        self.clearReturnTypeState();
+        const b = self.builder;
+        const path_idx = try b.internString(import_name);
+        const import_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, @intFromEnum(Zir.Inst.Ref.none));
+        try b.extra.append(b.gpa, path_idx);
+        const import_inst = try b.addInst(.import, Builder.encodePlTok(.zero, import_payload_idx));
+        // Use the import directly as the return type — no field access.
+        // The downstream ret_ty body emission expects
+        // `imported_ret_type_inst` to be the inst whose Ref IS the type.
+        self.imported_ret_import_inst = import_inst;
+        self.imported_ret_type_inst = import_inst;
+    }
+
+    /// Set the return type to `@This()` — a self-reference to the
+    /// current file's root struct. `@import(self)` is rejected by
+    /// Zig's build module system, so methods that return their own
+    /// enclosing struct must use `@This()` for the return type.
+    pub fn setThisReturnType(self: *FuncBody) !void {
+        self.clearReturnTypeState();
+        const b = self.builder;
+        const this_inst = try b.addInst(
+            .extended,
+            Builder.encodeExtended(@intFromEnum(Zir.Inst.Extended.this), 0, 0),
+        );
+        self.imported_ret_import_inst = this_inst;
+        self.imported_ret_type_inst = this_inst;
+    }
+
     /// Set the return type from arbitrary ZIR instructions.
     /// The caller provides instruction indices that compute the type,
     /// plus the result instruction whose ref is the final type.
     /// Used for generic container return types like ListOf(T) or MapOf(K,V).
     pub fn setCustomReturnType(self: *FuncBody, inst_indices: []const u32, result_inst: u32) !void {
+        self.clearReturnTypeState();
         try self.custom_ret_type_body.appendSlice(self.builder.gpa, inst_indices);
         self.custom_ret_type_result = result_inst;
     }
@@ -2477,6 +2841,7 @@ pub const FuncBody = struct {
     /// Must be called after beginFunction but before any body instructions
     /// that depend on the return type.
     pub fn setErrorUnionReturnType(self: *FuncBody, _: []const u8) !void {
+        self.clearReturnTypeState();
         const b = self.builder;
         const gpa = b.gpa;
 

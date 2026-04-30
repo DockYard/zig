@@ -488,14 +488,21 @@ fn addStructImpl(ctx: *ZirContext, name: []const u8, source_path: []const u8) !v
     // Ensure all files in module_roots have sub_file_path set.
     // Files created by populateModuleRootTable leave sub_file_path undefined,
     // and updateAliveFiles may not run for dynamically-added structs.
+    //
+    // Per Zcu.zig, `sub_file_path` is documented as `undefined` when
+    // `mod == null`. We use `mod == null` as the explicit sentinel
+    // rather than reading the undefined slice — the previous code
+    // pattern-matched against the debug allocator's fill bytes
+    // (0x5555…/0xaaaa…), which is only well-defined under that one
+    // allocator configuration. Any other allocator (e.g. release
+    // builds, third-party allocators) would leave non-sentinel garbage
+    // and silently skip the back-fill, leaving the file unusable.
     for (zcu.module_roots.keys(), zcu.module_roots.values()) |m, opt_file_idx| {
         if (opt_file_idx.unwrap()) |file_idx| {
             const f = zcu.fileByIndex(file_idx);
-            // Check if sub_file_path is undefined (pointer is sentinel value)
-            const ptr_val = @intFromPtr(f.sub_file_path.ptr);
-            if (ptr_val == 0 or ptr_val == 0x5555555555555555 or ptr_val == 0xaaaaaaaaaaaaaaaa) {
+            if (f.mod == null) {
                 f.sub_file_path = m.root_src_path;
-                if (f.mod == null) f.mod = m;
+                f.mod = m;
             }
         }
     }
@@ -506,7 +513,7 @@ fn addStructSourceImpl(ctx: *ZirContext, name: []const u8, source: []const u8) !
 
     // Build a path within the local cache directory for the source file.
     const cache_path = ctx.dirs.local_cache.path orelse return error.OutOfMemory;
-    const sub_dir = try std.fmt.allocPrint(ar, "{s}/zap_modules", .{cache_path});
+    const sub_dir = try std.fmt.allocPrint(ar, "{s}/zap_structs", .{cache_path});
     const file_name = try std.fmt.allocPrint(ar, "{s}.zig", .{name});
     const full_path = try std.fmt.allocPrint(ar, "{s}/{s}", .{ sub_dir, file_name });
 
@@ -1110,6 +1117,49 @@ pub export fn zir_builder_destroy(handle: ?*ZirBuilderHandle) callconv(.c) void 
     const b = getBuilder(handle) orelse return;
     b.deinit();
     std.heap.page_allocator.destroy(b);
+}
+
+/// Configure fields on the file's root struct_decl.
+///
+/// `name_ptrs[i]` / `name_lens[i]` describe the i-th field's name as a
+/// non-null-terminated UTF-8 byte slice. `type_refs[i]` is the
+/// `@intFromEnum(Zir.Inst.Ref)` of the field's type (e.g. `i64_type`,
+/// or a Ref produced by another builder helper).
+///
+/// All input arrays must have at least `count` elements. The strings and
+/// arrays referenced here are duplicated into builder-owned storage; the
+/// caller may free its inputs immediately after this call.
+///
+/// Calling this with `count == 0` clears any previously configured root
+/// fields and restores the legacy decls-only encoding for the root
+/// struct_decl.
+///
+/// Returns 0 on success, -1 on error.
+pub export fn zir_builder_set_root_fields(
+    handle: ?*ZirBuilderHandle,
+    name_ptrs: [*]const [*]const u8,
+    name_lens: [*]const u32,
+    type_refs: [*]const u32,
+    count: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const gpa = b.gpa;
+
+    if (count == 0) {
+        b.setRootFields(&.{}, &.{}) catch return -1;
+        return 0;
+    }
+
+    const names = gpa.alloc([]const u8, count) catch return -1;
+    defer gpa.free(names);
+    for (0..count) |i| names[i] = name_ptrs[i][0..name_lens[i]];
+
+    const refs = gpa.alloc(Zir.Inst.Ref, count) catch return -1;
+    defer gpa.free(refs);
+    for (0..count) |i| refs[i] = @enumFromInt(type_refs[i]);
+
+    b.setRootFields(names, refs) catch return -1;
+    return 0;
 }
 
 /// Begin a function declaration.
@@ -1807,6 +1857,26 @@ pub export fn zir_builder_emit_cond_branch_with_bodies(
     return 0;
 }
 
+/// Return the number of instruction indices currently tracked on the active
+/// body. Pairs with `zir_builder_pop_body_inst` to let callers capture a
+/// range of instructions (call get_body_inst_count → emit some instructions
+/// → call get_body_inst_count again → pop the difference). Used by the Zap
+/// frontend to harvest the supporting type-construction instructions for a
+/// tuple return type so they can be moved into the function's ret_ty body
+/// instead of leaking into the declaration body.
+pub export fn zir_builder_get_body_inst_count(
+    handle: ?*ZirBuilderHandle,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0;
+    const body = b.active_body orelse return 0;
+    if (body.body_tracking) {
+        return @intCast(body.body_inst_indices.items.len);
+    } else if (body.non_body_capture) |capture| {
+        return @intCast(capture.items.len);
+    }
+    return 0;
+}
+
 /// Pop the last instruction index from the active instruction list and return it.
 /// When body_tracking is active, pops from body_inst_indices.
 /// When inside a capture (body_tracking off), pops from the active capture buffer.
@@ -1904,18 +1974,22 @@ pub export fn zir_builder_emit_err_union_payload_unsafe(
 /// Emit `@setRuntimeSafety(enabled)` — controls whether safety checks
 /// (overflow, bounds, null) are active in the current scope.
 /// Pass bool_true (0x34) for enabled, bool_false (0x35) for disabled.
+/// Returns `true` on success, `false` if the builder is unavailable or
+/// the instruction failed to emit. (Previously returned u32 with sentinel
+/// 0xFFFFFFFF for error, which masqueraded as a Zir.Inst.Ref index and
+/// silently broke callers that checked `>= 0`.)
 pub export fn zir_builder_emit_set_runtime_safety(
     handle: ?*ZirBuilderHandle,
     enabled: u32,
-) callconv(.c) u32 {
-    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
-    const body = b.active_body orelse return 0xFFFFFFFF;
+) callconv(.c) bool {
+    const b = getBuilder(handle) orelse return false;
+    const body = b.active_body orelse return false;
     const enabled_ref: Zir.Inst.Ref = @enumFromInt(enabled);
     _ = body.emitBodyInst(.set_runtime_safety, .{ .un_node = .{
         .src_node = .zero,
         .operand = enabled_ref,
-    } }) catch return 0xFFFFFFFF;
-    return 0;
+    } }) catch return false;
+    return true;
 }
 
 /// Emit an inline if-else expression using block_inline/condbr_inline.
@@ -2015,6 +2089,7 @@ pub export fn zir_builder_set_generic_return_type(
 ) callconv(.c) i32 {
     const b = getBuilder(handle) orelse return -1;
     const body = b.active_body orelse return -1;
+    body.clearReturnTypeState();
     body.is_generic_return = true;
     return 0;
 }
@@ -2100,6 +2175,49 @@ pub export fn zir_builder_emit_tuple_decl(
     return @intFromEnum(zir_builder.Builder.instRef(idx));
 }
 
+/// Emit a tuple_decl WITHOUT appending to any tracked body list. Used by
+/// the Zap frontend when constructing nested tuple element types for a
+/// return type — the resulting Ref is referenced from a higher-level
+/// `tuple_decl` (or supporting-instruction list) that the caller routes
+/// into the ret_ty body via `zir_builder_set_tuple_return_type_with_body`.
+/// Without this untracked path, the inner tuple_decl ends up in
+/// `param_inst_indices` and Sema's generic param-type resolver hits an
+/// `unreachable` because the param body now has a `.extended` instruction
+/// where it expects only `.param*` tags.
+pub export fn zir_builder_emit_tuple_decl_untracked(
+    handle: ?*ZirBuilderHandle,
+    types_ptr: [*]const u32,
+    types_len: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const gpa = b.gpa;
+
+    const fields_len: u16 = @intCast(types_len);
+    const tuple_payload_idx: u32 = @intCast(b.extra.items.len);
+    b.extra.append(gpa, 0) catch return 0xFFFFFFFF; // src_node
+    for (0..types_len) |i| {
+        b.extra.append(gpa, types_ptr[i]) catch return 0xFFFFFFFF;
+        b.extra.append(gpa, @intFromEnum(Zir.Inst.Ref.none)) catch return 0xFFFFFFFF;
+    }
+    const idx = b.addInst(
+        .extended,
+        zir_builder.Builder.encodeExtended(@intFromEnum(Zir.Inst.Extended.tuple_decl), fields_len, tuple_payload_idx),
+    ) catch return 0xFFFFFFFF;
+
+    return @intFromEnum(zir_builder.Builder.instRef(idx));
+}
+
+/// Get the raw instruction index from a Ref returned by an `emit_*_untracked`
+/// function. Lets the frontend collect raw indices for `support_inst_indices`
+/// without re-implementing the Ref→index mapping.
+pub export fn zir_builder_ref_to_inst_index(_: ?*ZirBuilderHandle, ref: u32) callconv(.c) u32 {
+    // Refs above the first-non-builtin threshold encode `inst_index +
+    // first_inst_ref`. Use the same conversion as Builder.refToInstIndex.
+    const r: Zir.Inst.Ref = @enumFromInt(ref);
+    if (r.toIndex()) |i| return @intFromEnum(i);
+    return 0xFFFFFFFF;
+}
+
 /// Emit a tuple_decl as a function BODY instruction and return its Ref.
 /// Used to create body-local tuple types for nested struct_init_typed.
 pub export fn zir_builder_emit_tuple_decl_body(
@@ -2165,6 +2283,35 @@ pub export fn zir_builder_set_tuple_return_type(
     }
 
     body.setTupleReturnType(refs) catch return -1;
+    return 0;
+}
+
+/// Set a tuple return type with supporting instructions in the ret_ty body.
+/// `inst_indices_ptr` lists the raw instruction indices that compute the
+/// tuple's element type refs (e.g. `import` / `field_val` / `call_ref` /
+/// `typeof` chains for `struct_ref` / `map` / `list` / nested-tuple
+/// elements). Those instructions must already exist in the active body —
+/// the caller is expected to capture them via
+/// `zir_builder_get_body_inst_count` + `zir_builder_pop_body_inst`.
+/// Returns 0 on success, -1 on error.
+pub export fn zir_builder_set_tuple_return_type_with_body(
+    handle: ?*ZirBuilderHandle,
+    inst_indices_ptr: [*]const u32,
+    inst_indices_len: u32,
+    types_ptr: [*]const u32,
+    types_len: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    const gpa = b.gpa;
+
+    const refs = gpa.alloc(Zir.Inst.Ref, types_len) catch return -1;
+    defer gpa.free(refs);
+    for (0..types_len) |i| {
+        refs[i] = @enumFromInt(types_ptr[i]);
+    }
+
+    body.setTupleReturnTypeWithBody(inst_indices_ptr[0..inst_indices_len], refs) catch return -1;
     return 0;
 }
 
@@ -2460,6 +2607,70 @@ pub export fn zir_builder_emit_param_imported_type(
     const field_name = field_name_ptr[0..field_name_len];
     const ref = body.addParamImportedType(param_name, struct_name, field_name) catch return 0xFFFFFFFF;
     return @intFromEnum(ref);
+}
+
+/// Emit a parameter whose type is the root struct of an imported file —
+/// `@import(import_name)` directly, with no nested decl access. The
+/// import + break_inline land INSIDE the param's type body so Sema can
+/// resolve the break operand against an inst it actually walked.
+/// Required for the file-IS-the-struct emission model where the file
+/// itself is the canonical type (matches Zig stdlib's `Uri.zig` /
+/// `Build.zig` pattern).
+pub export fn zir_builder_emit_param_imported_root_type(
+    handle: ?*ZirBuilderHandle,
+    param_name_ptr: [*]const u8,
+    param_name_len: u32,
+    import_name_ptr: [*]const u8,
+    import_name_len: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const param_name = param_name_ptr[0..param_name_len];
+    const import_name = import_name_ptr[0..import_name_len];
+    const ref = body.addParamImportedRootType(param_name, import_name) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit a parameter whose type is `@This()` — a self-reference to the
+/// current file's root struct. Used when a method declared inside a
+/// Zap struct takes that struct as a parameter; the file IS the
+/// struct, and `@import(self)` is rejected by Zig's build module
+/// system, so `@This()` is the canonical self-reference.
+pub export fn zir_builder_emit_param_this_type(
+    handle: ?*ZirBuilderHandle,
+    param_name_ptr: [*]const u8,
+    param_name_len: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const param_name = param_name_ptr[0..param_name_len];
+    const ref = body.addParamThisType(param_name) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Set the function's return type to `@import(import_name)` — the
+/// imported file's root struct directly, with no field access. The
+/// file-IS-the-struct counterpart of `set_imported_return_type`.
+pub export fn zir_builder_set_imported_root_return_type(
+    handle: ?*ZirBuilderHandle,
+    import_name_ptr: [*]const u8,
+    import_name_len: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    const import_name = import_name_ptr[0..import_name_len];
+    body.setImportedRootReturnType(import_name) catch return -1;
+    return 0;
+}
+
+/// Set the function's return type to `@This()` — a self-reference
+/// to the current file's root struct. Used when a method returns
+/// its own enclosing Zap struct.
+pub export fn zir_builder_set_this_return_type(handle: ?*ZirBuilderHandle) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    body.setThisReturnType() catch return -1;
+    return 0;
 }
 
 /// Set the current function's return type to @import(struct_name).field_name.

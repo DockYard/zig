@@ -20,6 +20,7 @@ comptime {
     _ = &api.zir_compilation_add_link_lib;
     _ = &api.zir_builder_create;
     _ = &api.zir_builder_destroy;
+    _ = &api.zir_builder_set_root_fields;
     _ = &api.zir_builder_begin_func;
     _ = &api.zir_builder_end_func;
     _ = &api.zir_builder_emit_param;
@@ -89,6 +90,10 @@ comptime {
     _ = &api.zir_builder_set_imported_return_type;
     _ = &api.zir_builder_set_custom_return_type;
     _ = &api.zir_builder_emit_param_imported_type;
+    _ = &api.zir_builder_emit_param_imported_root_type;
+    _ = &api.zir_builder_emit_param_this_type;
+    _ = &api.zir_builder_set_imported_root_return_type;
+    _ = &api.zir_builder_set_this_return_type;
     _ = &api.zir_builder_get_union_ret_type_ref;
     _ = &api.zir_builder_emit_tuple_decl;
     _ = &api.zir_builder_emit_tuple_decl_body;

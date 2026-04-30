@@ -2995,7 +2995,7 @@ fn getCaptures(
                     sema.code.nullTerminatedString(str),
                     .no_embedded_nulls,
                 );
-                const nav = try sema.lookupIdentifier(block, decl_name);
+                const nav = try sema.lookupIdentifier(block, type_src, decl_name);
                 break :capture .wrap(.{ .nav_val = nav });
             },
             .decl_ref => |str| capture: {
@@ -3006,7 +3006,7 @@ fn getCaptures(
                     sema.code.nullTerminatedString(str),
                     .no_embedded_nulls,
                 );
-                const nav = try sema.lookupIdentifier(block, decl_name);
+                const nav = try sema.lookupIdentifier(block, type_src, decl_name);
                 break :capture InternPool.CaptureValue.wrap(.{ .nav_ref = nav });
             },
         };
@@ -6052,7 +6052,7 @@ fn zirDeclRef(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Air
         inst_data.get(sema.code),
         .no_embedded_nulls,
     );
-    const nav_index = try sema.lookupIdentifier(block, decl_name);
+    const nav_index = try sema.lookupIdentifier(block, src, decl_name);
     return sema.analyzeNavRef(block, src, nav_index);
 }
 
@@ -6072,11 +6072,11 @@ fn zirDeclVal(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Air
         inst_data.get(sema.code),
         .no_embedded_nulls,
     );
-    const nav = try sema.lookupIdentifier(block, decl_name);
+    const nav = try sema.lookupIdentifier(block, src, decl_name);
     return sema.analyzeNavVal(block, src, nav);
 }
 
-fn lookupIdentifier(sema: *Sema, block: *Block, name: InternPool.NullTerminatedString) !InternPool.Nav.Index {
+fn lookupIdentifier(sema: *Sema, block: *Block, src: LazySrcLoc, name: InternPool.NullTerminatedString) !InternPool.Nav.Index {
     const pt = sema.pt;
     const zcu = pt.zcu;
     var namespace = block.namespace;
@@ -6089,8 +6089,9 @@ fn lookupIdentifier(sema: *Sema, block: *Block, name: InternPool.NullTerminatedS
     }
     // AstGen normally detects undeclared identifiers, but externally-injected ZIR
     // (from the Zap compiler) may reference names not present in the current namespace.
-    // Return a compile error instead of crashing.
-    return sema.fail(block, block.nodeOffset(@enumFromInt(0)), "use of undeclared identifier '{f}'", .{name.fmt(&zcu.intern_pool)});
+    // Surface a compile error pinned to the *real* call site so users see the
+    // line/col of the referenced identifier instead of "0:0".
+    return sema.fail(block, src, "use of undeclared identifier '{f}'", .{name.fmt(&zcu.intern_pool)});
 }
 
 /// This looks up a member of a specific namespace.
