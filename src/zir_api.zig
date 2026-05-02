@@ -773,41 +773,41 @@ fn createImpl(
         "comptime {}\n"
     else if (output_mode_enum == .Exe)
         "const std = @import(\"std\");\n" ++
-        "pub const std_options_debug_threaded_io: ?*std.Io.Threaded = null;\n" ++
-        "pub const std_options_debug_io: std.Io = std.Io.failing;\n" ++
-        "pub const panic = struct {\n" ++
-        "    pub fn call(msg: []const u8, _: ?usize) noreturn {\n" ++
-        "        _ = std.c.write(2, msg.ptr, msg.len);\n" ++
-        "        _ = std.c.write(2, \"\\n\", 1);\n" ++
-        "        @trap();\n" ++
-        "    }\n" ++
-        "    pub fn sentinelMismatch(_: anytype, _: anytype) noreturn { @trap(); }\n" ++
-        "    pub fn unwrapError(_: anyerror) noreturn { @trap(); }\n" ++
-        "    pub fn outOfBounds(_: usize, _: usize) noreturn { @trap(); }\n" ++
-        "    pub fn startGreaterThanEnd(_: usize, _: usize) noreturn { @trap(); }\n" ++
-        "    pub fn inactiveUnionField(_: anytype, _: anytype) noreturn { @trap(); }\n" ++
-        "    pub fn sliceCastLenRemainder(_: usize) noreturn { @trap(); }\n" ++
-        "    pub fn reachedUnreachable() noreturn { @trap(); }\n" ++
-        "    pub fn unwrapNull() noreturn { @trap(); }\n" ++
-        "    pub fn castToNull() noreturn { @trap(); }\n" ++
-        "    pub fn incorrectAlignment() noreturn { @trap(); }\n" ++
-        "    pub fn invalidErrorCode() noreturn { @trap(); }\n" ++
-        "    pub fn integerOutOfBounds() noreturn { @trap(); }\n" ++
-        "    pub fn integerOverflow() noreturn { @trap(); }\n" ++
-        "    pub fn shlOverflow() noreturn { @trap(); }\n" ++
-        "    pub fn shrOverflow() noreturn { @trap(); }\n" ++
-        "    pub fn divideByZero() noreturn { @trap(); }\n" ++
-        "    pub fn exactDivisionRemainder() noreturn { @trap(); }\n" ++
-        "    pub fn integerPartOutOfBounds() noreturn { @trap(); }\n" ++
-        "    pub fn corruptSwitch() noreturn { @trap(); }\n" ++
-        "    pub fn shiftRhsTooBig() noreturn { @trap(); }\n" ++
-        "    pub fn invalidEnumValue() noreturn { @trap(); }\n" ++
-        "    pub fn forLenMismatch() noreturn { @trap(); }\n" ++
-        "    pub fn copyLenMismatch() noreturn { @trap(); }\n" ++
-        "    pub fn memcpyAlias() noreturn { @trap(); }\n" ++
-        "    pub fn noreturnReturned() noreturn { @trap(); }\n" ++
-        "};\n" ++
-        "pub fn main() void {}\n"
+            "pub const std_options_debug_threaded_io: ?*std.Io.Threaded = null;\n" ++
+            "pub const std_options_debug_io: std.Io = std.Io.failing;\n" ++
+            "pub const panic = struct {\n" ++
+            "    pub fn call(msg: []const u8, _: ?usize) noreturn {\n" ++
+            "        _ = std.c.write(2, msg.ptr, msg.len);\n" ++
+            "        _ = std.c.write(2, \"\\n\", 1);\n" ++
+            "        @trap();\n" ++
+            "    }\n" ++
+            "    pub fn sentinelMismatch(_: anytype, _: anytype) noreturn { @trap(); }\n" ++
+            "    pub fn unwrapError(_: anyerror) noreturn { @trap(); }\n" ++
+            "    pub fn outOfBounds(_: usize, _: usize) noreturn { @trap(); }\n" ++
+            "    pub fn startGreaterThanEnd(_: usize, _: usize) noreturn { @trap(); }\n" ++
+            "    pub fn inactiveUnionField(_: anytype, _: anytype) noreturn { @trap(); }\n" ++
+            "    pub fn sliceCastLenRemainder(_: usize) noreturn { @trap(); }\n" ++
+            "    pub fn reachedUnreachable() noreturn { @trap(); }\n" ++
+            "    pub fn unwrapNull() noreturn { @trap(); }\n" ++
+            "    pub fn castToNull() noreturn { @trap(); }\n" ++
+            "    pub fn incorrectAlignment() noreturn { @trap(); }\n" ++
+            "    pub fn invalidErrorCode() noreturn { @trap(); }\n" ++
+            "    pub fn integerOutOfBounds() noreturn { @trap(); }\n" ++
+            "    pub fn integerOverflow() noreturn { @trap(); }\n" ++
+            "    pub fn shlOverflow() noreturn { @trap(); }\n" ++
+            "    pub fn shrOverflow() noreturn { @trap(); }\n" ++
+            "    pub fn divideByZero() noreturn { @trap(); }\n" ++
+            "    pub fn exactDivisionRemainder() noreturn { @trap(); }\n" ++
+            "    pub fn integerPartOutOfBounds() noreturn { @trap(); }\n" ++
+            "    pub fn corruptSwitch() noreturn { @trap(); }\n" ++
+            "    pub fn shiftRhsTooBig() noreturn { @trap(); }\n" ++
+            "    pub fn invalidEnumValue() noreturn { @trap(); }\n" ++
+            "    pub fn forLenMismatch() noreturn { @trap(); }\n" ++
+            "    pub fn copyLenMismatch() noreturn { @trap(); }\n" ++
+            "    pub fn memcpyAlias() noreturn { @trap(); }\n" ++
+            "    pub fn noreturnReturned() noreturn { @trap(); }\n" ++
+            "};\n" ++
+            "pub fn main() void {}\n"
     else
         "comptime {}\n";
     cwd.createDirPath(io, stub_dir) catch {};
@@ -957,41 +957,41 @@ fn addZirImpl(ctx: *ZirContext, name: []const u8, data: *const ZirData) !void {
             "comptime {}\n"
         else if (ctx.output_mode == .Exe)
             "const std = @import(\"std\");\n" ++
-            "pub const std_options_debug_threaded_io: ?*std.Io.Threaded = null;\n" ++
-            "pub const std_options_debug_io: std.Io = std.Io.failing;\n" ++
-            "pub const panic = struct {\n" ++
-            "    pub fn call(msg: []const u8, _: ?usize) noreturn {\n" ++
-            "        _ = std.c.write(2, msg.ptr, msg.len);\n" ++
-            "        _ = std.c.write(2, \"\\n\", 1);\n" ++
-            "        @trap();\n" ++
-            "    }\n" ++
-            "    pub fn sentinelMismatch(_: anytype, _: anytype) noreturn { @trap(); }\n" ++
-            "    pub fn unwrapError(_: anyerror) noreturn { @trap(); }\n" ++
-            "    pub fn outOfBounds(_: usize, _: usize) noreturn { @trap(); }\n" ++
-            "    pub fn startGreaterThanEnd(_: usize, _: usize) noreturn { @trap(); }\n" ++
-            "    pub fn inactiveUnionField(_: anytype, _: anytype) noreturn { @trap(); }\n" ++
-            "    pub fn sliceCastLenRemainder(_: usize) noreturn { @trap(); }\n" ++
-            "    pub fn reachedUnreachable() noreturn { @trap(); }\n" ++
-            "    pub fn unwrapNull() noreturn { @trap(); }\n" ++
-            "    pub fn castToNull() noreturn { @trap(); }\n" ++
-            "    pub fn incorrectAlignment() noreturn { @trap(); }\n" ++
-            "    pub fn invalidErrorCode() noreturn { @trap(); }\n" ++
-            "    pub fn integerOutOfBounds() noreturn { @trap(); }\n" ++
-            "    pub fn integerOverflow() noreturn { @trap(); }\n" ++
-            "    pub fn shlOverflow() noreturn { @trap(); }\n" ++
-            "    pub fn shrOverflow() noreturn { @trap(); }\n" ++
-            "    pub fn divideByZero() noreturn { @trap(); }\n" ++
-            "    pub fn exactDivisionRemainder() noreturn { @trap(); }\n" ++
-            "    pub fn integerPartOutOfBounds() noreturn { @trap(); }\n" ++
-            "    pub fn corruptSwitch() noreturn { @trap(); }\n" ++
-            "    pub fn shiftRhsTooBig() noreturn { @trap(); }\n" ++
-            "    pub fn invalidEnumValue() noreturn { @trap(); }\n" ++
-            "    pub fn forLenMismatch() noreturn { @trap(); }\n" ++
-            "    pub fn copyLenMismatch() noreturn { @trap(); }\n" ++
-            "    pub fn memcpyAlias() noreturn { @trap(); }\n" ++
-            "    pub fn noreturnReturned() noreturn { @trap(); }\n" ++
-            "};\n" ++
-            "pub fn main() void {}\n"
+                "pub const std_options_debug_threaded_io: ?*std.Io.Threaded = null;\n" ++
+                "pub const std_options_debug_io: std.Io = std.Io.failing;\n" ++
+                "pub const panic = struct {\n" ++
+                "    pub fn call(msg: []const u8, _: ?usize) noreturn {\n" ++
+                "        _ = std.c.write(2, msg.ptr, msg.len);\n" ++
+                "        _ = std.c.write(2, \"\\n\", 1);\n" ++
+                "        @trap();\n" ++
+                "    }\n" ++
+                "    pub fn sentinelMismatch(_: anytype, _: anytype) noreturn { @trap(); }\n" ++
+                "    pub fn unwrapError(_: anyerror) noreturn { @trap(); }\n" ++
+                "    pub fn outOfBounds(_: usize, _: usize) noreturn { @trap(); }\n" ++
+                "    pub fn startGreaterThanEnd(_: usize, _: usize) noreturn { @trap(); }\n" ++
+                "    pub fn inactiveUnionField(_: anytype, _: anytype) noreturn { @trap(); }\n" ++
+                "    pub fn sliceCastLenRemainder(_: usize) noreturn { @trap(); }\n" ++
+                "    pub fn reachedUnreachable() noreturn { @trap(); }\n" ++
+                "    pub fn unwrapNull() noreturn { @trap(); }\n" ++
+                "    pub fn castToNull() noreturn { @trap(); }\n" ++
+                "    pub fn incorrectAlignment() noreturn { @trap(); }\n" ++
+                "    pub fn invalidErrorCode() noreturn { @trap(); }\n" ++
+                "    pub fn integerOutOfBounds() noreturn { @trap(); }\n" ++
+                "    pub fn integerOverflow() noreturn { @trap(); }\n" ++
+                "    pub fn shlOverflow() noreturn { @trap(); }\n" ++
+                "    pub fn shrOverflow() noreturn { @trap(); }\n" ++
+                "    pub fn divideByZero() noreturn { @trap(); }\n" ++
+                "    pub fn exactDivisionRemainder() noreturn { @trap(); }\n" ++
+                "    pub fn integerPartOutOfBounds() noreturn { @trap(); }\n" ++
+                "    pub fn corruptSwitch() noreturn { @trap(); }\n" ++
+                "    pub fn shiftRhsTooBig() noreturn { @trap(); }\n" ++
+                "    pub fn invalidEnumValue() noreturn { @trap(); }\n" ++
+                "    pub fn forLenMismatch() noreturn { @trap(); }\n" ++
+                "    pub fn copyLenMismatch() noreturn { @trap(); }\n" ++
+                "    pub fn memcpyAlias() noreturn { @trap(); }\n" ++
+                "    pub fn noreturnReturned() noreturn { @trap(); }\n" ++
+                "};\n" ++
+                "pub fn main() void {}\n"
         else
             "comptime {}\n";
         const source = try gpa.allocSentinel(u8, stub_source.len, 0);
@@ -2648,6 +2648,18 @@ pub export fn zir_builder_emit_param_this_type(
     return @intFromEnum(ref);
 }
 
+/// Emit a type ref for `@This()`.
+///
+/// Use this when a self type appears inside another type expression
+/// that is already being emitted into the correct body, for example a
+/// tuple return element.
+pub export fn zir_builder_emit_this_type(handle: ?*ZirBuilderHandle) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const ref = body.addThisTypeRef() catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
 /// Set the function's return type to `@import(import_name)` — the
 /// imported file's root struct directly, with no field access. The
 /// file-IS-the-struct counterpart of `set_imported_return_type`.
@@ -3458,6 +3470,28 @@ pub export fn zir_builder_emit_param_decl_val_type(
     const ref = body.addParamDeclValType(
         param_name_ptr[0..param_name_len],
         type_name_ptr[0..type_name_len],
+    ) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit a parameter whose type is resolved by an inline type body.
+/// `type_body_inst_indices` are raw instruction indices that must all be
+/// included in the parameter type body before the final break_inline.
+pub export fn zir_builder_emit_param_type_body(
+    handle: ?*ZirBuilderHandle,
+    param_name_ptr: [*]const u8,
+    param_name_len: u32,
+    type_body_inst_indices_ptr: [*]const u32,
+    type_body_inst_indices_len: u32,
+    type_result: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const type_body_inst_indices = type_body_inst_indices_ptr[0..type_body_inst_indices_len];
+    const ref = body.addParamTypeBody(
+        param_name_ptr[0..param_name_len],
+        type_body_inst_indices,
+        @enumFromInt(type_result),
     ) catch return 0xFFFFFFFF;
     return @intFromEnum(ref);
 }

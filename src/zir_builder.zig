@@ -1496,6 +1496,21 @@ pub const FuncBody = struct {
         return Builder.instRef(idx);
     }
 
+    /// Emit a type ref for `@This()`.
+    ///
+    /// This is needed when a self type appears inside a larger type
+    /// expression, such as an element of a tuple return type. Parameter
+    /// and direct return types have dedicated helpers because their ZIR
+    /// instructions must live inside special param/ret_ty bodies; callers
+    /// of this helper are responsible for moving the emitted instruction
+    /// into the enclosing body when required.
+    pub fn addThisTypeRef(self: *FuncBody) !Zir.Inst.Ref {
+        return try self.emitBodyInst(
+            .extended,
+            Builder.encodeExtended(@intFromEnum(Zir.Inst.Extended.this), 0, 0),
+        );
+    }
+
     /// Emit a parameter whose type is a named declaration in the current struct.
     /// Uses `decl_val` to reference the type by name (e.g., a struct type).
     pub fn addParamDeclValType(self: *FuncBody, param_name: []const u8, type_name: []const u8) !Zir.Inst.Ref {
@@ -1521,6 +1536,40 @@ pub const FuncBody = struct {
         try b.extra.append(b.gpa, param_name_idx);
         try b.extra.append(b.gpa, 2); // body_len=2, is_generic=false
         try b.extra.append(b.gpa, decl_val_inst);
+        try b.extra.append(b.gpa, break_idx);
+
+        const idx = try b.addInst(.param, Builder.encodePlTok(.zero, payload_idx));
+        std.debug.assert(idx == param_inst_idx);
+
+        try self.param_inst_indices.append(b.gpa, idx);
+        return Builder.instRef(idx);
+    }
+
+    /// Emit a parameter whose type is produced by a caller-supplied inline
+    /// type body. The body must include every instruction needed to resolve
+    /// `type_result` so Sema can analyze the parameter type in isolation.
+    pub fn addParamTypeBody(
+        self: *FuncBody,
+        param_name: []const u8,
+        type_body_inst_indices: []const u32,
+        type_result: Zir.Inst.Ref,
+    ) !Zir.Inst.Ref {
+        const b = self.builder;
+        const param_name_idx = try b.internString(param_name);
+
+        const param_inst_idx: u32 = @intCast(b.tags.items.len + 1);
+
+        const break_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+        try b.extra.append(b.gpa, param_inst_idx);
+        const break_idx = try b.addInst(.break_inline, Builder.encodeBreak(type_result, break_payload_idx));
+
+        const payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, param_name_idx);
+        try b.extra.append(b.gpa, @intCast(type_body_inst_indices.len + 1));
+        for (type_body_inst_indices) |inst_idx| {
+            try b.extra.append(b.gpa, inst_idx);
+        }
         try b.extra.append(b.gpa, break_idx);
 
         const idx = try b.addInst(.param, Builder.encodePlTok(.zero, payload_idx));

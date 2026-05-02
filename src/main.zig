@@ -92,6 +92,8 @@ comptime {
     _ = &api.zir_builder_emit_param_imported_type;
     _ = &api.zir_builder_emit_param_imported_root_type;
     _ = &api.zir_builder_emit_param_this_type;
+    _ = &api.zir_builder_emit_this_type;
+    _ = &api.zir_builder_emit_param_type_body;
     _ = &api.zir_builder_set_imported_root_return_type;
     _ = &api.zir_builder_set_this_return_type;
     _ = &api.zir_builder_get_union_ret_type_ref;
