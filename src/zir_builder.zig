@@ -1239,6 +1239,22 @@ pub const FuncBody = struct {
         }
     }
 
+    /// Emit a body-tracked instruction and return its raw u32 index.
+    /// Used by callers that need to record the instruction index in
+    /// `extra` payloads (for example `struct_init_field_type`, which
+    /// the surrounding `struct_init` references by index, not by
+    /// `Zir.Inst.Ref`). Identical body/capture handling to
+    /// `emitBodyInst` — the only difference is the return type.
+    fn emitBodyInstIdx(self: *FuncBody, tag: Zir.Inst.Tag, inst_data: Zir.Inst.Data) !u32 {
+        const idx = try self.builder.addInst(tag, inst_data);
+        if (self.body_tracking) {
+            try self.body_inst_indices.append(self.builder.gpa, idx);
+        } else if (self.non_body_capture) |capture| {
+            try capture.append(self.builder.gpa, idx);
+        }
+        return idx;
+    }
+
     /// Add an integer literal instruction. Returns a Ref to the result.
     pub fn addInt(self: *FuncBody, value: i64) !Zir.Inst.Ref {
         return self.emitBodyInst(.int, Builder.encodeInt(@bitCast(value)));
@@ -2291,6 +2307,21 @@ pub const FuncBody = struct {
     /// Emit a struct_init for a known tuple type.
     /// Emits a tuple_decl INSIDE the function body so Sema can resolve it,
     /// then uses struct_init with struct_init_field_type to create a typed init.
+    ///
+    /// Each `struct_init_field_type` instruction MUST be appended to the
+    /// surrounding body's tracked instruction list (or the active capture
+    /// list) the same way `validate_struct_init_result_ty` and the
+    /// final `struct_init` are. Callers in the Zap frontend may invoke
+    /// this from inside a `beginCapture` region — for instance, the
+    /// body of a guard-clause arm in a multi-clause function. If the
+    /// per-field type instructions are emitted via raw `addInst` and
+    /// only the surrounding `struct_init` is tracked, the captured
+    /// body Sema later analyzes references field-type instructions
+    /// that aren't visible from its scope, causing the frontend to
+    /// fall back to `struct_init_anon` and silently downgrade the
+    /// nominal type to an anonymous tuple. Use the body-tracking
+    /// helper here so all four instruction kinds participate in the
+    /// same body / capture list.
     pub fn addStructInitTyped(
         self: *FuncBody,
         struct_type: Zir.Inst.Ref,
@@ -2311,7 +2342,9 @@ pub const FuncBody = struct {
         // validate_struct_init_result_ty with the body-local tuple type
         try self.emitBodyInstVoid(.validate_struct_init_result_ty, Builder.encodeUnNode(.zero, body_tuple_ref));
 
-        // struct_init_field_type per field
+        // struct_init_field_type per field — body-tracked so it
+        // travels with the surrounding `struct_init` into captured
+        // bodies (multi-clause dispatch arms, guard blocks, etc.).
         var field_type_indices = std.ArrayListUnmanaged(u32).empty;
         defer field_type_indices.deinit(gpa);
         for (field_names) |name| {
@@ -2319,7 +2352,7 @@ pub const FuncBody = struct {
             const ft_payload_idx: u32 = @intCast(b.extra.items.len);
             try b.extra.append(gpa, @intFromEnum(body_tuple_ref));
             try b.extra.append(gpa, name_idx);
-            const ft_idx = try b.addInst(.struct_init_field_type, Builder.encodePlNode(.zero, ft_payload_idx));
+            const ft_idx = try self.emitBodyInstIdx(.struct_init_field_type, Builder.encodePlNode(.zero, ft_payload_idx));
             try field_type_indices.append(gpa, ft_idx);
         }
 
