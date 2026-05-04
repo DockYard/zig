@@ -42,13 +42,32 @@ pub const Builder = struct {
     struct_scope_depth: u32 = 0,
 
     /// Field information for the file's root struct_decl.
-    /// When `root_fields_len > 0`, finalize() emits the root struct_decl
+    /// When `root_fields.items.len > 0`, finalize() emits the root struct_decl
     /// with both decls and fields (small = has_decls_len | has_fields_len).
-    /// The names slice and each name within it are Builder-owned (duped from
-    /// the caller's input by setRootFields), as is the type-refs slice.
-    root_field_names: ?[]const []const u8 = null,
-    root_field_type_refs: ?[]const Zir.Inst.Ref = null,
-    root_fields_len: u32 = 0,
+    ///
+    /// Each entry's `body` distinguishes the two cases the field type body
+    /// can take:
+    ///
+    /// - `.static_ref`: the type is a primitive named ref (`i64_type`,
+    ///   `bool_type`, etc.). finalize() emits a 1-instruction
+    ///   `break_inline operand=ref` body. Identical to the pre-streaming
+    ///   `setRootFields(refs)` behavior.
+    ///
+    /// - `.recorded`: the type was built by recording instructions into a
+    ///   transient `FuncBody` between `beginRootFieldBody` and
+    ///   `endRootFieldBody`. finalize() emits a `break_inline operand=
+    ///   final_ref` and writes a per-field body of length
+    ///   `recorded.instructions.len + 1` whose trailer is
+    ///   `[recorded.instructions..., break_inline_idx]`. Sema processes
+    ///   the recorded instructions in order in the struct_decl's scope,
+    ///   which is exactly the file's root namespace — so `decl_val "Body"`,
+    ///   `call ListOf(Tree)`, etc. resolve correctly.
+    ///
+    /// Both name strings and the `recorded.instructions` slice are
+    /// Builder-owned and freed in `deinit`. The `RootField` type
+    /// definition lives outside `Builder` (see below this struct);
+    /// Zig doesn't allow `pub const` declarations between fields.
+    root_fields: std.ArrayListUnmanaged(RootField) = .empty,
 
     pub fn init(gpa: Allocator) !Builder {
         var self = Builder{
@@ -88,15 +107,14 @@ pub const Builder = struct {
         for (&self.struct_scope_stack) |*buf| {
             buf.deinit(self.gpa);
         }
-        if (self.root_field_names) |names| {
-            for (names) |name| self.gpa.free(name);
-            self.gpa.free(names);
-            self.root_field_names = null;
+        for (self.root_fields.items) |field| {
+            self.gpa.free(field.name);
+            switch (field.body) {
+                .static_ref => {},
+                .recorded => |rec| self.gpa.free(rec.instructions),
+            }
         }
-        if (self.root_field_type_refs) |refs| {
-            self.gpa.free(refs);
-            self.root_field_type_refs = null;
-        }
+        self.root_fields.deinit(self.gpa);
         if (self.active_body) |body| {
             body.body_inst_indices.deinit(self.gpa);
             body.param_inst_indices.deinit(self.gpa);
@@ -104,57 +122,138 @@ pub const Builder = struct {
         }
     }
 
-    /// Configure the file's root struct_decl with fields. After this is
-    /// called, finalize() emits the root struct_decl with both decls and
-    /// fields (small = has_decls_len | has_fields_len). When this is not
-    /// called (or `field_names.len == 0`), finalize() preserves the
-    /// pre-existing decls-only behavior.
+    /// Reset the root fields list, freeing all previously-set field state.
+    /// Idempotent. Used by `setRootFields` (the legacy bulk API) and may
+    /// be called explicitly to start fresh.
+    fn clearRootFields(self: *Builder) void {
+        for (self.root_fields.items) |field| {
+            self.gpa.free(field.name);
+            switch (field.body) {
+                .static_ref => {},
+                .recorded => |rec| self.gpa.free(rec.instructions),
+            }
+        }
+        self.root_fields.clearRetainingCapacity();
+    }
+
+    /// Append one root field whose type body is the constant
+    /// `break_inline operand=ref`. This is the streaming-API equivalent
+    /// of one slot in the legacy `setRootFields(names, refs)` array, and
+    /// the right call for primitive types whose Ref is a named static
+    /// type (`i64_type`, `bool_type`, …).
+    pub fn setRootFieldStatic(
+        self: *Builder,
+        field_name: []const u8,
+        type_ref: Zir.Inst.Ref,
+    ) !void {
+        const name_copy = try self.gpa.dupe(u8, field_name);
+        errdefer self.gpa.free(name_copy);
+
+        try self.root_fields.append(self.gpa, .{
+            .name = name_copy,
+            .body = .{ .static_ref = type_ref },
+        });
+    }
+
+    /// Begin recording the type body of a single root field. Allocates a
+    /// transient `FuncBody` and installs it as `active_body`, so any
+    /// subsequent `body.emitBodyInst*` (or C-ABI `zir_builder_emit_*`)
+    /// calls capture into this field's body. Caller must finish with
+    /// `endRootFieldBody(body, final_ref)`.
     ///
-    /// The provided `field_names` slice and the strings inside it are
-    /// duplicated into Builder-owned storage; the caller may free its
-    /// inputs immediately after this call.
+    /// The `FuncBody` returned here is intentionally minimal — its
+    /// function-specific fields (`decl_inst`, `restore_inst`,
+    /// `param_inst_indices`, `ret_type`, all the `*_ret_type_inst`
+    /// slots) are unused. We pay the storage tax for the shared
+    /// `body_inst_indices` / `body_tracking` / `non_body_capture`
+    /// machinery rather than introducing a parallel transient-body
+    /// abstraction the rest of the builder doesn't already understand.
+    pub fn beginRootFieldBody(
+        self: *Builder,
+        field_name: []const u8,
+    ) !*FuncBody {
+        std.debug.assert(self.active_body == null);
+
+        const name_copy = try self.gpa.dupe(u8, field_name);
+        errdefer self.gpa.free(name_copy);
+
+        const body = try self.gpa.create(FuncBody);
+        errdefer self.gpa.destroy(body);
+
+        body.* = FuncBody{
+            .builder = self,
+            .body_inst_indices = .empty,
+            .param_inst_indices = .empty,
+            .name = name_copy,
+            .decl_inst = 0, // unused for transient body
+            .restore_inst = 0, // unused for transient body
+            // `has_explicit_return = true` so endFunction logic
+            // (if accidentally invoked) wouldn't synthesize a
+            // ret_implicit. We never call endFunction on this body —
+            // endRootFieldBody is the correct sink.
+            .has_explicit_return = true,
+            .ret_type = .void, // unused for transient body
+        };
+
+        self.active_body = body;
+        return body;
+    }
+
+    /// Finish recording a root field's type body. `final_ref` is the
+    /// Ref the body produces — typically the result of the last
+    /// recorded instruction, but may also be a static named ref if all
+    /// the recorded work was setup that didn't directly yield the
+    /// result. Drops the active body, takes ownership of the
+    /// `body_inst_indices` slice, and stores it under the field's
+    /// name + final ref for later emission in `finalize()`.
+    pub fn endRootFieldBody(
+        self: *Builder,
+        body: *FuncBody,
+        final_ref: Zir.Inst.Ref,
+    ) !void {
+        std.debug.assert(self.active_body == body);
+
+        // Take ownership of the recorded instruction indices.
+        const recorded_instructions = try body.body_inst_indices.toOwnedSlice(self.gpa);
+        errdefer self.gpa.free(recorded_instructions);
+
+        try self.root_fields.append(self.gpa, .{
+            .name = body.name,
+            .body = .{ .recorded = .{
+                .instructions = recorded_instructions,
+                .final_ref = final_ref,
+            } },
+        });
+
+        // body.name ownership transferred into root_fields; do NOT free.
+        // body_inst_indices is now empty + freed; deinit is a no-op but
+        // we still call it for consistency with FuncBody's lifecycle.
+        body.body_inst_indices.deinit(self.gpa);
+        body.param_inst_indices.deinit(self.gpa);
+        self.active_body = null;
+        self.gpa.destroy(body);
+    }
+
+    /// Legacy bulk API — kept as a thin wrapper around the streaming
+    /// API above so downstream callers that haven't migrated yet
+    /// continue to work. Each `(name, ref)` pair becomes one
+    /// `static_ref` root field. Same idempotent reset semantics as
+    /// before.
+    ///
+    /// New callers should prefer `setRootFieldStatic` (for primitives)
+    /// or the `beginRootFieldBody` / `endRootFieldBody` pair (for
+    /// nominal / generic / list / map / tuple field types whose body
+    /// needs more than a single break_inline of a static ref).
     pub fn setRootFields(
         self: *Builder,
         field_names: []const []const u8,
         field_type_refs: []const Zir.Inst.Ref,
     ) !void {
         std.debug.assert(field_names.len == field_type_refs.len);
-
-        // Free any previously-set root fields so this is idempotent.
-        if (self.root_field_names) |old_names| {
-            for (old_names) |name| self.gpa.free(name);
-            self.gpa.free(old_names);
-            self.root_field_names = null;
+        self.clearRootFields();
+        for (field_names, field_type_refs) |name, ref| {
+            try self.setRootFieldStatic(name, ref);
         }
-        if (self.root_field_type_refs) |old_refs| {
-            self.gpa.free(old_refs);
-            self.root_field_type_refs = null;
-        }
-        self.root_fields_len = 0;
-
-        if (field_names.len == 0) return;
-
-        const names_copy = try self.gpa.alloc([]const u8, field_names.len);
-        errdefer self.gpa.free(names_copy);
-
-        // Track how many name strings we've successfully duped so a partial
-        // failure can clean up without leaking.
-        var duped: usize = 0;
-        errdefer {
-            var i: usize = 0;
-            while (i < duped) : (i += 1) self.gpa.free(names_copy[i]);
-        }
-        for (field_names, 0..) |name, i| {
-            names_copy[i] = try self.gpa.dupe(u8, name);
-            duped = i + 1;
-        }
-
-        const refs_copy = try self.gpa.dupe(Zir.Inst.Ref, field_type_refs);
-        errdefer self.gpa.free(refs_copy);
-
-        self.root_field_names = names_copy;
-        self.root_field_type_refs = refs_copy;
-        self.root_fields_len = @intCast(field_names.len);
     }
 
     /// Intern a null-terminated string in string_bytes. Returns the index.
@@ -498,34 +597,64 @@ pub const Builder = struct {
     /// `endStructDecl` for nested struct types. Otherwise the legacy
     /// decls-only encoding is preserved unchanged.
     pub fn finalize(self: *Builder) !FinalizedZir {
-        const has_root_fields = self.root_fields_len > 0;
+        const has_root_fields = self.root_fields.items.len > 0;
+        const root_fields_len: u32 = @intCast(self.root_fields.items.len);
 
         // The root struct_decl always lives at instruction index 0 (the
-        // placeholder reserved in init()). When emitting fields, we first
-        // need to emit one break_inline per field type referencing the
-        // struct_decl as the block target. Per the StructDecl encoding,
-        // each field's type is a body of length 1 — a single break_inline
-        // whose operand is the field type Ref and whose block_inst is the
-        // struct_decl instruction (index 0).
-        var root_field_type_insts: std.ArrayListUnmanaged(u32) = .empty;
-        defer root_field_type_insts.deinit(self.gpa);
+        // placeholder reserved in init()). For each root field we emit
+        // a `break_inline` whose operand is the field's "final ref" —
+        // the value that the field's type body produces — and whose
+        // block_inst is the struct_decl placeholder. Per the StructDecl
+        // encoding, the trailer carries a per-field body length and a
+        // flat list of body instruction indices.
+        //
+        // For static_ref fields (primitives, named refs) the body is
+        // exactly the break_inline — length 1.
+        //
+        // For recorded fields (nominal struct types, generic
+        // containers, anything emitted via begin/endRootFieldBody) the
+        // body is the recorded instructions plus the trailing
+        // break_inline — length `instructions.len + 1`. The recorded
+        // instructions were already appended to `tags`/`data` during
+        // begin/end, so the body trailer references them by their
+        // existing indices.
+        var per_field_body_lens: std.ArrayListUnmanaged(u32) = .empty;
+        defer per_field_body_lens.deinit(self.gpa);
+        var per_field_body_insts: std.ArrayListUnmanaged(u32) = .empty;
+        defer per_field_body_insts.deinit(self.gpa);
 
         if (has_root_fields) {
-            const type_refs = self.root_field_type_refs.?;
-            try root_field_type_insts.ensureTotalCapacity(self.gpa, type_refs.len);
+            try per_field_body_lens.ensureTotalCapacity(self.gpa, root_fields_len);
 
-            for (type_refs) |type_ref| {
+            for (self.root_fields.items) |field| {
+                const final_ref: Zir.Inst.Ref = switch (field.body) {
+                    .static_ref => |r| r,
+                    .recorded => |rec| rec.final_ref,
+                };
+
                 const brk_payload_idx: u32 = @intCast(self.extra.items.len);
-                // Break payload: { operand_src_node: none, block_inst }
+                // Break payload: { operand_src_node: none, block_inst }.
                 try self.extra.append(self.gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
-                // block_inst = 0 (the root struct_decl placeholder).
+                // block_inst = 0 — the root struct_decl placeholder.
                 try self.extra.append(self.gpa, 0);
 
                 const brk_inst = try self.addInst(
                     .break_inline,
-                    encodeBreak(type_ref, brk_payload_idx),
+                    encodeBreak(final_ref, brk_payload_idx),
                 );
-                root_field_type_insts.appendAssumeCapacity(brk_inst);
+
+                switch (field.body) {
+                    .static_ref => {
+                        per_field_body_lens.appendAssumeCapacity(1);
+                        try per_field_body_insts.append(self.gpa, brk_inst);
+                    },
+                    .recorded => |rec| {
+                        const len: u32 = @intCast(rec.instructions.len + 1);
+                        per_field_body_lens.appendAssumeCapacity(len);
+                        try per_field_body_insts.appendSlice(self.gpa, rec.instructions);
+                        try per_field_body_insts.append(self.gpa, brk_inst);
+                    },
+                }
             }
         }
 
@@ -551,7 +680,7 @@ pub const Builder = struct {
         const decls_len: u32 = @intCast(self.decl_indices.items.len);
         try self.extra.append(self.gpa, decls_len);
         if (has_root_fields) {
-            try self.extra.append(self.gpa, self.root_fields_len);
+            try self.extra.append(self.gpa, root_fields_len);
         }
 
         // Trailing data (matches getStructDecl in lib/std/zig/Zir.zig):
@@ -566,26 +695,26 @@ pub const Builder = struct {
         }
 
         if (has_root_fields) {
-            const field_names = self.root_field_names.?;
-
             // field names (interned StringId u32 each)
-            for (field_names) |fname| {
-                const name_idx = try self.internString(fname);
+            for (self.root_fields.items) |field| {
+                const name_idx = try self.internString(field.name);
                 try self.extra.append(self.gpa, name_idx);
             }
 
-            // field type body lengths (one per field; each body is a single
-            // break_inline instruction).
-            for (0..self.root_fields_len) |_| {
-                try self.extra.append(self.gpa, 1);
+            // field type body lengths — per-field, computed above. May
+            // be 1 (static_ref), or 1 + N (recorded body of N
+            // instructions plus the trailing break_inline).
+            for (per_field_body_lens.items) |body_len| {
+                try self.extra.append(self.gpa, body_len);
             }
 
-            // field bodies — one break_inline inst index per field.
-            // The break payloads were already written with block_inst = 0
-            // above, so no fixup is required (struct_decl_idx is always 0
-            // for the root).
-            for (root_field_type_insts.items) |brk_inst| {
-                try self.extra.append(self.gpa, brk_inst);
+            // field bodies — flat array, concatenation of each field's
+            // body instruction indices in order. Sema slices this back
+            // out per-field using the body lengths above. Each
+            // recorded body's break payload was already written with
+            // block_inst = 0 above, so no fixup is required.
+            for (per_field_body_insts.items) |inst| {
+                try self.extra.append(self.gpa, inst);
             }
         }
 
@@ -1142,6 +1271,29 @@ pub const ReturnType = enum(u32) {
     f64_type = @intFromEnum(Zir.Inst.Ref.f64_type),
     slice_const_u8_type = @intFromEnum(Zir.Inst.Ref.slice_const_u8_type),
     _,
+};
+
+/// One root struct field's name + type body, stored on `Builder`
+/// until `finalize()` lays out the StructDecl payload. Two body
+/// shapes are supported: a single static Ref (the fast path used by
+/// primitive field types and the legacy bulk `setRootFields` API),
+/// or a recorded sequence of ZIR instructions plus a final Ref (for
+/// nominal struct types, generic containers, lists, maps, tuples,
+/// and any other type that needs more than a single break_inline of
+/// a static ref to express).
+pub const RootField = struct {
+    name: []const u8,
+    body: Body,
+
+    pub const Body = union(enum) {
+        static_ref: Zir.Inst.Ref,
+        recorded: Recorded,
+    };
+
+    pub const Recorded = struct {
+        instructions: []const u32,
+        final_ref: Zir.Inst.Ref,
+    };
 };
 
 /// Accumulates function body instructions. Instructions are emitted eagerly

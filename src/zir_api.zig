@@ -1162,6 +1162,74 @@ pub export fn zir_builder_set_root_fields(
     return 0;
 }
 
+/// Append one root field whose type body is a single static Ref
+/// (e.g., a primitive `Zir.Inst.Ref.i64_type`). Streaming-API
+/// alternative to the bulk `zir_builder_set_root_fields` for
+/// callers that build their field list one entry at a time.
+///
+/// Multiple calls to the streaming API (this plus the body-recording
+/// pair below) accumulate into a single root field list. Mix freely
+/// — primitive fields go through this fast path, complex field
+/// types (nominal struct, list, map, tuple, …) go through
+/// `begin_root_field_body` / `end_root_field_body`.
+///
+/// Returns 0 on success, -1 on error.
+pub export fn zir_builder_set_root_field_static(
+    handle: ?*ZirBuilderHandle,
+    name_ptr: [*]const u8,
+    name_len: u32,
+    type_ref: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const name = name_ptr[0..name_len];
+    const ref: Zir.Inst.Ref = @enumFromInt(type_ref);
+    b.setRootFieldStatic(name, ref) catch return -1;
+    return 0;
+}
+
+/// Begin recording the type body of a single root field. Pushes a
+/// transient `FuncBody` onto the builder so any subsequent
+/// `zir_builder_emit_*` calls capture into this field's body
+/// instead of failing with "no active body."
+///
+/// The recorded instructions are emitted into the global ZIR stream
+/// as they're called — Sema later analyzes them in the order they
+/// appear in the field's body trailer (which is set up by
+/// `finalize()`), with the struct_decl's namespace as their lookup
+/// scope. That's why `decl_val "Body"` resolves correctly here:
+/// the file's root struct owns every nested type decl, and the
+/// field body's lookup happens in that scope.
+///
+/// Caller must finish with `zir_builder_end_root_field_body`.
+/// Returns 0 on success, -1 on error.
+pub export fn zir_builder_begin_root_field_body(
+    handle: ?*ZirBuilderHandle,
+    name_ptr: [*]const u8,
+    name_len: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const name = name_ptr[0..name_len];
+    _ = b.beginRootFieldBody(name) catch return -1;
+    return 0;
+}
+
+/// Finish recording a root field's type body. `final_ref` is the
+/// Ref that the body produces — the type expression's result, which
+/// will become the operand of the synthesized `break_inline` at
+/// the end of the field's body.
+///
+/// Returns 0 on success, -1 on error.
+pub export fn zir_builder_end_root_field_body(
+    handle: ?*ZirBuilderHandle,
+    final_ref: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    const ref: Zir.Inst.Ref = @enumFromInt(final_ref);
+    b.endRootFieldBody(body, ref) catch return -1;
+    return 0;
+}
+
 /// Begin a function declaration.
 /// `name_ptr` + `name_len` specify the function name.
 /// `ret_type` is 0 for void, or a `Zir.Inst.Ref` value for the return type
