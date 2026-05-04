@@ -1752,6 +1752,34 @@ pub const FuncBody = struct {
         return self.emitBodyInst(.optional_type, Builder.encodeUnNode(.zero, child_type));
     }
 
+    /// Emit `*const T` — a single-element, immutable, address-space-
+    /// default pointer with no sentinel/alignment metadata. Used by
+    /// the recursive-struct storage strategy to break layout cycles
+    /// (`Tree { left :: ?Tree }` → field storage `?*const Tree`).
+    pub fn addSingleConstPtrType(self: *FuncBody, pointee: Zir.Inst.Ref) !Zir.Inst.Ref {
+        // Layout of the `ptr_type` instruction's data:
+        //   .ptr_type = .{ .flags = ..., .size = .One, .payload_index = N }
+        // where payload at extra[N] is { elem_type, then optional
+        // sentinel/align/etc. depending on flag bits }. We only need
+        // the elem_type because every flag bit is false for a plain
+        // `*const T`.
+        const payload_idx: u32 = @intCast(self.builder.extra.items.len);
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(pointee));
+        return self.emitBodyInst(.ptr_type, .{ .ptr_type = .{
+            .flags = .{
+                .is_allowzero = false,
+                .is_mutable = false,
+                .is_volatile = false,
+                .has_sentinel = false,
+                .has_align = false,
+                .has_addrspace = false,
+                .has_bit_range = false,
+            },
+            .size = .one,
+            .payload_index = payload_idx,
+        } });
+    }
+
     /// Emit `@as(dest_type, operand)`. Returns a Ref to the coerced value.
     pub fn addAs(self: *FuncBody, dest_type: Zir.Inst.Ref, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
         const payload_idx: u32 = @intCast(self.builder.extra.items.len);

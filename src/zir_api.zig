@@ -2782,6 +2782,24 @@ pub export fn zir_builder_emit_optional_type(
     return @intFromEnum(ref);
 }
 
+/// Emit `*const T` — a single-element, immutable, address-space-
+/// default pointer with no sentinel or alignment metadata. Used by
+/// the Zap recursive-struct storage strategy to break layout
+/// cycles: a field declared `:: ?Tree` whose enclosing struct
+/// transitively reaches itself is lowered as `?*const Tree`,
+/// inserting a hidden pointer indirection that source-level code
+/// never sees. Returns a Ref to the pointer type.
+pub export fn zir_builder_emit_single_const_ptr_type(
+    handle: ?*ZirBuilderHandle,
+    pointee: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const pointee_ref: Zir.Inst.Ref = @enumFromInt(pointee);
+    const ref = body.addSingleConstPtrType(pointee_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
 /// Set the return type from arbitrary ZIR instruction indices.
 /// The instructions compute the type (e.g., via generic container instantiation).
 /// `result_inst` is the instruction index whose ref is the final type.
