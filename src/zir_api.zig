@@ -3560,6 +3560,41 @@ pub export fn zir_builder_emit_param_decl_val_type(
     return @intFromEnum(ref);
 }
 
+/// Emit a parameter whose type is `?T` where `T` is a sibling decl
+/// in the current struct (resolved via `decl_val(type_name)`). Used by
+/// Zap's `f(nil) / f(t :: T)` optional-dispatch lowering.
+pub export fn zir_builder_emit_param_optional_decl_val_type(
+    handle: ?*ZirBuilderHandle,
+    param_name_ptr: [*]const u8,
+    param_name_len: u32,
+    type_name_ptr: [*]const u8,
+    type_name_len: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const ref = body.addParamOptionalDeclValType(
+        param_name_ptr[0..param_name_len],
+        type_name_ptr[0..type_name_len],
+    ) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
+/// Emit a parameter whose type is `?@This()` — optional of the file's
+/// root struct. Companion to `emit_param_optional_decl_val_type` for
+/// the case where the optional inner type is the current file itself.
+pub export fn zir_builder_emit_param_optional_this_type(
+    handle: ?*ZirBuilderHandle,
+    param_name_ptr: [*]const u8,
+    param_name_len: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const ref = body.addParamOptionalThisType(
+        param_name_ptr[0..param_name_len],
+    ) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
 /// Emit a parameter whose type is resolved by an inline type body.
 /// `type_body_inst_indices` are raw instruction indices that must all be
 /// included in the parameter type body before the final break_inline.

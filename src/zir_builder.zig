@@ -1713,6 +1713,92 @@ pub const FuncBody = struct {
         return Builder.instRef(idx);
     }
 
+    /// Emit a parameter whose type is `?T` where `T` is a sibling
+    /// nominal struct declared in the current file (reachable as
+    /// `decl_val(type_name)`). The body emits `decl_val(T)` then
+    /// `optional_type(decl_val_ref)` then `break_inline` to the
+    /// optional, all inside the param's type body. Used by Zap's
+    /// `f(nil) / f(t :: T)` optional-dispatch lowering — the param
+    /// must be `?T` so dispatcher code (`is_non_null`,
+    /// `optional_payload_unsafe`) type-checks against it.
+    pub fn addParamOptionalDeclValType(self: *FuncBody, param_name: []const u8, type_name: []const u8) !Zir.Inst.Ref {
+        const b = self.builder;
+        const param_name_idx = try b.internString(param_name);
+
+        // Pre-compute param instruction index: follows 3 instructions
+        // (decl_val, optional_type, break_inline).
+        const param_inst_idx: u32 = @intCast(b.tags.items.len + 3);
+
+        // 1. decl_val(T)
+        const type_name_idx = try b.internString(type_name);
+        const decl_val_inst = try b.addInst(.decl_val, Builder.encodeStrTok(type_name_idx, .zero));
+        const decl_val_ref = Builder.instRef(decl_val_inst);
+
+        // 2. optional_type(decl_val)
+        const opt_inst = try b.addInst(.optional_type, Builder.encodeUnNode(.zero, decl_val_ref));
+        const opt_ref = Builder.instRef(opt_inst);
+
+        // 3. break_inline → opt_ref
+        const break_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+        try b.extra.append(b.gpa, param_inst_idx);
+        const break_idx = try b.addInst(.break_inline, Builder.encodeBreak(opt_ref, break_payload_idx));
+
+        // Param payload: [name, body_len_with_flag, decl_val, optional_type, break]
+        const payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, param_name_idx);
+        try b.extra.append(b.gpa, 3); // body_len=3, is_generic=false
+        try b.extra.append(b.gpa, decl_val_inst);
+        try b.extra.append(b.gpa, opt_inst);
+        try b.extra.append(b.gpa, break_idx);
+
+        const idx = try b.addInst(.param, Builder.encodePlTok(.zero, payload_idx));
+        std.debug.assert(idx == param_inst_idx);
+
+        try self.param_inst_indices.append(b.gpa, idx);
+        return Builder.instRef(idx);
+    }
+
+    /// Emit a parameter whose type is `?@This()` — the optional of the
+    /// current file's root struct. Used by `f(nil) / f(t :: T)`
+    /// dispatch when `T` is the file's root type.
+    pub fn addParamOptionalThisType(self: *FuncBody, param_name: []const u8) !Zir.Inst.Ref {
+        const b = self.builder;
+        const param_name_idx = try b.internString(param_name);
+
+        // Pre-compute param instruction index: follows 3 instructions
+        // (this_type extended, optional_type, break_inline).
+        const param_inst_idx: u32 = @intCast(b.tags.items.len + 3);
+
+        // 1. @This()
+        const this_inst = try b.addInst(.extended, Builder.encodeExtended(@intFromEnum(Zir.Inst.Extended.this), 0, 0));
+        const this_ref = Builder.instRef(this_inst);
+
+        // 2. optional_type(this)
+        const opt_inst = try b.addInst(.optional_type, Builder.encodeUnNode(.zero, this_ref));
+        const opt_ref = Builder.instRef(opt_inst);
+
+        // 3. break_inline → opt_ref
+        const break_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+        try b.extra.append(b.gpa, param_inst_idx);
+        const break_idx = try b.addInst(.break_inline, Builder.encodeBreak(opt_ref, break_payload_idx));
+
+        // Param payload
+        const payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(b.gpa, param_name_idx);
+        try b.extra.append(b.gpa, 3);
+        try b.extra.append(b.gpa, this_inst);
+        try b.extra.append(b.gpa, opt_inst);
+        try b.extra.append(b.gpa, break_idx);
+
+        const idx = try b.addInst(.param, Builder.encodePlTok(.zero, payload_idx));
+        std.debug.assert(idx == param_inst_idx);
+
+        try self.param_inst_indices.append(b.gpa, idx);
+        return Builder.instRef(idx);
+    }
+
     /// Emit a parameter whose type is produced by a caller-supplied inline
     /// type body. The body must include every instruction needed to resolve
     /// `type_result` so Sema can analyze the parameter type in isolation.
