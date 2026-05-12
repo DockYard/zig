@@ -397,6 +397,394 @@ pub export fn zir_compilation_invalidate_file(ctx: ?*ZirContext, name: [*:0]cons
 }
 
 // ---------------------------------------------------------------------------
+// zap_fork_compile_zig_to_object — general-purpose in-process Zig compile
+// primitive (Memory Manager ABI v1.0 spec section 10.1.1).
+//
+// Public C-ABI surface used by Zap (and other third-party callers) to compile
+// a single Zig source file to an object file in-process — no subprocess, no
+// `zig build-obj`. The same Compilation API used elsewhere in zir_api.zig
+// drives the compile; the only differences are:
+//   * the root module's source is the caller's actual Zig file rather than
+//     a generated stub + ZIR injection;
+//   * the output mode is fixed to .Obj;
+//   * libc is not linked (object files are partial — final link decides);
+//   * `skip_linker_dependencies = true` since we are not producing a binary.
+//
+// The primitive is intentionally NOT memory-manager-specific. It is general
+// to any caller that needs to compile a self-contained Zig file (codegen
+// plugins, build-time helpers, etc.).
+// ---------------------------------------------------------------------------
+
+/// Wire-format target descriptor. Fields are integer values of
+/// `std.Target.Cpu.Arch`, `std.Target.Os.Tag`, and `std.Target.Abi` as
+/// pinned by ABI v1.0 (memory-manager-abi.md Appendix C).
+pub const ZapForkTarget = extern struct {
+    arch_tag: u16,
+    os_tag: u16,
+    abi_tag: u16,
+    _reserved: u16,
+};
+
+/// Optimize mode. Mirrors `std.builtin.OptimizeMode` ordering.
+pub const ZapForkOptimize = enum(c_int) {
+    Debug = 0,
+    ReleaseSafe = 1,
+    ReleaseFast = 2,
+    ReleaseSmall = 3,
+};
+
+/// Result codes for `zap_fork_compile_zig_to_object`.
+pub const ZapForkResult = enum(c_int) {
+    Ok = 0,
+    SourceNotFound = 1,
+    CompilationFailed = 2,
+    TargetUnsupported = 3,
+    InternalError = 99,
+};
+
+/// Compile a Zig source file to an object file in-process.
+///
+/// `source_path` and `out_object_path` are null-terminated UTF-8 paths.
+/// `target` specifies the cross-compile target. Pass `arch_tag = max u16`
+/// (0xFFFF) for native compilation; the implementation rejects any other
+/// invalid combination with `TargetUnsupported`.
+/// `optimize` selects the optimize mode.
+/// `out_diagnostic_buffer`/`out_diagnostic_capacity` receive a UTF-8
+/// diagnostic message on non-Ok return; pass null to discard. The
+/// implementation writes at most `out_diagnostic_capacity` bytes
+/// (including a trailing NUL if space permits) and truncates the message
+/// otherwise. On `Ok` return, the buffer is left untouched.
+///
+/// Thread safety: the function spins up its own `Compilation` instance
+/// and tears it down before returning. Concurrent calls from different
+/// threads are safe in principle, but the underlying Zig compiler relies
+/// on a per-Compilation `Io.Threaded` runtime that is *not* designed for
+/// many concurrent in-process compilations — callers should serialize
+/// calls at the Zap-side build orchestrator. The function itself does no
+/// caller synchronization.
+///
+/// LLVM context note: when `build_options.have_llvm` is true, the
+/// compiler uses a global LLVM context for codegen. Re-entrant calls
+/// from within an existing Zig Compilation (e.g., from a hypothetical
+/// build-step plugin running inside another `compilation.update()`)
+/// would be unsafe. The Zap build orchestrator drives this primitive
+/// from the top level only, well before any other Compilation is alive,
+/// so the LLVM-context restriction is not exercised in Zap's use case.
+/// Future v2 work could decouple the LLVM context via Compilation's
+/// nested sub-compilation mechanism (see Compilation.zig:5032 and
+/// related sub_compilation paths), which already runs in-process.
+pub export fn zap_fork_compile_zig_to_object(
+    source_path: [*:0]const u8,
+    target: *const ZapForkTarget,
+    optimize: ZapForkOptimize,
+    out_object_path: [*:0]const u8,
+    out_diagnostic_buffer: ?[*]u8,
+    out_diagnostic_capacity: usize,
+    /// Optional caller-supplied Zig stdlib directory. Pass null to let
+    /// the primitive auto-detect from the running compiler's self-exe
+    /// (uses `introspect.findZigLibDir`). Callers like Zap, which
+    /// embed the stdlib in a tar archive that's unpacked to a temp
+    /// dir at runtime, must pass that temp dir explicitly because the
+    /// running binary is not laid out like a Zig install.
+    zig_lib_dir_opt: ?[*:0]const u8,
+) callconv(.c) ZapForkResult {
+    var diag_buf: [1024]u8 = undefined;
+    var diag_used: usize = 0;
+    const DiagOut = struct {
+        buf: ?[*]u8,
+        cap: usize,
+        used: *usize,
+        scratch: []u8,
+
+        fn write(self: @This(), comptime fmt: []const u8, args: anytype) void {
+            const written = std.fmt.bufPrint(self.scratch, fmt, args) catch self.scratch;
+            const out = self.buf orelse return;
+            const cap = self.cap;
+            if (cap == 0) return;
+            const copy_len = @min(written.len, cap - 1);
+            @memcpy(out[0..copy_len], written[0..copy_len]);
+            out[copy_len] = 0;
+            self.used.* = copy_len;
+        }
+    };
+    const diag = DiagOut{
+        .buf = out_diagnostic_buffer,
+        .cap = out_diagnostic_capacity,
+        .used = &diag_used,
+        .scratch = &diag_buf,
+    };
+
+    const source_path_slice = mem.sliceTo(source_path, 0);
+    const out_object_path_slice = mem.sliceTo(out_object_path, 0);
+
+    // Resolve target. Special sentinel 0xFFFF for native; otherwise we
+    // construct a target query directly from the wire-format triple.
+    const target_query: std.Target.Query = blk: {
+        if (target.arch_tag == 0xFFFF) {
+            break :blk .{};
+        }
+        // Validate the triple against the v1.0 supported set (Appendix C).
+        const arch: std.Target.Cpu.Arch = inline for (@typeInfo(std.Target.Cpu.Arch).@"enum".fields) |f| {
+            if (f.value == target.arch_tag) break @field(std.Target.Cpu.Arch, f.name);
+        } else {
+            diag.write("zap_fork: unsupported arch_tag={d}", .{target.arch_tag});
+            return .TargetUnsupported;
+        };
+        const os_tag: std.Target.Os.Tag = inline for (@typeInfo(std.Target.Os.Tag).@"enum".fields) |f| {
+            if (f.value == target.os_tag) break @field(std.Target.Os.Tag, f.name);
+        } else {
+            diag.write("zap_fork: unsupported os_tag={d}", .{target.os_tag});
+            return .TargetUnsupported;
+        };
+        const abi_tag: std.Target.Abi = inline for (@typeInfo(std.Target.Abi).@"enum".fields) |f| {
+            if (f.value == target.abi_tag) break @field(std.Target.Abi, f.name);
+        } else {
+            diag.write("zap_fork: unsupported abi_tag={d}", .{target.abi_tag});
+            return .TargetUnsupported;
+        };
+        break :blk .{
+            .cpu_arch = arch,
+            .os_tag = os_tag,
+            .abi = abi_tag,
+        };
+    };
+
+    const zig_lib_dir_slice: ?[]const u8 = if (zig_lib_dir_opt) |p| mem.sliceTo(p, 0) else null;
+
+    compileToObjectImpl(
+        source_path_slice,
+        out_object_path_slice,
+        target_query,
+        optimize,
+        zig_lib_dir_slice,
+    ) catch |err| switch (err) {
+        error.SourceNotFound => {
+            diag.write("zap_fork: source not found: {s}", .{source_path_slice});
+            return .SourceNotFound;
+        },
+        error.CompilationFailed => {
+            // The internal helper has already populated the diagnostic
+            // (if any) onto stderr via the compiler's standard error
+            // bundle path. Surface a generic message here; callers that
+            // need richer diagnostics can request them through a future
+            // structured-diagnostic capability.
+            diag.write("zap_fork: compilation failed for {s}", .{source_path_slice});
+            return .CompilationFailed;
+        },
+        else => {
+            diag.write("zap_fork: internal error: {s}", .{@errorName(err)});
+            return .InternalError;
+        },
+    };
+
+    return .Ok;
+}
+
+const CompileToObjectError = error{
+    SourceNotFound,
+    CompilationFailed,
+    OutOfMemory,
+    UnableToResolveTarget,
+};
+
+fn compileToObjectImpl(
+    source_path: []const u8,
+    out_object_path: []const u8,
+    target_query: std.Target.Query,
+    optimize: ZapForkOptimize,
+    zig_lib_dir_opt: ?[]const u8,
+) CompileToObjectError!void {
+    const gpa = std.heap.c_allocator;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const ar = arena_state.allocator();
+
+    // Initialize an Io.Threaded instance for this compile. Reuses the
+    // same threading model as createImpl above. We allow up to 4 worker
+    // threads, mirroring the rest of zir_api.zig.
+    const thread_limit = @min(std.Thread.getCpuCount() catch 1, 4);
+    var io_impl: Io.Threaded = .init(gpa, .{ .stack_size = 16 * 1024 * 1024 });
+    defer io_impl.deinit();
+    const limit: Io.Limit = .limited(thread_limit - 1);
+    io_impl.setAsyncLimit(limit);
+    io_impl.concurrent_limit = limit;
+    Zcu.PerThread.Id.allocate(ar, @max(thread_limit, 2)) catch |err| {
+        logErr("zap_fork: PerThread.Id.allocate failed: {s}", .{@errorName(err)});
+        return error.OutOfMemory;
+    };
+    const io = io_impl.io();
+
+    // Resolve the zig lib dir. If the caller provided an explicit path,
+    // use that — Zap embeds its pinned stdlib in a tar archive and
+    // unpacks it at runtime, so it must supply that path directly.
+    // Otherwise auto-detect from the running compiler's self-exe.
+    const self_exe_path = std.process.executablePathAlloc(io, ar) catch |err| {
+        logErr("zap_fork: executablePathAlloc failed: {s}", .{@errorName(err)});
+        return error.OutOfMemory;
+    };
+    const zig_lib_dir: Cache.Directory = blk: {
+        if (zig_lib_dir_opt) |dir_path| {
+            const cwd_for_open = Dir.cwd();
+            const handle = cwd_for_open.openDir(io, dir_path, .{}) catch |err| {
+                logErr("zap_fork: openDir(zig_lib_dir={s}) failed: {s}", .{ dir_path, @errorName(err) });
+                return error.OutOfMemory;
+            };
+            break :blk .{ .handle = handle, .path = try ar.dupe(u8, dir_path) };
+        }
+        break :blk introspect.findZigLibDir(ar, io) catch |err| {
+            logErr("zap_fork: findZigLibDir failed: {s}", .{@errorName(err)});
+            return error.OutOfMemory;
+        };
+    };
+
+    // Use /tmp as both the local and global cache so that this primitive
+    // does not pollute the caller's project cache. A future revision
+    // will expose these as parameters so that Zap's build orchestrator
+    // controls cache placement.
+    const cache_path = "/tmp/zap-fork-cache";
+
+    const cwd = Dir.cwd();
+    cwd.createDirPath(io, cache_path) catch |err| {
+        logErr("zap_fork: createDirPath({s}) failed: {s}", .{ cache_path, @errorName(err) });
+    };
+
+    const cache_handle = cwd.openDir(io, cache_path, .{}) catch |err| {
+        logErr("zap_fork: openDir({s}) failed: {s}", .{ cache_path, @errorName(err) });
+        return error.OutOfMemory;
+    };
+
+    var dirs: Compilation.Directories = .{
+        .cwd = introspect.getResolvedCwd(io, ar) catch |err| {
+            logErr("zap_fork: getResolvedCwd failed: {s}", .{@errorName(err)});
+            return error.OutOfMemory;
+        },
+        .zig_lib = zig_lib_dir,
+        .local_cache = .{ .handle = cache_handle, .path = try ar.dupe(u8, cache_path) },
+        .global_cache = .{ .handle = cache_handle, .path = try ar.dupe(u8, cache_path) },
+    };
+    defer dirs.deinit(io);
+
+    // Resolve the target query. We round-trip through resolveTargetQueryOrFatal
+    // so that the result matches what the rest of zir_api.zig produces.
+    const resolved_result = std.zig.resolveTargetQueryOrFatal(io, target_query);
+    const resolved_target: Package.Module.ResolvedTarget = .{
+        .result = resolved_result,
+        .is_native_os = target_query.isNativeOs(),
+        .is_native_abi = target_query.isNativeAbi(),
+        .is_explicit_dynamic_linker = false,
+    };
+
+    const optimize_mode_enum: std.builtin.OptimizeMode = switch (optimize) {
+        .Debug => .Debug,
+        .ReleaseSafe => .ReleaseSafe,
+        .ReleaseFast => .ReleaseFast,
+        .ReleaseSmall => .ReleaseSmall,
+    };
+
+    // Object-file output: no libc, no compiler_rt, no ubsan_rt, no
+    // linker passes — that is the responsibility of the final link
+    // performed by Zap's build orchestrator.
+    const config = Compilation.Config.resolve(.{
+        .output_mode = .Obj,
+        .resolved_target = resolved_target,
+        .is_test = false,
+        .have_zcu = true,
+        .emit_bin = true,
+        .root_optimize_mode = optimize_mode_enum,
+        .root_strip = false,
+        .link_libc = false,
+        .link_mode = null,
+        .lto = .none,
+        .use_llvm = build_options.have_llvm,
+    }) catch return error.OutOfMemory;
+
+    // Verify the source file exists. We do this before constructing the
+    // root module so that a missing source produces the precise
+    // `SourceNotFound` error rather than a downstream compilation error.
+    {
+        const f = cwd.openFile(io, source_path, .{}) catch return error.SourceNotFound;
+        defer f.close(io);
+    }
+
+    const dir_path = std.fs.path.dirname(source_path) orelse ".";
+    const file_name = std.fs.path.basename(source_path);
+
+    const root_path = Compilation.Path.fromUnresolved(ar, dirs, &.{dir_path}) catch return error.OutOfMemory;
+
+    const root_mod = Package.Module.create(ar, .{
+        .paths = .{
+            .root = root_path,
+            .root_src_path = try ar.dupe(u8, file_name),
+        },
+        .fully_qualified_name = "root",
+        .cc_argv = &.{},
+        .inherited = .{ .resolved_target = resolved_target },
+        .global = config,
+        .parent = null,
+    }) catch return error.OutOfMemory;
+
+    // Pick a stable "root name" derived from the source filename (no
+    // extension) so emitted artifacts have a sensible base.
+    const root_name = blk: {
+        const base = std.fs.path.stem(file_name);
+        if (base.len == 0) break :blk "zap_fork_obj";
+        break :blk ar.dupe(u8, base) catch return error.OutOfMemory;
+    };
+    const root_name_z = try ar.dupeZ(u8, root_name);
+
+    var environ_map = std.process.Environ.Map.init(ar);
+
+    const output_path_duped = try ar.dupe(u8, out_object_path);
+
+    var create_diag: Compilation.CreateDiagnostic = undefined;
+    var compilation = Compilation.create(gpa, ar, io, &create_diag, .{
+        .dirs = dirs,
+        .thread_limit = thread_limit,
+        .environ_map = &environ_map,
+        .self_exe_path = self_exe_path,
+        .config = config,
+        .root_mod = root_mod,
+        .root_name = root_name_z,
+        .cache_mode = .none,
+        .emit_bin = .{ .yes_path = output_path_duped },
+        // Object output produces nothing that needs compiler_rt / ubsan_rt
+        // / libc startup — Zap's final link adds them once across all
+        // objects.
+        .skip_linker_dependencies = true,
+        .entry = .default,
+    }) catch |err| {
+        logErr("zap_fork: Compilation.create failed: {s}", .{@errorName(err)});
+        return error.CompilationFailed;
+    };
+    defer {
+        if (compilation.zcu) |zcu| zcu.deinit();
+    }
+
+    const prog_node = std.Progress.start(io, .{});
+    defer prog_node.end();
+    compilation.update(prog_node) catch |err| {
+        logErr("zap_fork: compilation.update failed: {s}", .{@errorName(err)});
+        var error_bundle = compilation.getAllErrorsAlloc() catch {
+            return error.CompilationFailed;
+        };
+        defer error_bundle.deinit(gpa);
+        if (error_bundle.errorMessageCount() > 0) {
+            dumpErrorBundle(error_bundle);
+        }
+        return error.CompilationFailed;
+    };
+    if (compilation.anyErrors()) {
+        var error_bundle = compilation.getAllErrorsAlloc() catch {
+            return error.CompilationFailed;
+        };
+        defer error_bundle.deinit(gpa);
+        dumpErrorBundle(error_bundle);
+        return error.CompilationFailed;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Internal: compilation creation
 // ---------------------------------------------------------------------------
 
