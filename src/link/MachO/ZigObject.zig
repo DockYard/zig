@@ -1167,6 +1167,28 @@ fn getNavOutputSection(
     const ip = &zcu.intern_pool;
     const nav = ip.getNav(nav_index);
     const nav_val: Value = .fromInterned(nav.resolved.?.value);
+
+    // Honour a user-supplied `linksection` attribute. Mach-O section
+    // names follow the `SEGMENT,SECTION` convention (e.g.
+    // `__DATA,__zapmem`). When a `linksection` attribute is present
+    // and parseable, route the symbol to the requested section,
+    // creating it on the fly if it does not yet exist. This mirrors
+    // the ELF / COFF / Wasm linker backends' handling (see
+    // `src/link/Elf2.zig`, `Elf/ZigObject.zig`, `Coff.zig`, and
+    // `Wasm.zig`).
+    if (nav.resolved.?.@"linksection".toSlice(ip)) |link_section_name| {
+        if (std.mem.indexOfScalar(u8, link_section_name, ',')) |comma_idx| {
+            const segment_name = link_section_name[0..comma_idx];
+            const section_name = link_section_name[comma_idx + 1 ..];
+            if (segment_name.len > 0 and segment_name.len <= 16 and
+                section_name.len > 0 and section_name.len <= 16)
+            {
+                return macho_file.getSectionByName(segment_name, section_name) orelse
+                    try macho_file.addSection(segment_name, section_name, .{});
+            }
+        }
+    }
+
     if (ip.isFunctionType(nav_val.typeOf(zcu).toIntern())) return macho_file.zig_text_sect_index.?;
     if (nav.resolved.?.@"threadlocal" and macho_file.base.comp.config.any_non_single_threaded) {
         for (code) |byte| {
