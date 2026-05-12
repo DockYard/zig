@@ -967,6 +967,19 @@ fn testLinksection(b: *Build, opts: Options) *Step {
         check.checkContains("(__TEXT,__TestGenFnA) _main.TestGenericFn(");
     }
 
+    // The section created via `linksection` must carry the
+    // S_ATTR_NO_DEAD_STRIP attribute (0x10000000 in the flags field
+    // of section_64). The user explicitly placed data at this
+    // location; if `-dead_strip` could remove it, downstream code
+    // that locates the data via a weak extern (e.g. Zap's memory-
+    // manager `.zapmem` section) would resolve to null at startup
+    // and panic with a runtime diagnostic that's hard to trace
+    // back to the linker.
+    check.checkInHeaders();
+    check.checkExact("segname __DATA");
+    check.checkExact("sectname __TestGlobal");
+    check.checkExact("flags 10000000");
+
     test_step.dependOn(&check.step);
 
     return test_step;

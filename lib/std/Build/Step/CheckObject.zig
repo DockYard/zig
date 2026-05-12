@@ -901,12 +901,14 @@ const MachODumper = struct {
                             \\size {x}
                             \\offset {x}
                             \\align {x}
+                            \\flags {x}
                         , .{
                             sect.sectName(),
                             sect.addr,
                             sect.size,
                             sect.offset,
                             sect.@"align",
+                            sect.flags,
                         });
                     }
                 },

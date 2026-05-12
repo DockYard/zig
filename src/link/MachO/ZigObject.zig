@@ -1176,6 +1176,16 @@ fn getNavOutputSection(
     // the ELF / COFF / Wasm linker backends' handling (see
     // `src/link/Elf2.zig`, `Elf/ZigObject.zig`, `Coff.zig`, and
     // `Wasm.zig`).
+    //
+    // `S_ATTR_NO_DEAD_STRIP` is set on the newly-created section so
+    // the user-placed data survives `-dead_strip`. `linksection`
+    // semantics imply the user is explicitly placing data at a known
+    // location — Zap's memory-manager `.zapmem` section in particular
+    // is discovered at runtime by a weak extern that resolves to null
+    // if Mach-O dead-stripped the data, producing a runtime startup
+    // panic that's hard to diagnose. Matching the section flag here
+    // keeps the section in the binary across the full link, mirroring
+    // the `pub export` behaviour users expect.
     if (nav.resolved.?.@"linksection".toSlice(ip)) |link_section_name| {
         if (std.mem.indexOfScalar(u8, link_section_name, ',')) |comma_idx| {
             const segment_name = link_section_name[0..comma_idx];
@@ -1184,7 +1194,9 @@ fn getNavOutputSection(
                 section_name.len > 0 and section_name.len <= 16)
             {
                 return macho_file.getSectionByName(segment_name, section_name) orelse
-                    try macho_file.addSection(segment_name, section_name, .{});
+                    try macho_file.addSection(segment_name, section_name, .{
+                        .flags = macho.S_REGULAR | macho.S_ATTR_NO_DEAD_STRIP,
+                    });
             }
         }
     }
