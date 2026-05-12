@@ -371,6 +371,10 @@ pub export fn zir_compilation_destroy(ctx: *ZirContext) void {
     ctx.dirs.deinit(io);
     ctx.io_impl.deinit();
     ctx.arena_state.deinit();
+    // The static tid pool's items slice was backed by `ctx.arena_state`;
+    // reset it before the next `allocate` so the stale pointer doesn't
+    // trip the empty-pool invariant.
+    Zcu.PerThread.Id.deinit();
     gpa.destroy(ctx);
 }
 
@@ -920,10 +924,23 @@ fn compileToObjectImpl(
     const limit: Io.Limit = .limited(thread_limit - 1);
     io_impl.setAsyncLimit(limit);
     io_impl.concurrent_limit = limit;
+    // Reset the global tid pool first. Sibling compiles in this same
+    // process (e.g. the outer ZIR build invoked through `createImpl`
+    // after this manager-object compile returns) keep their tid storage
+    // alive via separate arenas; without this reset, the static
+    // `available_tids` slice still points into the previous compile's
+    // arena (already freed at `arena_state.deinit()`) and the
+    // `assert(items.len == 0)` inside `allocate` either trips or
+    // silently corrupts.
+    Zcu.PerThread.Id.deinit();
     Zcu.PerThread.Id.allocate(ar, @max(thread_limit, 2)) catch |err| {
         logErr("zap_fork: PerThread.Id.allocate failed: {s}", .{@errorName(err)});
         return error.OutOfMemory;
     };
+    // Make sure the pool is reset BEFORE this arena dies, otherwise a
+    // future compile (re)allocate trips an assert on the dangling
+    // pointer into our about-to-be-freed arena memory.
+    defer Zcu.PerThread.Id.deinit();
     const io = io_impl.io();
 
     // Resolve the zig lib dir. If the caller provided an explicit path,
@@ -1056,9 +1073,25 @@ fn compileToObjectImpl(
         .ReleaseSmall => .ReleaseSmall,
     };
 
-    // Object-file output: no libc, no compiler_rt, no ubsan_rt, no
-    // linker passes — that is the responsibility of the final link
-    // performed by Zap's build orchestrator.
+    // Object-file output: no compiler_rt, no ubsan_rt, no linker passes
+    // — that is the responsibility of the final link performed by Zap's
+    // build orchestrator.
+    //
+    // `link_libc` selection: on targets where the platform stdlib only
+    // works under libc (macOS, iOS, Solaris, etc. — see
+    // `std.Target.requiresLibC`), `std.os` cannot resolve syscall-layer
+    // primitives without libc bindings, and even purely `std.mem` /
+    // `std.atomic` translation units fail because `std.posix.system`
+    // resolves to an empty fallback struct that lacks members like
+    // `getrandom` and `IOV_MAX`. Forcing `link_libc = false` on those
+    // platforms breaks compilation of any non-trivial manager source
+    // before codegen. Honour `requiresLibC()` here; manager objects are
+    // still linked into the host binary by Zap's final link, which adds
+    // libc once across all objects (the manager's symbol contributions
+    // are unchanged either way — `linksection`, `zap_memory_section`,
+    // and the vtable function pointers are all opaque to the libc
+    // toggle).
+    const target_requires_libc = resolved_target.result.requiresLibC();
     const config = Compilation.Config.resolve(.{
         .output_mode = .Obj,
         .resolved_target = resolved_target,
@@ -1067,7 +1100,7 @@ fn compileToObjectImpl(
         .emit_bin = true,
         .root_optimize_mode = optimize_mode_enum,
         .root_strip = false,
-        .link_libc = false,
+        .link_libc = target_requires_libc,
         .link_mode = null,
         .lto = .none,
         .use_llvm = build_options.have_llvm,
@@ -1544,6 +1577,10 @@ fn createImpl(
     };
     ctx.arena_state = std.heap.ArenaAllocator.init(gpa);
     errdefer ctx.arena_state.deinit();
+    // Pair with the `arena_state.deinit()` reset on the happy path
+    // (`zir_compilation_destroy`). If `createImpl` errors out partway,
+    // the static tid pool may already hold a slice into our arena.
+    errdefer Zcu.PerThread.Id.deinit();
     const ar = ctx.arena_state.allocator();
 
     // Initialize the Io.Threaded instance (replaces thread pool in 0.16).
@@ -1562,6 +1599,13 @@ fn createImpl(
     ctx.io_impl.setAsyncLimit(limit);
     ctx.io_impl.concurrent_limit = limit;
     // Allocate per-thread IDs for the Zig compiler's concurrent work.
+    // Reset first — sibling compiles (e.g. the manager-object compile
+    // in `compileToObjectImpl`) may have populated the global pool with
+    // a slice into an arena that has since been freed.
+    // `compileToObjectImpl` also calls `deinit` on its own exit, but
+    // belt-and-braces the reset here so callers in any order are
+    // resilient.
+    Zcu.PerThread.Id.deinit();
     Zcu.PerThread.Id.allocate(ar, @max(thread_limit, 2)) catch {
         logErr("failed to allocate PerThread IDs", .{});
         return error.OutOfMemory;

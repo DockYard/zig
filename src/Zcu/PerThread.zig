@@ -71,6 +71,27 @@ pub const Id = if (InternPool.single_threaded) enum {
     threadlocal var recursive_depth: usize = 0;
     threadlocal var recursive_tid: Id = undefined;
 
+    /// Reset the global tid pool. Callers that run multiple sequential
+    /// `Compilation`s in the same process (e.g. Zap's build orchestrator,
+    /// which compiles a manager object before lowering the user's ZIR)
+    /// must call `deinit` between compiles so that the pool's stale
+    /// pointer into the previous compile's arena (now freed) is dropped
+    /// before `allocate` re-asserts the empty-pool invariant.
+    ///
+    /// `deinit` only resets the pool to its sentinel `.empty` state —
+    /// the storage is owned by the caller's arena and has already been
+    /// freed when this is called. No deallocation happens here.
+    pub fn deinit() void {
+        available_tids = .empty;
+        switch (build_options.io_mode) {
+            .threaded => {
+                recursive_depth = 0;
+                recursive_tid = undefined;
+            },
+            .evented => {},
+        }
+    }
+
     pub fn allocate(arena: Allocator, n: usize) Allocator.Error!void {
         assert(available_tids.items.len == 0);
         try available_tids.ensureTotalCapacityPrecise(arena, n - 1);
