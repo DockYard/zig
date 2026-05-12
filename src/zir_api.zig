@@ -332,7 +332,13 @@ pub export fn zir_compilation_add_link_lib(
 /// validated the resulting `.zapmem` section; this entry point only
 /// performs the link-time mechanical step.
 ///
-/// Returns 0 on success, -1 on failure (file not found, allocation, etc.).
+/// Returns 0 on success and a negative error code on failure:
+///   * `-1` — general failure (allocation, internal error, etc.).
+///   * `-2` — filesystem error opening either the object file or its
+///     parent directory. Distinguishing this from `-1` lets the Zap-side
+///     driver surface a useful diagnostic ("object not readable") instead
+///     of falling back to a generic OOM message.
+///
 /// Must be invoked AFTER `zir_compilation_create*` and BEFORE
 /// `zir_compilation_update`.
 pub export fn zir_compilation_add_link_object_file(
@@ -340,7 +346,10 @@ pub export fn zir_compilation_add_link_object_file(
     path: [*:0]const u8,
 ) callconv(.c) i32 {
     const c = ctx orelse return -1;
-    addLinkObjectFileImpl(c, mem.sliceTo(path, 0)) catch return -1;
+    addLinkObjectFileImpl(c, mem.sliceTo(path, 0)) catch |err| switch (err) {
+        error.LinkObjectFileNotReadable => return -2,
+        else => return -1,
+    };
     return 0;
 }
 
@@ -1439,15 +1448,23 @@ fn addLinkLibImpl(ctx: *ZirContext, lib_name: []const u8) !void {
 /// On success the `Input.object` entry is added to `link_inputs` and the
 /// linker pulls in the object during the final link step. The file handle
 /// is held open for the lifetime of the `ZirContext`.
+///
+/// Returns `error.LinkObjectFileNotReadable` for filesystem failures
+/// (missing object, unreadable parent directory). Allocation failures
+/// continue to propagate as `error.OutOfMemory`. The two failure modes
+/// are distinct because the C-ABI export maps them to different return
+/// codes so the Zap-side driver can surface a useful diagnostic.
 fn addLinkObjectFileImpl(ctx: *ZirContext, obj_path: []const u8) !void {
     const ar = ctx.arena();
     const io = ctx.io();
     const cwd_dir = Dir.cwd();
 
     var file = cwd_dir.openFile(io, obj_path, .{}) catch |err| {
-        logErr("object file not found at '{s}': {s}", .{ obj_path, @errorName(err) });
-        return error.OutOfMemory;
+        logErr("object file not readable at '{s}': {s}", .{ obj_path, @errorName(err) });
+        return error.LinkObjectFileNotReadable;
     };
+    // The errdefer below releases `file` if any later step fails;
+    // the success path transfers ownership into `ctx.compilation.link_inputs`.
     errdefer file.close(io);
 
     // Resolve a directory handle for the object's parent dir so the
@@ -1457,10 +1474,12 @@ fn addLinkObjectFileImpl(ctx: *ZirContext, obj_path: []const u8) !void {
     const dir_path: []const u8 = if (sep_idx) |idx| obj_path[0..idx] else ".";
     const sub_path: []const u8 = if (sep_idx) |idx| obj_path[idx + 1 ..] else obj_path;
 
+    // No explicit `file.close` on this error path — the outer
+    // `errdefer file.close(io)` above handles cleanup. Issuing a manual
+    // close here in addition would double-close the handle.
     var dir = cwd_dir.openDir(io, dir_path, .{}) catch |err| {
         logErr("could not open object's directory '{s}': {s}", .{ dir_path, @errorName(err) });
-        file.close(io);
-        return error.OutOfMemory;
+        return error.LinkObjectFileNotReadable;
     };
     errdefer dir.close(io);
 
@@ -1472,18 +1491,20 @@ fn addLinkObjectFileImpl(ctx: *ZirContext, obj_path: []const u8) !void {
     const old = ctx.compilation.link_inputs;
     const new = try ar.alloc(link.Input, old.len + 1);
     @memcpy(new[0..old.len], old);
-    new[old.len] = .{ .object = .{
-        .path = cache_path,
-        .file = file,
-        // `must_link = true` so the linker pulls in every symbol the
-        // manager defines — including `zap_memory_section`, which the
-        // runtime bootstrap discovers by walking the linked-in `.zapmem`
-        // section. Without `must_link`, an unreferenced compositionally
-        // marked symbol could be dropped on systems whose default link
-        // policy is `--gc-sections`.
-        .must_link = true,
-        .hidden = false,
-    } };
+    new[old.len] = .{
+        .object = .{
+            .path = cache_path,
+            .file = file,
+            // `must_link = true` so the linker pulls in every symbol the
+            // manager defines — including `zap_memory_section`, which the
+            // runtime bootstrap discovers by walking the linked-in `.zapmem`
+            // section. Without `must_link`, an unreferenced compositionally
+            // marked symbol could be dropped on systems whose default link
+            // policy is `--gc-sections`.
+            .must_link = true,
+            .hidden = false,
+        },
+    };
     ctx.compilation.link_inputs = new;
 }
 
