@@ -503,19 +503,45 @@ const ZapForkDiag = struct {
 
     /// Render an `ErrorBundle` into the caller's buffer. Each error
     /// message is written on its own line with source-location prefix
-    /// where available. If the buffer fills up, the remaining errors
-    /// are summarized as `... [truncated, N more errors]`.
+    /// where available. Note (sub-message) records attached to each
+    /// error message are written as additional indented `note:` lines
+    /// immediately after their parent error, mirroring
+    /// `dumpErrorBundle` (the stderr path). If the buffer fills up,
+    /// the remaining errors are summarized as `... [truncated, N more
+    /// errors]`. Notes belonging to a parent error that itself didn't
+    /// fit are elided implicitly; notes belonging to a parent that
+    /// did fit are dropped silently if there's no room — the parent's
+    /// presence is the primary signal and is preserved.
+    ///
+    /// Buffer layout (cap = self.cap):
+    ///   [0 .. cap-1-marker_reserve)         normal output region
+    ///   [cap-1-marker_reserve .. cap-1)     reserved for truncation marker
+    ///   [cap-1]                             NUL terminator slot
+    ///
+    /// `marker_reserve` is sized to fit the longest possible truncation
+    /// marker (`... [truncated, N more errors]`) up to a 10-digit
+    /// `omitted` count, plus a leading newline so the marker always
+    /// starts on its own line even when the last in-region write
+    /// happens to be a partial fragment. Reserving up front guarantees
+    /// the marker can always be emitted intact when needed, and never
+    /// clobbers a trailing newline from earlier output.
     fn writeErrorBundle(self: ZapForkDiag, eb: std.zig.ErrorBundle) void {
         if (self.cap == 0) return;
         const out = self.buf orelse return;
-        // Reserve one byte for NUL and one for an optional truncation
-        // marker. We rewrite the truncation marker after the main loop
-        // if any error didn't fit.
-        var writer = std.Io.Writer.fixed(out[0 .. self.cap - 1]);
+        // Longest truncation marker shape (leading newline + body +
+        // up to 10 decimal digits for the count); use a static upper
+        // bound so the reserve is comptime-known. If the buffer is
+        // smaller than `marker_reserve + 1` (for NUL), skip reserving
+        // and fall back to no-marker behavior — the buffer is too
+        // small to be useful anyway.
+        const marker_reserve: usize = "\n... [truncated, 4294967295 more errors]".len;
+        const reserve = if (self.cap >= marker_reserve + 1) marker_reserve else 0;
+
+        var writer = std.Io.Writer.fixed(out[0 .. self.cap - 1 - reserve]);
 
         const messages = eb.getMessages();
         var first_omitted_index: ?u32 = null;
-        for (messages, 0..) |msg_index, i| {
+        outer: for (messages, 0..) |msg_index, i| {
             const err_msg = eb.getErrorMessage(msg_index);
             const text = eb.nullTerminatedString(err_msg.msg);
 
@@ -529,22 +555,118 @@ const ZapForkDiag = struct {
 
             printed catch {
                 first_omitted_index = @intCast(i);
-                break;
+                break :outer;
             };
+
+            // Notes are best-effort: once the parent error has been
+            // recorded, dropping a note loses context but does not
+            // change the count of errors reported. If a note doesn't
+            // fit, stop emitting notes for this error and continue to
+            // the next error (which may still fit if it's shorter).
+            for (eb.getNotes(msg_index)) |note_index| {
+                const note = eb.getErrorMessage(note_index);
+                const note_text = eb.nullTerminatedString(note.msg);
+                const note_printed = if (note.src_loc != .none) blk: {
+                    const note_src = eb.getSourceLocation(note.src_loc);
+                    const note_path = eb.nullTerminatedString(note_src.src_path);
+                    break :blk writer.print("       {s}:{d}:{d}: note: {s}\n", .{
+                        note_path, note_src.line + 1, note_src.column + 1, note_text,
+                    });
+                } else writer.print("       note: {s}\n", .{note_text});
+
+                note_printed catch break;
+            }
         }
 
+        // End of normal output region. The reserve tail is still
+        // available for the truncation marker.
+        var end: usize = writer.end;
         if (first_omitted_index) |idx| {
             const omitted = @as(u32, @intCast(messages.len)) - idx;
-            // Best-effort truncation marker. If the marker itself
-            // does not fit, we silently drop it — the buffer is
-            // already saturated and NUL-terminating is the only
-            // remaining guarantee.
-            writer.print("... [truncated, {d} more errors]", .{omitted}) catch {};
+            // Render the marker into the reserved tail using a
+            // separate fixed writer; this cannot fail to fit because
+            // `marker_reserve` was sized for the worst case.
+            if (reserve != 0) {
+                var marker_writer = std.Io.Writer.fixed(out[end .. end + reserve]);
+                marker_writer.print("\n... [truncated, {d} more errors]", .{omitted}) catch {};
+                end += marker_writer.end;
+            }
         }
 
-        out[writer.end] = 0;
+        out[end] = 0;
     }
 };
+
+/// Resolve a platform-appropriate default cache directory.
+///
+/// On Linux/macOS this is `/tmp/zap-fork-cache` (preserves the spike's
+/// historical behavior). On Windows this is `%TEMP%\zap-fork-cache`
+/// (or `%TMP%\zap-fork-cache` as a fallback). On any other host this
+/// returns `error.UnsupportedOs` so the caller can surface a clear
+/// diagnostic — callers on exotic hosts must pass an explicit override.
+///
+/// Returned slice is allocated in `ar` so its lifetime matches the
+/// caller's arena.
+fn defaultCachePath(ar: Allocator) ![]const u8 {
+    return switch (builtin.target.os.tag) {
+        .linux, .macos => "/tmp/zap-fork-cache",
+        .windows => blk: {
+            // Try TEMP first (the conventional Windows variable),
+            // then TMP as a fallback. Both follow the same path
+            // convention (no trailing separator). If neither is set,
+            // surface the failure clearly rather than silently
+            // defaulting to a path that may not be writable.
+            const temp: []const u8 = temp_blk: {
+                if (std.process.getEnvVarOwned(ar, "TEMP")) |t| {
+                    break :temp_blk t;
+                } else |err| switch (err) {
+                    error.EnvironmentVariableNotFound => {},
+                    else => return err,
+                }
+                if (std.process.getEnvVarOwned(ar, "TMP")) |t| {
+                    break :temp_blk t;
+                } else |err| switch (err) {
+                    error.EnvironmentVariableNotFound => return error.WindowsTempEnvMissing,
+                    else => return err,
+                }
+            };
+            break :blk try std.fmt.allocPrint(ar, "{s}\\zap-fork-cache", .{temp});
+        },
+        else => error.UnsupportedOs,
+    };
+}
+
+/// Returns true iff `(arch, os_tag, abi_tag)` is one of the five
+/// (arch, os, abi) triples enumerated in spec Appendix C.1:
+///   * `x86_64-linux-gnu`
+///   * `x86_64-macos-none`
+///   * `aarch64-linux-gnu`
+///   * `aarch64-macos-none`
+///   * `x86_64-windows-msvc`
+///
+/// Any other combination — even if each tag individually resolves to a
+/// valid enum value — is outside the v1.0 supported set and the
+/// primitive rejects it with `TargetUnsupported`.
+fn isSupportedTriple(
+    arch: std.Target.Cpu.Arch,
+    os_tag: std.Target.Os.Tag,
+    abi_tag: std.Target.Abi,
+) bool {
+    return switch (arch) {
+        .x86_64 => switch (os_tag) {
+            .linux => abi_tag == .gnu,
+            .macos => abi_tag == .none,
+            .windows => abi_tag == .msvc,
+            else => false,
+        },
+        .aarch64 => switch (os_tag) {
+            .linux => abi_tag == .gnu,
+            .macos => abi_tag == .none,
+            else => false,
+        },
+        else => false,
+    };
+}
 
 /// Compile a Zig source file to an object file in-process.
 ///
@@ -552,16 +674,21 @@ const ZapForkDiag = struct {
 /// `target` specifies the cross-compile target. Pass
 /// `arch_tag = ZAP_FORK_ARCH_NATIVE` (0xFFFF) for native compilation;
 /// the implementation rejects any other invalid combination with
-/// `TargetUnsupported`. `target._reserved` must be zero in v1.0; the
-/// primitive rejects a non-zero value with `TargetUnsupported`.
+/// `TargetUnsupported`. The resolved triple — whether from explicit
+/// tags or the native sentinel — is checked against the v1.0 supported
+/// whitelist (Appendix C.1); unsupported triples are rejected with a
+/// diagnostic naming the requested triple. `target._reserved` must be
+/// zero in v1.0; the primitive rejects a non-zero value with
+/// `TargetUnsupported`.
 /// `optimize` selects the optimize mode.
 /// `out_diagnostic_buffer`/`out_diagnostic_capacity` receive a UTF-8
 /// diagnostic message on non-Ok return; pass null to discard. On
 /// `CompilationFailed` the buffer is populated with the formatted
 /// contents of the Zig compiler's structured `ErrorBundle` (one error
-/// per line with source-location prefix); the rest of the messages are
-/// summarized as `... [truncated, N more errors]` if the buffer fills
-/// up. On `Ok` return, the buffer is left untouched.
+/// per line with source-location prefix; note records appear as
+/// indented `note:` lines below their parent error); the rest of the
+/// messages are summarized as `... [truncated, N more errors]` if the
+/// buffer fills up. On `Ok` return, the buffer is left untouched.
 ///
 /// Thread safety: the function spins up its own `Compilation` instance
 /// and tears it down before returning. Concurrent calls from different
@@ -596,9 +723,14 @@ pub export fn zap_fork_compile_zig_to_object(
     /// running binary is not laid out like a Zig install.
     zig_lib_dir_opt: ?[*:0]const u8,
     /// Optional caller-supplied local cache directory. Pass null to
-    /// use the primitive's default (`/tmp/zap-fork-cache`). Callers
-    /// driving many compilations (e.g., Zap's build orchestrator) can
-    /// thread their own per-build cache through this argument.
+    /// use the primitive's platform default (`/tmp/zap-fork-cache` on
+    /// Linux/macOS, `%TEMP%\zap-fork-cache` on Windows). On hosts that
+    /// have no documented default, the primitive returns
+    /// `InternalError` with an explanatory diagnostic, so exotic-host
+    /// callers must thread an explicit path through this argument.
+    /// Callers driving many compilations (e.g., Zap's build
+    /// orchestrator) can thread their own per-build cache through this
+    /// argument.
     local_cache_dir_opt: ?[*:0]const u8,
     /// Optional caller-supplied global cache directory. Pass null to
     /// use the same default as `local_cache_dir_opt`.
@@ -612,20 +744,37 @@ pub export fn zap_fork_compile_zig_to_object(
     const source_path_slice = mem.sliceTo(source_path, 0);
     const out_object_path_slice = mem.sliceTo(out_object_path, 0);
 
+    // Reserved field validation. v1.0 fixes `_reserved` to zero;
+    // a non-zero value indicates either caller error or a struct
+    // built against a future ABI version we cannot interpret
+    // safely. This check runs unconditionally — including when
+    // `arch_tag == ZAP_FORK_ARCH_NATIVE` — because the spec rules
+    // `_reserved` is fixed for the entire struct, not just the
+    // explicit-triple branch (Appendix C of the spec).
+    if (target._reserved != 0) {
+        diag.write("zap_fork: target._reserved must be 0 (got {d})", .{target._reserved});
+        return .TargetUnsupported;
+    }
+
     // Resolve target. Special sentinel `ZAP_FORK_ARCH_NATIVE` for
     // native; otherwise construct a target query directly from the
     // wire-format triple.
     const target_query: std.Target.Query = blk: {
         if (target.arch_tag == ZAP_FORK_ARCH_NATIVE) {
+            // For the native sentinel, resolve the host triple and
+            // verify it's in the v1.0 supported whitelist. An
+            // experimental developer machine whose host doesn't
+            // appear in the supported set must fail clearly rather
+            // than silently miscompiling.
+            const host = builtin.target;
+            if (!isSupportedTriple(host.cpu.arch, host.os.tag, host.abi)) {
+                diag.write(
+                    "zap_fork: native host triple {s}-{s}-{s} is not in the v1.0 supported set",
+                    .{ @tagName(host.cpu.arch), @tagName(host.os.tag), @tagName(host.abi) },
+                );
+                return .TargetUnsupported;
+            }
             break :blk .{};
-        }
-        // Reserved field validation. v1.0 fixes `_reserved` to zero;
-        // a non-zero value indicates either caller error or a struct
-        // built against a future ABI version we cannot interpret
-        // safely.
-        if (target._reserved != 0) {
-            diag.write("zap_fork: target._reserved must be 0 (got {d})", .{target._reserved});
-            return .TargetUnsupported;
         }
         // Validate the triple against the v1.0 supported set (Appendix C).
         const arch: std.Target.Cpu.Arch = inline for (@typeInfo(std.Target.Cpu.Arch).@"enum".fields) |f| {
@@ -646,6 +795,18 @@ pub export fn zap_fork_compile_zig_to_object(
             diag.write("zap_fork: unsupported abi_tag={d}", .{target.abi_tag});
             return .TargetUnsupported;
         };
+        // Whitelist check: even though each individual tag resolves
+        // to a valid enum value, the v1.0 spec (Appendix C.1) supports
+        // exactly five (arch, os, abi) triples. Any other combination
+        // is rejected here with a diagnostic that names the requested
+        // triple.
+        if (!isSupportedTriple(arch, os_tag, abi_tag)) {
+            diag.write(
+                "zap_fork: unsupported target triple {s}-{s}-{s} (v1.0 supports x86_64-linux-gnu, x86_64-macos-none, aarch64-linux-gnu, aarch64-macos-none, x86_64-windows-msvc)",
+                .{ @tagName(arch), @tagName(os_tag), @tagName(abi_tag) },
+            );
+            return .TargetUnsupported;
+        }
         break :blk .{
             .cpu_arch = arch,
             .os_tag = os_tag,
@@ -764,11 +925,41 @@ fn compileToObjectImpl(
         };
     };
 
-    // Resolve local and global cache paths. Defaults match the spike's
-    // historical behaviour (`/tmp/zap-fork-cache`); callers driving
-    // many compilations (e.g., Zap's build orchestrator) can override
-    // both independently.
-    const default_cache_path: []const u8 = "/tmp/zap-fork-cache";
+    // Resolve local and global cache paths. On Linux/macOS the default
+    // is `/tmp/zap-fork-cache` (matches the spike's historical
+    // behaviour); on Windows we use `%TEMP%\zap-fork-cache` because
+    // `/tmp` does not exist. On any other host the primitive emits an
+    // `OutputDirInaccessible` diagnostic naming the OS — callers on
+    // exotic hosts must pass `local_cache_dir_opt`/`global_cache_dir_opt`
+    // explicitly. Callers driving many compilations (e.g., Zap's build
+    // orchestrator) can override both independently.
+    const default_cache_path: []const u8 = if (local_cache_dir_opt != null and global_cache_dir_opt != null)
+        // Both caller-supplied — the placeholder is never read.
+        ""
+    else
+        defaultCachePath(ar) catch |err| switch (err) {
+            error.UnsupportedOs => {
+                diag.write(
+                    "zap_fork: no default cache path for OS '{s}'; pass local_cache_dir_opt/global_cache_dir_opt",
+                    .{@tagName(builtin.target.os.tag)},
+                );
+                return error.OutputDirInaccessible;
+            },
+            error.WindowsTempEnvMissing => {
+                diag.write(
+                    "zap_fork: cannot resolve default cache path: neither TEMP nor TMP env var is set",
+                    .{},
+                );
+                return error.OutputDirInaccessible;
+            },
+            else => {
+                diag.write(
+                    "zap_fork: failed to resolve default cache path: {s}",
+                    .{@errorName(err)},
+                );
+                return error.OutputDirInaccessible;
+            },
+        };
     const local_cache_path: []const u8 = local_cache_dir_opt orelse default_cache_path;
     const global_cache_path: []const u8 = global_cache_dir_opt orelse default_cache_path;
 
@@ -867,9 +1058,13 @@ fn compileToObjectImpl(
     {
         const out_dir = std.fs.path.dirname(out_object_path) orelse ".";
         cwd.access(io, out_dir, .{ .write = true }) catch |err| switch (err) {
-            // For an empty/relative path that resolves to the cwd, an
-            // access check usually succeeds. Treat permission-denied,
-            // file-not-found, etc. as a clear caller error.
+            // All `access` failures (permission denied, file not
+            // found, name too long, etc.) collapse to
+            // `OutputDirInaccessible`. The diagnostic preserves the
+            // underlying OS error name (`@errorName(err)`) so callers
+            // can still distinguish cases at the message level
+            // without us hard-coding a switch over an open-ended
+            // platform-error set.
             else => {
                 diag.write(
                     "zap_fork: output directory not accessible: {s} ({s})",
@@ -972,7 +1167,15 @@ fn compileToObjectImpl(
             return error.CompilationFailed;
         };
         defer error_bundle.deinit(gpa);
-        diag.writeErrorBundle(error_bundle);
+        // Mirror the line ~1053 pattern: if `anyErrors()` returns true
+        // but the bundle is empty, the compiler is in an anomalous
+        // state — surface that explicitly rather than handing the
+        // caller a `CompilationFailed` with an empty diagnostic.
+        if (error_bundle.errorMessageCount() > 0) {
+            diag.writeErrorBundle(error_bundle);
+        } else {
+            diag.write("zap_fork: anyErrors() is true but error bundle is empty (compiler is in an anomalous state)", .{});
+        }
         return error.CompilationFailed;
     }
 }
