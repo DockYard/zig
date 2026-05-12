@@ -323,6 +323,27 @@ pub export fn zir_compilation_add_link_lib(
     return 0;
 }
 
+/// Append an object file to the compilation's link inputs.
+///
+/// Used by Zap's memory-manager driver (Memory Manager ABI v1.0,
+/// `docs/memory-manager-abi.md` section 10) to splice a separately-compiled
+/// manager `.o` into the final binary's link line. The caller has already
+/// produced the object via `zap_fork_compile_zig_to_object` and parsed and
+/// validated the resulting `.zapmem` section; this entry point only
+/// performs the link-time mechanical step.
+///
+/// Returns 0 on success, -1 on failure (file not found, allocation, etc.).
+/// Must be invoked AFTER `zir_compilation_create*` and BEFORE
+/// `zir_compilation_update`.
+pub export fn zir_compilation_add_link_object_file(
+    ctx: ?*ZirContext,
+    path: [*:0]const u8,
+) callconv(.c) i32 {
+    const c = ctx orelse return -1;
+    addLinkObjectFileImpl(c, mem.sliceTo(path, 0)) catch return -1;
+    return 0;
+}
+
 /// Destroy the compilation context and free all resources.
 pub export fn zir_compilation_destroy(ctx: *ZirContext) void {
     const gpa = ctx.gpa;
@@ -1408,6 +1429,62 @@ fn addLinkLibImpl(ctx: *ZirContext, lib_name: []const u8) !void {
 
     logErr("system library not found: lib{s}", .{lib_name});
     return error.OutOfMemory;
+}
+
+/// Append a precompiled object file at `obj_path` to the compilation's
+/// `link_inputs`. Used by the Memory Manager ABI v1.0 build pipeline to
+/// splice a manager `.o` into the final binary link line.
+///
+/// The path is opened relative to the host's current working directory.
+/// On success the `Input.object` entry is added to `link_inputs` and the
+/// linker pulls in the object during the final link step. The file handle
+/// is held open for the lifetime of the `ZirContext`.
+fn addLinkObjectFileImpl(ctx: *ZirContext, obj_path: []const u8) !void {
+    const ar = ctx.arena();
+    const io = ctx.io();
+    const cwd_dir = Dir.cwd();
+
+    var file = cwd_dir.openFile(io, obj_path, .{}) catch |err| {
+        logErr("object file not found at '{s}': {s}", .{ obj_path, @errorName(err) });
+        return error.OutOfMemory;
+    };
+    errdefer file.close(io);
+
+    // Resolve a directory handle for the object's parent dir so the
+    // linker can compute paths relative to it. We split on the last
+    // separator; if the path is bare (no slash) we fall back to ".".
+    const sep_idx = std.mem.lastIndexOfAny(u8, obj_path, "/\\");
+    const dir_path: []const u8 = if (sep_idx) |idx| obj_path[0..idx] else ".";
+    const sub_path: []const u8 = if (sep_idx) |idx| obj_path[idx + 1 ..] else obj_path;
+
+    var dir = cwd_dir.openDir(io, dir_path, .{}) catch |err| {
+        logErr("could not open object's directory '{s}': {s}", .{ dir_path, @errorName(err) });
+        file.close(io);
+        return error.OutOfMemory;
+    };
+    errdefer dir.close(io);
+
+    const cache_path: Cache.Path = .{
+        .root_dir = .{ .handle = dir, .path = ar.dupe(u8, dir_path) catch null },
+        .sub_path = try ar.dupe(u8, sub_path),
+    };
+
+    const old = ctx.compilation.link_inputs;
+    const new = try ar.alloc(link.Input, old.len + 1);
+    @memcpy(new[0..old.len], old);
+    new[old.len] = .{ .object = .{
+        .path = cache_path,
+        .file = file,
+        // `must_link = true` so the linker pulls in every symbol the
+        // manager defines — including `zap_memory_section`, which the
+        // runtime bootstrap discovers by walking the linked-in `.zapmem`
+        // section. Without `must_link`, an unreferenced compositionally
+        // marked symbol could be dropped on systems whose default link
+        // policy is `--gc-sections`.
+        .must_link = true,
+        .hidden = false,
+    } };
+    ctx.compilation.link_inputs = new;
 }
 
 fn logErr(comptime fmt: []const u8, args: anytype) void {
