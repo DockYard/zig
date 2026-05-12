@@ -328,7 +328,16 @@ pub export fn zir_compilation_destroy(ctx: *ZirContext) void {
     const gpa = ctx.gpa;
     const io = ctx.io();
 
-    if (ctx.compilation.zcu) |zcu| zcu.deinit();
+    // `Compilation.destroy` cleans up all resources allocated by
+    // `Compilation.create` (bin_file, cache_use, c_object_work_queue,
+    // win32_resource_work_queue, windows_libs, crt_files,
+    // libcxx/libcxxabi/libunwind/tsan/ubsan_rt/compiler_rt static libs,
+    // glibc_so_files, c_object_table, failed_c_objects,
+    // win32_resource_table, failed_win32_resources, time_report,
+    // link_diags, oneshot_prelink_tasks, misc_failures,
+    // cache_parent.manifest_dir). It also handles `zcu.deinit()` for
+    // us, so we don't call it manually.
+    ctx.compilation.destroy();
     ctx.dirs.deinit(io);
     ctx.io_impl.deinit();
     ctx.arena_state.deinit();
@@ -425,6 +434,12 @@ pub const ZapForkTarget = extern struct {
     _reserved: u16,
 };
 
+/// Sentinel value for `ZapForkTarget.arch_tag` that requests the host
+/// target. When set, `os_tag` and `abi_tag` are ignored and the
+/// primitive selects the running compiler's native target. See spec
+/// Appendix C.
+pub const ZAP_FORK_ARCH_NATIVE: u16 = 0xFFFF;
+
 /// Optimize mode. Mirrors `std.builtin.OptimizeMode` ordering.
 pub const ZapForkOptimize = enum(c_int) {
     Debug = 0,
@@ -442,18 +457,111 @@ pub const ZapForkResult = enum(c_int) {
     InternalError = 99,
 };
 
+/// Diagnostic buffer writer used by `zap_fork_compile_zig_to_object`
+/// and its internal helpers. The buffer is caller-supplied (UTF-8,
+/// NUL-terminated on return) and bounded; oversize messages are
+/// truncated with a clear marker.
+///
+/// The `Writer` is a `std.Io.Writer.fixed` over the caller's buffer so
+/// that we can render `Compilation.CreateDiagnostic` and
+/// `ErrorBundle` messages directly into it without an intermediate
+/// allocation. When the buffer fills up, `Writer` returns
+/// `error.WriteFailed`; the caller is expected to record the
+/// truncation marker.
+const ZapForkDiag = struct {
+    /// Pointer to the caller's buffer, or null if the caller passed
+    /// `null` for the diagnostic argument.
+    buf: ?[*]u8,
+    /// Buffer capacity in bytes (including the trailing NUL slot).
+    cap: usize,
+
+    /// Format a small message into the caller's buffer. Truncates if
+    /// the rendered text exceeds the capacity. Always NUL-terminates.
+    fn write(self: ZapForkDiag, comptime fmt: []const u8, args: anytype) void {
+        if (self.cap == 0) return;
+        const out = self.buf orelse return;
+        var scratch: [1024]u8 = undefined;
+        const printed = std.fmt.bufPrint(&scratch, fmt, args) catch &scratch;
+        const copy_len = @min(printed.len, self.cap - 1);
+        @memcpy(out[0..copy_len], printed[0..copy_len]);
+        out[copy_len] = 0;
+    }
+
+    /// Render `Compilation.CreateDiagnostic` through its `format`
+    /// method into the caller's buffer. The diagnostic union carries
+    /// structured fields (cache path, libc-detection error, etc.); the
+    /// `format` method is the canonical way to flatten them to a
+    /// human-readable message.
+    fn writeCreateDiag(self: ZapForkDiag, diag: Compilation.CreateDiagnostic) void {
+        if (self.cap == 0) return;
+        const out = self.buf orelse return;
+        // Reserve one byte for NUL.
+        var writer = std.Io.Writer.fixed(out[0 .. self.cap - 1]);
+        writer.print("zap_fork: Compilation.create failed: {f}", .{diag}) catch {};
+        out[writer.end] = 0;
+    }
+
+    /// Render an `ErrorBundle` into the caller's buffer. Each error
+    /// message is written on its own line with source-location prefix
+    /// where available. If the buffer fills up, the remaining errors
+    /// are summarized as `... [truncated, N more errors]`.
+    fn writeErrorBundle(self: ZapForkDiag, eb: std.zig.ErrorBundle) void {
+        if (self.cap == 0) return;
+        const out = self.buf orelse return;
+        // Reserve one byte for NUL and one for an optional truncation
+        // marker. We rewrite the truncation marker after the main loop
+        // if any error didn't fit.
+        var writer = std.Io.Writer.fixed(out[0 .. self.cap - 1]);
+
+        const messages = eb.getMessages();
+        var first_omitted_index: ?u32 = null;
+        for (messages, 0..) |msg_index, i| {
+            const err_msg = eb.getErrorMessage(msg_index);
+            const text = eb.nullTerminatedString(err_msg.msg);
+
+            const printed = if (err_msg.src_loc != .none) blk: {
+                const src = eb.getSourceLocation(err_msg.src_loc);
+                const path = eb.nullTerminatedString(src.src_path);
+                break :blk writer.print("[{d}] {s}:{d}:{d}: error: {s}\n", .{
+                    i, path, src.line + 1, src.column + 1, text,
+                });
+            } else writer.print("[{d}] error: {s}\n", .{ i, text });
+
+            printed catch {
+                first_omitted_index = @intCast(i);
+                break;
+            };
+        }
+
+        if (first_omitted_index) |idx| {
+            const omitted = @as(u32, @intCast(messages.len)) - idx;
+            // Best-effort truncation marker. If the marker itself
+            // does not fit, we silently drop it — the buffer is
+            // already saturated and NUL-terminating is the only
+            // remaining guarantee.
+            writer.print("... [truncated, {d} more errors]", .{omitted}) catch {};
+        }
+
+        out[writer.end] = 0;
+    }
+};
+
 /// Compile a Zig source file to an object file in-process.
 ///
 /// `source_path` and `out_object_path` are null-terminated UTF-8 paths.
-/// `target` specifies the cross-compile target. Pass `arch_tag = max u16`
-/// (0xFFFF) for native compilation; the implementation rejects any other
-/// invalid combination with `TargetUnsupported`.
+/// `target` specifies the cross-compile target. Pass
+/// `arch_tag = ZAP_FORK_ARCH_NATIVE` (0xFFFF) for native compilation;
+/// the implementation rejects any other invalid combination with
+/// `TargetUnsupported`. `target._reserved` must be zero in v1.0; the
+/// primitive rejects a non-zero value with `TargetUnsupported`.
 /// `optimize` selects the optimize mode.
 /// `out_diagnostic_buffer`/`out_diagnostic_capacity` receive a UTF-8
-/// diagnostic message on non-Ok return; pass null to discard. The
-/// implementation writes at most `out_diagnostic_capacity` bytes
-/// (including a trailing NUL if space permits) and truncates the message
-/// otherwise. On `Ok` return, the buffer is left untouched.
+/// diagnostic message on non-Ok return; pass null to discard. On
+/// `CompilationFailed` the buffer is populated with the formatted
+/// contents of the Zig compiler's structured `ErrorBundle` (one error
+/// per line with source-location prefix); the rest of the messages are
+/// summarized as `... [truncated, N more errors]` if the buffer fills
+/// up. On `Ok` return, the buffer is left untouched.
 ///
 /// Thread safety: the function spins up its own `Compilation` instance
 /// and tears it down before returning. Concurrent calls from different
@@ -487,41 +595,37 @@ pub export fn zap_fork_compile_zig_to_object(
     /// dir at runtime, must pass that temp dir explicitly because the
     /// running binary is not laid out like a Zig install.
     zig_lib_dir_opt: ?[*:0]const u8,
+    /// Optional caller-supplied local cache directory. Pass null to
+    /// use the primitive's default (`/tmp/zap-fork-cache`). Callers
+    /// driving many compilations (e.g., Zap's build orchestrator) can
+    /// thread their own per-build cache through this argument.
+    local_cache_dir_opt: ?[*:0]const u8,
+    /// Optional caller-supplied global cache directory. Pass null to
+    /// use the same default as `local_cache_dir_opt`.
+    global_cache_dir_opt: ?[*:0]const u8,
 ) callconv(.c) ZapForkResult {
-    var diag_buf: [1024]u8 = undefined;
-    var diag_used: usize = 0;
-    const DiagOut = struct {
-        buf: ?[*]u8,
-        cap: usize,
-        used: *usize,
-        scratch: []u8,
-
-        fn write(self: @This(), comptime fmt: []const u8, args: anytype) void {
-            const written = std.fmt.bufPrint(self.scratch, fmt, args) catch self.scratch;
-            const out = self.buf orelse return;
-            const cap = self.cap;
-            if (cap == 0) return;
-            const copy_len = @min(written.len, cap - 1);
-            @memcpy(out[0..copy_len], written[0..copy_len]);
-            out[copy_len] = 0;
-            self.used.* = copy_len;
-        }
-    };
-    const diag = DiagOut{
+    const diag = ZapForkDiag{
         .buf = out_diagnostic_buffer,
         .cap = out_diagnostic_capacity,
-        .used = &diag_used,
-        .scratch = &diag_buf,
     };
 
     const source_path_slice = mem.sliceTo(source_path, 0);
     const out_object_path_slice = mem.sliceTo(out_object_path, 0);
 
-    // Resolve target. Special sentinel 0xFFFF for native; otherwise we
-    // construct a target query directly from the wire-format triple.
+    // Resolve target. Special sentinel `ZAP_FORK_ARCH_NATIVE` for
+    // native; otherwise construct a target query directly from the
+    // wire-format triple.
     const target_query: std.Target.Query = blk: {
-        if (target.arch_tag == 0xFFFF) {
+        if (target.arch_tag == ZAP_FORK_ARCH_NATIVE) {
             break :blk .{};
+        }
+        // Reserved field validation. v1.0 fixes `_reserved` to zero;
+        // a non-zero value indicates either caller error or a struct
+        // built against a future ABI version we cannot interpret
+        // safely.
+        if (target._reserved != 0) {
+            diag.write("zap_fork: target._reserved must be 0 (got {d})", .{target._reserved});
+            return .TargetUnsupported;
         }
         // Validate the triple against the v1.0 supported set (Appendix C).
         const arch: std.Target.Cpu.Arch = inline for (@typeInfo(std.Target.Cpu.Arch).@"enum".fields) |f| {
@@ -550,6 +654,8 @@ pub export fn zap_fork_compile_zig_to_object(
     };
 
     const zig_lib_dir_slice: ?[]const u8 = if (zig_lib_dir_opt) |p| mem.sliceTo(p, 0) else null;
+    const local_cache_dir_slice: ?[]const u8 = if (local_cache_dir_opt) |p| mem.sliceTo(p, 0) else null;
+    const global_cache_dir_slice: ?[]const u8 = if (global_cache_dir_opt) |p| mem.sliceTo(p, 0) else null;
 
     compileToObjectImpl(
         source_path_slice,
@@ -557,19 +663,23 @@ pub export fn zap_fork_compile_zig_to_object(
         target_query,
         optimize,
         zig_lib_dir_slice,
+        local_cache_dir_slice,
+        global_cache_dir_slice,
+        diag,
     ) catch |err| switch (err) {
         error.SourceNotFound => {
             diag.write("zap_fork: source not found: {s}", .{source_path_slice});
             return .SourceNotFound;
         },
-        error.CompilationFailed => {
-            // The internal helper has already populated the diagnostic
-            // (if any) onto stderr via the compiler's standard error
-            // bundle path. Surface a generic message here; callers that
-            // need richer diagnostics can request them through a future
-            // structured-diagnostic capability.
-            diag.write("zap_fork: compilation failed for {s}", .{source_path_slice});
-            return .CompilationFailed;
+        // For CompilationFailed and CreateFailed, `compileToObjectImpl`
+        // has already written the structured diagnostic (an
+        // `ErrorBundle` or a `Compilation.CreateDiagnostic`) into the
+        // caller's buffer. Don't overwrite it here.
+        error.CompilationFailed => return .CompilationFailed,
+        error.CreateFailed => return .CompilationFailed,
+        error.OutputDirInaccessible => {
+            // Diagnostic was written by the impl with the full path.
+            return .InternalError;
         },
         else => {
             diag.write("zap_fork: internal error: {s}", .{@errorName(err)});
@@ -583,6 +693,8 @@ pub export fn zap_fork_compile_zig_to_object(
 const CompileToObjectError = error{
     SourceNotFound,
     CompilationFailed,
+    CreateFailed,
+    OutputDirInaccessible,
     OutOfMemory,
     UnableToResolveTarget,
 };
@@ -593,6 +705,9 @@ fn compileToObjectImpl(
     target_query: std.Target.Query,
     optimize: ZapForkOptimize,
     zig_lib_dir_opt: ?[]const u8,
+    local_cache_dir_opt: ?[]const u8,
+    global_cache_dir_opt: ?[]const u8,
+    diag: ZapForkDiag,
 ) CompileToObjectError!void {
     const gpa = std.heap.c_allocator;
 
@@ -602,8 +717,13 @@ fn compileToObjectImpl(
 
     // Initialize an Io.Threaded instance for this compile. Reuses the
     // same threading model as createImpl above. We allow up to 4 worker
-    // threads, mirroring the rest of zir_api.zig.
-    const thread_limit = @min(std.Thread.getCpuCount() catch 1, 4);
+    // threads, mirroring the rest of zir_api.zig. The `catch 2`
+    // fallback handles platforms where `getCpuCount` fails. We choose
+    // 2 (rather than 1) so that the subsequent `Io.Limit.limited(N-1)`
+    // call always sees a non-zero limit; with `1` the limit collapses
+    // to `.limited(0)`, which is at best a noop and at worst trips a
+    // latent assertion downstream.
+    const thread_limit = @min(std.Thread.getCpuCount() catch 2, 4);
     var io_impl: Io.Threaded = .init(gpa, .{ .stack_size = 16 * 1024 * 1024 });
     defer io_impl.deinit();
     const limit: Io.Limit = .limited(thread_limit - 1);
@@ -619,6 +739,12 @@ fn compileToObjectImpl(
     // use that — Zap embeds its pinned stdlib in a tar archive and
     // unpacks it at runtime, so it must supply that path directly.
     // Otherwise auto-detect from the running compiler's self-exe.
+    //
+    // `self_exe_path` is required by `Compilation.create` regardless of
+    // whether `zig_lib_dir_opt` is supplied — the compiler uses it to
+    // anchor a number of auxiliary lookups (cache key derivation,
+    // compiler_rt source location, etc.) that are independent of the
+    // stdlib path. Always resolve it.
     const self_exe_path = std.process.executablePathAlloc(io, ar) catch |err| {
         logErr("zap_fork: executablePathAlloc failed: {s}", .{@errorName(err)});
         return error.OutOfMemory;
@@ -638,21 +764,48 @@ fn compileToObjectImpl(
         };
     };
 
-    // Use /tmp as both the local and global cache so that this primitive
-    // does not pollute the caller's project cache. A future revision
-    // will expose these as parameters so that Zap's build orchestrator
-    // controls cache placement.
-    const cache_path = "/tmp/zap-fork-cache";
+    // Resolve local and global cache paths. Defaults match the spike's
+    // historical behaviour (`/tmp/zap-fork-cache`); callers driving
+    // many compilations (e.g., Zap's build orchestrator) can override
+    // both independently.
+    const default_cache_path: []const u8 = "/tmp/zap-fork-cache";
+    const local_cache_path: []const u8 = local_cache_dir_opt orelse default_cache_path;
+    const global_cache_path: []const u8 = global_cache_dir_opt orelse default_cache_path;
 
     const cwd = Dir.cwd();
-    cwd.createDirPath(io, cache_path) catch |err| {
-        logErr("zap_fork: createDirPath({s}) failed: {s}", .{ cache_path, @errorName(err) });
+    // `createDirPath` returns `PathAlreadyExists` when the path is
+    // already present — that's the happy case, suppress it. Any other
+    // error (permission denied, ENOSPC, etc.) is fatal and must
+    // surface through the diagnostic buffer.
+    cwd.createDirPath(io, local_cache_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => {
+            diag.write("zap_fork: createDirPath({s}) failed: {s}", .{ local_cache_path, @errorName(err) });
+            return error.OutputDirInaccessible;
+        },
+    };
+    if (!mem.eql(u8, local_cache_path, global_cache_path)) {
+        cwd.createDirPath(io, global_cache_path) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => {
+                diag.write("zap_fork: createDirPath({s}) failed: {s}", .{ global_cache_path, @errorName(err) });
+                return error.OutputDirInaccessible;
+            },
+        };
+    }
+
+    const local_cache_handle = cwd.openDir(io, local_cache_path, .{}) catch |err| {
+        diag.write("zap_fork: openDir({s}) failed: {s}", .{ local_cache_path, @errorName(err) });
+        return error.OutputDirInaccessible;
     };
 
-    const cache_handle = cwd.openDir(io, cache_path, .{}) catch |err| {
-        logErr("zap_fork: openDir({s}) failed: {s}", .{ cache_path, @errorName(err) });
-        return error.OutOfMemory;
-    };
+    const global_cache_handle: Dir = if (mem.eql(u8, local_cache_path, global_cache_path))
+        local_cache_handle
+    else
+        cwd.openDir(io, global_cache_path, .{}) catch |err| {
+            diag.write("zap_fork: openDir({s}) failed: {s}", .{ global_cache_path, @errorName(err) });
+            return error.OutputDirInaccessible;
+        };
 
     var dirs: Compilation.Directories = .{
         .cwd = introspect.getResolvedCwd(io, ar) catch |err| {
@@ -660,8 +813,8 @@ fn compileToObjectImpl(
             return error.OutOfMemory;
         },
         .zig_lib = zig_lib_dir,
-        .local_cache = .{ .handle = cache_handle, .path = try ar.dupe(u8, cache_path) },
-        .global_cache = .{ .handle = cache_handle, .path = try ar.dupe(u8, cache_path) },
+        .local_cache = .{ .handle = local_cache_handle, .path = try ar.dupe(u8, local_cache_path) },
+        .global_cache = .{ .handle = global_cache_handle, .path = try ar.dupe(u8, global_cache_path) },
     };
     defer dirs.deinit(io);
 
@@ -705,6 +858,26 @@ fn compileToObjectImpl(
     {
         const f = cwd.openFile(io, source_path, .{}) catch return error.SourceNotFound;
         defer f.close(io);
+    }
+
+    // Pre-validate the output path's parent directory. If the parent
+    // does not exist or is not writable, fail fast with a clear
+    // diagnostic instead of letting `Compilation.create` fail at link
+    // time with a generic "open output binary" error.
+    {
+        const out_dir = std.fs.path.dirname(out_object_path) orelse ".";
+        cwd.access(io, out_dir, .{ .write = true }) catch |err| switch (err) {
+            // For an empty/relative path that resolves to the cwd, an
+            // access check usually succeeds. Treat permission-denied,
+            // file-not-found, etc. as a clear caller error.
+            else => {
+                diag.write(
+                    "zap_fork: output directory not accessible: {s} ({s})",
+                    .{ out_dir, @errorName(err) },
+                );
+                return error.OutputDirInaccessible;
+            },
+        };
     }
 
     const dir_path = std.fs.path.dirname(source_path) orelse ".";
@@ -753,33 +926,53 @@ fn compileToObjectImpl(
         // objects.
         .skip_linker_dependencies = true,
         .entry = .default,
-    }) catch |err| {
-        logErr("zap_fork: Compilation.create failed: {s}", .{@errorName(err)});
-        return error.CompilationFailed;
+    }) catch |err| switch (err) {
+        // `CreateFail` is the carrier for the structured diagnostic;
+        // surface the contents of `create_diag` through the caller's
+        // buffer rather than burying them in a generic message.
+        error.CreateFail => {
+            diag.writeCreateDiag(create_diag);
+            return error.CreateFailed;
+        },
+        else => {
+            logErr("zap_fork: Compilation.create failed: {s}", .{@errorName(err)});
+            return error.CompilationFailed;
+        },
     };
-    defer {
-        if (compilation.zcu) |zcu| zcu.deinit();
-    }
+    // Compilation.create allocates many resources (bin_file, cache_use,
+    // c_object_work_queue, win32_resource_work_queue, windows_libs,
+    // crt_files, libcxx/libcxxabi/libunwind/tsan/ubsan_rt/compiler_rt
+    // static libs, glibc_so_files, c_object_table, failed_c_objects,
+    // win32_resource_table, failed_win32_resources, time_report,
+    // link_diags, oneshot_prelink_tasks, misc_failures,
+    // cache_parent.manifest_dir) that only `Compilation.destroy()`
+    // cleans up. The canonical caller pattern (src/main.zig:3833) uses
+    // `defer comp.destroy()`. Match that here.
+    defer compilation.destroy();
 
     const prog_node = std.Progress.start(io, .{});
     defer prog_node.end();
     compilation.update(prog_node) catch |err| {
         logErr("zap_fork: compilation.update failed: {s}", .{@errorName(err)});
         var error_bundle = compilation.getAllErrorsAlloc() catch {
+            diag.write("zap_fork: compilation.update failed: {s}", .{@errorName(err)});
             return error.CompilationFailed;
         };
         defer error_bundle.deinit(gpa);
         if (error_bundle.errorMessageCount() > 0) {
-            dumpErrorBundle(error_bundle);
+            diag.writeErrorBundle(error_bundle);
+        } else {
+            diag.write("zap_fork: compilation.update failed: {s}", .{@errorName(err)});
         }
         return error.CompilationFailed;
     };
     if (compilation.anyErrors()) {
         var error_bundle = compilation.getAllErrorsAlloc() catch {
+            diag.write("zap_fork: compilation produced errors (failed to extract bundle)", .{});
             return error.CompilationFailed;
         };
         defer error_bundle.deinit(gpa);
-        dumpErrorBundle(error_bundle);
+        diag.writeErrorBundle(error_bundle);
         return error.CompilationFailed;
     }
 }
@@ -1053,7 +1246,12 @@ fn createImpl(
     const ar = ctx.arena_state.allocator();
 
     // Initialize the Io.Threaded instance (replaces thread pool in 0.16).
-    const thread_limit = @min(std.Thread.getCpuCount() catch 1, 4);
+    // `catch 2` (not 1) ensures the subsequent `Io.Limit.limited(N-1)`
+    // call always sees a non-zero limit on platforms where `getCpuCount`
+    // fails to report. With `catch 1` the limit collapses to
+    // `.limited(0)`, which is at best a noop and risks tripping latent
+    // assertions downstream.
+    const thread_limit = @min(std.Thread.getCpuCount() catch 2, 4);
     ctx.io_impl = .init(gpa, .{
         .stack_size = 16 * 1024 * 1024,
     });
