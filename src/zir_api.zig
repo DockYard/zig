@@ -151,9 +151,19 @@ pub export fn zir_compilation_add_zir(
 /// Run semantic analysis, codegen, and linking.
 /// Returns 0 on success, non-zero if errors occurred.
 pub export fn zir_compilation_update(ctx: *ZirContext) i32 {
-    const io = ctx.io();
-    const prog_node = std.Progress.start(io, .{});
-    defer prog_node.end();
+    // `std.Progress` is process-global: `Progress.start` asserts that
+    // `node_end_index == 0` and the matching `prog_node.end()` does NOT
+    // reset that counter back to zero. Multiple compiles in the same
+    // process (e.g., the manager-object compile via
+    // `compileToObjectImpl` followed by the user-code compile here)
+    // would therefore trip the `unreachable` inside `Progress.start`
+    // on the second call.
+    //
+    // We side-step the singleton entirely by passing `Progress.Node.none`
+    // directly. The library's host (Zap's CLI) already prints its own
+    // progress via stderr; the internal compiler progress bar would
+    // overwrite that output anyway.
+    const prog_node: std.Progress.Node = .none;
     ctx.compilation.update(prog_node) catch |err| {
         logErr("update failed: {s}", .{@errorName(err)});
         // Print detailed errors
@@ -1208,8 +1218,14 @@ fn compileToObjectImpl(
     // `defer comp.destroy()`. Match that here.
     defer compilation.destroy();
 
-    const prog_node = std.Progress.start(io, .{});
-    defer prog_node.end();
+    // See the matching comment in `zir_compilation_update`. `Progress`
+    // is process-global and stateful across calls, but the manager
+    // compile is one of two sibling compiles that run inside a single
+    // Zap CLI invocation (the second being the user-code compile). The
+    // singleton state can only be initialized once per process, so we
+    // pass `.none` here and let the host (Zap CLI) own all progress
+    // reporting it cares about.
+    const prog_node: std.Progress.Node = .none;
     compilation.update(prog_node) catch |err| {
         logErr("zap_fork: compilation.update failed: {s}", .{@errorName(err)});
         var error_bundle = compilation.getAllErrorsAlloc() catch {
