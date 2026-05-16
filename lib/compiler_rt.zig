@@ -448,36 +448,24 @@ pub const gnu_f16_abi = switch (builtin.cpu.arch) {
 pub const want_sparc_abi = builtin.cpu.arch.isSPARC();
 
 /// This seems to mostly correspond to `clang::TargetInfo::HasFloat16`.
+///
+/// This delegates the actual decision to `std.Target.f16ConversionAbi`, which
+/// is the single source of truth shared with the self-hosted code generators.
+/// Routing the callee signature (here) and the caller lowering (in the
+/// backends) through the same function makes it impossible for the two sides
+/// of the f16-conversion ABI to drift apart.
 pub fn F16T(comptime OtherType: type) type {
-    return switch (builtin.cpu.arch) {
-        .amdgcn,
-        .arm,
-        .armeb,
-        .thumb,
-        .thumbeb,
-        .aarch64,
-        .aarch64_be,
-        .hexagon,
-        .loongarch32,
-        .loongarch64,
-        .nvptx,
-        .nvptx64,
-        .riscv32,
-        .riscv32be,
-        .riscv64,
-        .riscv64be,
-        .s390x,
-        .spirv32,
-        .spirv64,
-        => f16,
-        .x86, .x86_64 => if (builtin.target.os.tag.isDarwin()) switch (OtherType) {
-            // Starting with LLVM 16, Darwin uses different abi for f16
-            // depending on the type of the other return/argument..???
-            f32, f64 => u16,
-            f80, f128 => f16,
-            else => unreachable,
-        } else f16,
-        else => u16,
+    const other_float_bits: u16 = switch (OtherType) {
+        f16 => 16,
+        f32 => 32,
+        f64 => 64,
+        f80 => 80,
+        f128 => 128,
+        else => @compileError("unsupported F16T companion type: " ++ @typeName(OtherType)),
+    };
+    return switch (std.Target.f16ConversionAbi(&builtin.target, other_float_bits)) {
+        .sse_f16 => f16,
+        .gp_u16 => u16,
     };
 }
 

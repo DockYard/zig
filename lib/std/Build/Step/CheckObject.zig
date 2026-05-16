@@ -1125,6 +1125,13 @@ const MachODumper = struct {
                         if (sym.n_type.bits.pext) try writer.writeAll(" private");
                         try writer.writeAll(" external");
                     } else if (sym.n_type.bits.pext) try writer.writeAll(" (was private external)");
+                    // For a defined symbol this bit is `N_NO_DEAD_STRIP`: the
+                    // symbol must not be removed by `-dead_strip`. This is the
+                    // attribute LLVM emits for `@llvm.used` members and the
+                    // one the self-hosted MachO linker treats as a GC root
+                    // (`link/MachO/dead_strip.zig`). Mirrors `nm -m`'s
+                    // `[no dead strip]`.
+                    if (sym.n_desc.discarded_or_no_dead_strip) try writer.writeAll(" [no dead strip]");
                     try writer.print(" {s}\n", .{sym_name});
                 } else if (sym.tentative()) {
                     const alignment = (@as(u16, @bitCast(sym.n_desc)) >> 8) & 0x0F;

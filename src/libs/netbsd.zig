@@ -742,6 +742,7 @@ fn buildSharedLib(
         .thread_limit = comp.thread_limit,
         .dirs = comp.dirs.withoutLocalCache(),
         .self_exe_path = comp.self_exe_path,
+        .internal_tools_in_process = comp.internal_tools_in_process,
         // Because we manually cache the whole set of objects, we don't cache the individual objects
         // within it. In fact, we *can't* do that, because we need `emit_bin` to specify the path.
         .cache_mode = .none,

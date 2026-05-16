@@ -302,7 +302,18 @@ pub const Instruction = struct {
     ) !Instruction {
         const encoding: Encoding = switch (prefix) {
             else => (try Encoding.findByMnemonic(prefix, mnemonic, ops, target)) orelse {
-                log.err("no encoding found for: {s} {s} {s} {s} {s} {s}", .{
+                // Diagnostic only — the authoritative failure signal is the
+                // `error.InvalidInstruction` returned just below, which every
+                // caller handles via `try`. This must NOT be `log.err`: a
+                // missing encoding is a normal, expected outcome when callers
+                // probe operand/mnemonic combinations (and the negative
+                // `invalid instruction` test deliberately triggers it). The
+                // test runner counts any `.err` log as a test failure, so an
+                // `.err` here would spuriously fail correct negative tests
+                // without adding information the returned error lacks. Mirrors
+                // the `.debug` level used for the success path below
+                // ("selected encoding").
+                log.debug("no encoding found for: {s} {s} {s} {s} {s} {s}", .{
                     @tagName(prefix),
                     @tagName(mnemonic),
                     @tagName(if (ops.len > 0) Encoding.Op.fromOperand(ops[0], target) else .none),
@@ -1184,6 +1195,40 @@ fn expectEqualHexStrings(expected: []const u8, given: []const u8, assembly: []co
     return error.TestFailed;
 }
 
+// `Instruction.new` (and `Encoding.findByMnemonic`/`Op.fromOperand`)
+// have required a `target: *const std.Target` argument since the
+// self-hosted x86_64 backend was reworked. These embedded encoder
+// tests were never updated and have been committed-broken at
+// 3 arguments ever since, so a clean-cache `test-unit` build of this
+// file failed to compile (it only ever succeeded from a stale cache).
+// The encoder is x86_64-specific, so the tests need an x86_64 target
+// regardless of the host arch. Build a host-independent comptime
+// `std.Target` for x86_64 once and thread it through every test
+// call-site. `freestanding`/`.none` would also satisfy `findByMnemonic`
+// (it only inspects `cpu.arch`, `cpu.has(...)`, and register
+// `bitSize`), but a Linux/GNU/ELF baseline mirrors the real backend
+// target shape and keeps the version range well-formed.
+const x86_64_test_target: std.Target = test_target: {
+    const os = std.Target.Os.Tag.defaultVersionRange(.linux, .x86_64, .gnu);
+    var cpu = std.Target.Cpu.baseline(.x86_64, os);
+    // `Encoding.findByMnemonic` filters encodings by the target CPU feature
+    // set. The encoder tests deliberately exercise SSE3 instructions (e.g.
+    // `fisttp`, which is gated on `sse3 x87` in `encodings.zon` and has an
+    // expected byte sequence in the `assemble` test). The bare x86_64
+    // baseline includes SSE/SSE2 but not SSE3, so `fisttp` failed to encode
+    // ("no encoding found"). Before `Instruction.new` took a target, encoding
+    // was not feature-gated and these instructions always resolved; enabling
+    // SSE3 here restores that behavior for the now feature-gated API while
+    // keeping the rest of the baseline intact.
+    cpu.features.addFeature(@intFromEnum(std.Target.x86.Feature.sse3));
+    break :test_target .{
+        .cpu = cpu,
+        .os = os,
+        .abi = .gnu,
+        .ofmt = .elf,
+    };
+};
+
 const TestEncode = struct {
     buffer: [32]u8 = undefined,
     index: usize = 0,
@@ -1194,9 +1239,9 @@ const TestEncode = struct {
         ops: []const Instruction.Operand,
     ) !void {
         var writer: std.Io.Writer = .fixed(&enc.buffer);
-        const inst: Instruction = try .new(.none, mnemonic, ops);
+        const inst: Instruction = try .new(.none, mnemonic, ops, &x86_64_test_target);
         try inst.encode(&writer, .{});
-        enc.index = writer.bufferedLen();
+        enc.index = writer.end;
     }
 
     fn code(enc: TestEncode) []const u8 {
@@ -1205,15 +1250,15 @@ const TestEncode = struct {
 };
 
 test "encode" {
-    var buf = std.array_list.Managed(u8).init(testing.allocator);
-    defer buf.deinit();
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
 
     const inst: Instruction = try .new(.none, .mov, &.{
         .{ .reg = .rbx },
         .{ .imm = .u(4) },
-    });
-    try inst.encode(buf.writer(), .{});
-    try testing.expectEqualSlices(u8, &.{ 0x48, 0xc7, 0xc3, 0x4, 0x0, 0x0, 0x0 }, buf.items);
+    }, &x86_64_test_target);
+    try inst.encode(&aw.writer, .{});
+    try testing.expectEqualSlices(u8, &.{ 0x48, 0xc7, 0xc3, 0x4, 0x0, 0x0, 0x0 }, aw.writer.buffered());
 }
 
 test "lower I encoding" {
@@ -1943,7 +1988,7 @@ test "lower NP encoding" {
 }
 
 fn invalidInstruction(mnemonic: Instruction.Mnemonic, ops: []const Instruction.Operand) !void {
-    const err: Instruction = .new(.none, mnemonic, ops);
+    const err = Instruction.new(.none, mnemonic, ops, &x86_64_test_target);
     try testing.expectError(error.InvalidInstruction, err);
 }
 
@@ -1996,7 +2041,7 @@ test "invalid instruction" {
 }
 
 fn cannotEncode(mnemonic: Instruction.Mnemonic, ops: []const Instruction.Operand) !void {
-    try testing.expectError(error.CannotEncode, .new(.none, mnemonic, ops));
+    try testing.expectError(error.CannotEncode, Instruction.new(.none, mnemonic, ops, &x86_64_test_target));
 }
 
 test "cannot encode" {
@@ -2180,7 +2225,7 @@ const Assembler = struct {
 
     pub fn assemble(as: *Assembler, w: *Writer) !void {
         while (try as.next()) |parsed_inst| {
-            const inst: Instruction = try .new(.none, parsed_inst.mnemonic, &parsed_inst.ops);
+            const inst: Instruction = try .new(.none, parsed_inst.mnemonic, &parsed_inst.ops, &x86_64_test_target);
             try inst.encode(w, .{});
         }
     }
@@ -2636,10 +2681,10 @@ test "assemble" {
     // zig fmt: on
 
     var as = Assembler.init(input);
-    var output = std.array_list.Managed(u8).init(testing.allocator);
+    var output: std.Io.Writer.Allocating = .init(testing.allocator);
     defer output.deinit();
-    try as.assemble(output.writer());
-    try expectEqualHexStrings(expected, output.items, input);
+    try as.assemble(&output.writer);
+    try expectEqualHexStrings(expected, output.writer.buffered(), input);
 }
 
 test "assemble - Jcc" {
@@ -2680,10 +2725,10 @@ test "assemble - Jcc" {
         const input = @tagName(mnemonic[0]) ++ " 0x0";
         const expected = [_]u8{ 0x0f, mnemonic[1], 0x0, 0x0, 0x0, 0x0 };
         var as = Assembler.init(input);
-        var output = std.array_list.Managed(u8).init(testing.allocator);
+        var output: std.Io.Writer.Allocating = .init(testing.allocator);
         defer output.deinit();
-        try as.assemble(output.writer());
-        try expectEqualHexStrings(&expected, output.items, input);
+        try as.assemble(&output.writer);
+        try expectEqualHexStrings(&expected, output.writer.buffered(), input);
     }
 }
 
@@ -2725,10 +2770,10 @@ test "assemble - SETcc" {
         const input = @tagName(mnemonic[0]) ++ " al";
         const expected = [_]u8{ 0x0f, mnemonic[1], 0xC0 };
         var as = Assembler.init(input);
-        var output = std.array_list.Managed(u8).init(testing.allocator);
+        var output: std.Io.Writer.Allocating = .init(testing.allocator);
         defer output.deinit();
-        try as.assemble(output.writer());
-        try expectEqualHexStrings(&expected, output.items, input);
+        try as.assemble(&output.writer);
+        try expectEqualHexStrings(&expected, output.writer.buffered(), input);
     }
 }
 
@@ -2770,9 +2815,9 @@ test "assemble - CMOVcc" {
         const input = @tagName(mnemonic[0]) ++ " rax, rbx";
         const expected = [_]u8{ 0x48, 0x0f, mnemonic[1], 0xC3 };
         var as = Assembler.init(input);
-        var output = std.array_list.Managed(u8).init(testing.allocator);
+        var output: std.Io.Writer.Allocating = .init(testing.allocator);
         defer output.deinit();
-        try as.assemble(output.writer());
-        try expectEqualHexStrings(&expected, output.items, input);
+        try as.assemble(&output.writer);
+        try expectEqualHexStrings(&expected, output.writer.buffered(), input);
     }
 }

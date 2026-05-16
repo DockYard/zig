@@ -282,6 +282,7 @@ pub fn buildTsan(comp: *Compilation, prog_node: std.Progress.Node) BuildError!vo
         .thread_limit = comp.thread_limit,
         .dirs = comp.dirs.withoutLocalCache(),
         .self_exe_path = comp.self_exe_path,
+        .internal_tools_in_process = comp.internal_tools_in_process,
         .cache_mode = .whole,
         .config = config,
         .root_mod = root_mod,

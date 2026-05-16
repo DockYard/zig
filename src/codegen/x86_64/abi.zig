@@ -558,6 +558,71 @@ pub fn getCAbiLinkerScratchReg(cc: std.builtin.CallingConvention.Tag) Register {
     };
 }
 
+/// How the f16 value of a compiler-rt half-precision *conversion* helper
+/// (`__extendhf{sf,df}2`, `__trunc{sf,df}hf2`) is passed in/out at the C ABI
+/// boundary on this target.
+///
+/// CONTRACT — this MUST stay byte-for-byte equivalent to
+/// `std.Target.f16ConversionAbi` / `compiler_rt`'s `F16T` (see
+/// `lib/std/Target.zig` and `lib/compiler_rt.zig`). `F16T` decides how the
+/// compiler-rt helper itself declares its f16 parameter/return (the *callee*
+/// signature); this function decides which register class the self-hosted
+/// x86_64 backend places the f16 bits in / reads them from at the *call site*.
+/// If these two disagree the generated call is silently miscompiled, so the
+/// arch/OS decision below is intentionally identical to `F16T`'s. The compiler
+/// frontend (`src/`) and compiler-rt (`lib/`) live in separate module trees
+/// and cannot import a shared file, so — exactly like the pre-existing
+/// `use_gnu_f16_abi` pair in `src/Air.zig` and `lib/compiler_rt.zig` — the
+/// decision is encoded once per side and bound by this contract.
+///
+/// `other_float_bits` is the bit width of the *other* (non-f16) floating-point
+/// type involved in the conversion (32 for `f32`, 64 for `f64`). It matters
+/// because, starting with LLVM 16, Darwin uses a different ABI for f16
+/// depending on the type of the other operand.
+pub const F16Abi = enum {
+    /// The f16 value is passed/returned as an `f16` ("`_Float16`") and is
+    /// therefore classified into an SSE/vector register (GNU `_Float16`).
+    sse_f16,
+    /// The f16 value is passed/returned as a `u16` and is therefore
+    /// classified into a general-purpose (integer) register (Darwin).
+    gp_u16,
+};
+
+pub fn f16ConversionAbi(target: *const std.Target, other_float_bits: u16) F16Abi {
+    return switch (target.cpu.arch) {
+        .amdgcn,
+        .arm,
+        .armeb,
+        .thumb,
+        .thumbeb,
+        .aarch64,
+        .aarch64_be,
+        .hexagon,
+        .loongarch32,
+        .loongarch64,
+        .nvptx,
+        .nvptx64,
+        .riscv32,
+        .riscv32be,
+        .riscv64,
+        .riscv64be,
+        .s390x,
+        .spirv32,
+        .spirv64,
+        => .sse_f16,
+        .x86, .x86_64 => if (target.os.tag.isDarwin()) switch (other_float_bits) {
+            // Starting with LLVM 16, Darwin uses a different ABI for f16
+            // depending on the type of the other return/argument: the f16
+            // is a `u16` (GP register) when paired with `f32`/`f64`, but a
+            // real `f16` (SSE register) when paired with `f80`/`f128`.
+            32, 64 => .gp_u16,
+            80, 128 => .sse_f16,
+            else => unreachable,
+        } else .sse_f16,
+        else => .gp_u16,
+    };
+}
+
 const gp_regs = [_]Register{
     .rax, .rdx, .rbx, .rcx, .rsi, .rdi, .r8, .r9, .r10, .r11, .r12, .r13, .r14, .r15,
 };

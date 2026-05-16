@@ -956,31 +956,72 @@ fn testLinksection(b: *Build, opts: Options) *Step {
         \\}
     });
 
+    // A declaration explicitly placed with `linksection` must survive
+    // `-dead_strip` of the final image: downstream code typically
+    // discovers it through a weak extern (e.g. Zap's memory-manager
+    // `.zapmem` section), which resolves to null at startup if the
+    // linker dead-stripped the data, then panics with a runtime
+    // diagnostic that is hard to trace back to the linker.
+    //
+    // The correct, code/data-format-agnostic mechanism for this is
+    // `@llvm.used` (LLVM backend) / `N_NO_DEAD_STRIP` symbol attribute
+    // (self-hosted backend). It is *not* `S_ATTR_NO_DEAD_STRIP` on the
+    // section: a section-specifier approach is unrepresentable for the
+    // common case `linksection("__TEXT,__text")` and any section also
+    // used implicitly, because LLVM requires a single consistent
+    // section specifier per named section. Both backends therefore
+    // anchor the *symbol* with `N_NO_DEAD_STRIP` (`n_desc` bit `0x20`,
+    // shown by `nm -m` as `[no dead strip]`), which the self-hosted
+    // MachO linker treats as a dead-strip GC root
+    // (`link/MachO/dead_strip.zig`: `sym.flags.no_dead_strip`).
+    //
+    // This object is a relocatable (`MH_OBJECT`). The structurally
+    // correct, verifiable guarantee here is that every `linksection`
+    // symbol carries the `[no dead strip]` (`N_NO_DEAD_STRIP`)
+    // attribute in the symbol table, alongside its `(SEG,SECT)`
+    // placement. (A relocatable has a single blank-named segment, so
+    // the `(__DATA,__TestGlobal)` association in the symtab already
+    // proves placement; there is no `__DATA` *segment* to assert.)
     const check = obj.checkObject();
     check.checkInSymtab();
-    check.checkContains("(__DATA,__TestGlobal) external _test_global");
+    check.checkContains("(__DATA,__TestGlobal) external [no dead strip] _test_global");
     check.checkInSymtab();
-    check.checkContains("(__TEXT,__TestFn) external _testFn");
+    check.checkContains("(__TEXT,__TestFn) external [no dead strip] _testFn");
 
     if (opts.optimize == .Debug) {
         check.checkInSymtab();
-        check.checkContains("(__TEXT,__TestGenFnA) _main.TestGenericFn(");
+        check.checkContains("(__TEXT,__TestGenFnA) [no dead strip] _main.TestGenericFn(");
     }
 
-    // The section created via `linksection` must carry the
-    // S_ATTR_NO_DEAD_STRIP attribute (0x10000000 in the flags field
-    // of section_64). The user explicitly placed data at this
-    // location; if `-dead_strip` could remove it, downstream code
-    // that locates the data via a weak extern (e.g. Zap's memory-
-    // manager `.zapmem` section) would resolve to null at startup
-    // and panic with a runtime diagnostic that's hard to trace
-    // back to the linker.
-    check.checkInHeaders();
-    check.checkExact("segname __DATA");
-    check.checkExact("sectname __TestGlobal");
-    check.checkExact("flags 10000000");
-
     test_step.dependOn(&check.step);
+
+    // Linked-image variant: the strongest, end-to-end guarantee. A
+    // final image DOES have a real `__DATA` segment. `keepme` is
+    // exported but never referenced by `main`; with `-dead_strip`
+    // enabled it would be removed unless its `N_NO_DEAD_STRIP` symbol
+    // attribute keeps it as a GC root. We assert the symbol *survived*
+    // dead-strip (still present in the real `__DATA` segment) and that
+    // the image is structurally valid and runs. This directly mirrors
+    // the real Zap `.zapmem` use case.
+    {
+        const exe = addExecutable(b, opts, .{ .name = "linksection_image", .zig_source_bytes =
+            \\export var keepme: u32 linksection("__DATA,__TestKeep") = 0xBEEF;
+            \\pub fn main() void {}
+        });
+        exe.link_gc_sections = true;
+
+        const exe_check = exe.checkObject();
+        exe_check.checkInSymtab();
+        exe_check.checkContains("(__DATA,__TestKeep) external _keepme");
+        exe_check.checkInHeaders();
+        exe_check.checkExact("segname __DATA");
+        exe_check.checkExact("sectname __TestKeep");
+        test_step.dependOn(&exe_check.step);
+
+        const run = addRunArtifact(exe);
+        run.expectExitCode(0);
+        test_step.dependOn(&run.step);
+    }
 
     return test_step;
 }

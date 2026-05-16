@@ -148,6 +148,7 @@ pub fn buildStaticLib(comp: *Compilation, prog_node: std.Progress.Node) BuildErr
         .thread_limit = comp.thread_limit,
         .dirs = comp.dirs.withoutLocalCache(),
         .self_exe_path = comp.self_exe_path,
+        .internal_tools_in_process = comp.internal_tools_in_process,
         .config = config,
         .root_mod = root_mod,
         .cache_mode = .whole,

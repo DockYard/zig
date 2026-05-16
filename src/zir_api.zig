@@ -101,14 +101,19 @@ pub export fn zir_compilation_create(
         is_dynamic,
         link_libc,
         null,
+        null,
     ) catch null;
 }
 
-/// Create a new compilation context with an explicit target triple.
+/// Create a new compilation context with an explicit target triple
+/// and optional CPU model/feature set.
 ///
 /// `target_triple` is a null-terminated target string (e.g., "wasm32-wasi",
 /// "aarch64-linux-gnu"). Pass null or "native" for native compilation.
-/// Returns null on failure.
+/// `cpu_features` is a null-terminated CPU string (e.g., "baseline",
+/// "apple_m1", "x86_64_v3", "<model>+feat-feat") mirroring `zig build`'s
+/// `-Dcpu=`. Pass null or "" for the target's default CPU. Returns null
+/// on failure.
 pub export fn zir_compilation_create_cross(
     zig_lib_dir: [*:0]const u8,
     local_cache_dir: [*:0]const u8,
@@ -120,8 +125,10 @@ pub export fn zir_compilation_create_cross(
     is_dynamic: bool,
     link_libc: bool,
     target_triple: ?[*:0]const u8,
+    cpu_features: ?[*:0]const u8,
 ) ?*ZirContext {
     const target_str: ?[]const u8 = if (target_triple) |t| mem.sliceTo(t, 0) else null;
+    const cpu_str: ?[]const u8 = if (cpu_features) |c| mem.sliceTo(c, 0) else null;
     return createImpl(
         mem.sliceTo(zig_lib_dir, 0),
         mem.sliceTo(local_cache_dir, 0),
@@ -133,6 +140,7 @@ pub export fn zir_compilation_create_cross(
         is_dynamic,
         link_libc,
         target_str,
+        cpu_str,
     ) catch null;
 }
 
@@ -197,6 +205,33 @@ pub export fn zir_compilation_update(ctx: *ZirContext) i32 {
         defer error_bundle.deinit(ctx.gpa);
         dumpErrorBundle(error_bundle);
         return -1;
+    }
+
+    // Post-link artifact verification (mirrors the object-compile
+    // primitive). `update()` returning cleanly and `anyErrors()` being
+    // false does not by itself prove the binary was written: a linker
+    // flush can complete "successfully" yet emit nothing if the link
+    // step could not actually run (historically: the LLD relocatable
+    // step re-spawning the embedder as `<self_exe> ld.lld ...`).
+    // `internal_tools_in_process` fixes the known cause, but this primitive must
+    // NEVER report success without the artifact, regardless of linker
+    // path or target class.
+    if (ctx.compilation.bin_file) |lf| {
+        const io = ctx.io();
+        const st = lf.emit.root_dir.handle.statFile(io, lf.emit.sub_path, .{}) catch |stat_err| {
+            logErr(
+                "zap_fork: compilation reported success but produced no output binary at '{s}' ({s}); the requested target may require a linker toolchain this build cannot provide",
+                .{ lf.emit.sub_path, @errorName(stat_err) },
+            );
+            return -1;
+        };
+        if (st.size == 0) {
+            logErr(
+                "zap_fork: compilation reported success but produced an empty output binary at '{s}'",
+                .{lf.emit.sub_path},
+            );
+            return -1;
+        }
     }
     return 0;
 }
@@ -680,32 +715,42 @@ fn defaultCachePath(ar: Allocator) ![]const u8 {
     };
 }
 
-/// Returns true iff `(arch, os_tag, abi_tag)` is one of the five
-/// (arch, os, abi) triples enumerated in spec Appendix C.1:
-///   * `x86_64-linux-gnu`
-///   * `x86_64-macos-none`
-///   * `aarch64-linux-gnu`
-///   * `aarch64-macos-none`
-///   * `x86_64-windows-msvc`
+/// Returns true iff `(arch, os_tag, abi_tag)` is a target this
+/// primitive can compile a self-contained object for.
 ///
-/// Any other combination — even if each tag individually resolves to a
-/// valid enum value — is outside the v1.0 supported set and the
-/// primitive rejects it with `TargetUnsupported`.
+/// IMPORTANT: this primitive emits a SINGLE relocatable object via
+/// `build-obj` with `skip_linker_dependencies = true`. It does NOT
+/// link, so the target's libc/CRT availability is irrelevant to object
+/// emission itself — only Zig's codegen + integrated assembler need to
+/// support the target, which they do for the entire matrix below
+/// WITHOUT any external toolchain (Zig bundles musl and provides
+/// freestanding/none ABIs out of the box; the glibc/Windows entries
+/// only need Zig's bundled stubs to *link*, which is the caller's
+/// final-link concern, not this object-compile step).
+///
+/// The earlier hard-coded five-triple whitelist was an artificial
+/// restriction that rejected fully-supported targets such as
+/// `*-linux-musl`. It is replaced here with the real capability
+/// boundary: the common cross targets Zig handles natively. A genuinely
+/// unsupported arch/os/abi (e.g. an exotic embedded target Zig's
+/// codegen cannot target) still returns false and is rejected with a
+/// clear diagnostic — there is no silent success.
 fn isSupportedTriple(
     arch: std.Target.Cpu.Arch,
     os_tag: std.Target.Os.Tag,
     abi_tag: std.Target.Abi,
 ) bool {
     return switch (arch) {
-        .x86_64 => switch (os_tag) {
-            .linux => abi_tag == .gnu,
+        .x86_64, .aarch64 => switch (os_tag) {
+            // Linux: glibc and musl (musl is fully bundled by Zig; no
+            // external toolchain needed for either to produce objects).
+            .linux => abi_tag == .gnu or abi_tag == .musl or abi_tag == .none,
+            // macOS: native ABI is `.none` for Zig's Mach-O target.
             .macos => abi_tag == .none,
-            .windows => abi_tag == .msvc,
-            else => false,
-        },
-        .aarch64 => switch (os_tag) {
-            .linux => abi_tag == .gnu,
-            .macos => abi_tag == .none,
+            // Windows: MSVC and GNU (mingw) ABIs.
+            .windows => abi_tag == .msvc or abi_tag == .gnu,
+            // Bare-metal / freestanding has no ABI requirement.
+            .freestanding => true,
             else => false,
         },
         else => false,
@@ -779,6 +824,12 @@ pub export fn zap_fork_compile_zig_to_object(
     /// Optional caller-supplied global cache directory. Pass null to
     /// use the same default as `local_cache_dir_opt`.
     global_cache_dir_opt: ?[*:0]const u8,
+    /// Optional CPU model/feature set (mirrors `zig build`'s `-Dcpu=`,
+    /// e.g. "baseline", "apple_m1", "x86_64_v3", "<model>+feat-feat").
+    /// Pass null or "" for the resolved triple's default CPU. When set,
+    /// the manager `.o` is built for the SAME CPU as the user binary so
+    /// every object in the final link agrees on the target machine.
+    cpu_features_opt: ?[*:0]const u8,
 ) callconv(.c) ZapForkResult {
     const diag = ZapForkDiag{
         .buf = out_diagnostic_buffer,
@@ -858,6 +909,56 @@ pub export fn zap_fork_compile_zig_to_object(
         };
     };
 
+    // Apply an optional CPU model/feature set onto the resolved
+    // triple. We re-parse through `std.Target.Query.parse` (the
+    // canonical path, identical to what the user-binary compile uses)
+    // so the manager `.o` is built for exactly the same machine as the
+    // rest of the binary. An empty/absent string keeps the triple's
+    // default CPU. The arch is pinned to the already-validated triple
+    // so a CPU string can only refine the CPU, never change the arch.
+    // Heap-allocated `arch_os_abi` buffer (only when an explicit triple
+    // forces a synthesized "arch-os-abi" string). Owned at function
+    // scope with a `defer` so it is freed on EVERY exit path, including
+    // the `return .TargetUnsupported` taken from inside the block on an
+    // invalid CPU. `std.Target.Query.parse` copies what it needs (CPU
+    // model -> enum/`.explicit` model pointer into static tables,
+    // features -> bit-sets; see `lib/std/Target/Query.zig`) and never
+    // retains a slice into this buffer, so freeing it right after the
+    // `cpu_query` block is correct.
+    var arch_os_abi_owned: ?[]u8 = null;
+    defer if (arch_os_abi_owned) |buf| std.heap.c_allocator.free(buf);
+
+    const cpu_query: std.Target.Query = blk: {
+        const cpu_str: ?[]const u8 = if (cpu_features_opt) |c| mem.sliceTo(c, 0) else null;
+        if (cpu_str == null or cpu_str.?.len == 0) break :blk target_query;
+
+        const arch_for_cpu = target_query.cpu_arch orelse builtin.target.cpu.arch;
+        const arch_os_abi: []const u8 = if (target_query.cpu_arch == null)
+            "native"
+        else blk2: {
+            const buf = std.fmt.allocPrint(std.heap.c_allocator, "{s}-{s}-{s}", .{
+                @tagName(arch_for_cpu),
+                @tagName(target_query.os_tag orelse builtin.target.os.tag),
+                @tagName(target_query.abi orelse builtin.target.abi),
+            }) catch {
+                diag.write("zap_fork: out of memory resolving -Dcpu", .{});
+                return .InternalError;
+            };
+            arch_os_abi_owned = buf;
+            break :blk2 buf;
+        };
+        var diags: std.Target.Query.ParseOptions.Diagnostics = .{};
+        const parsed = std.Target.Query.parse(.{
+            .arch_os_abi = arch_os_abi,
+            .cpu_features = cpu_str.?,
+            .diagnostics = &diags,
+        }) catch {
+            diag.write("zap_fork: invalid -Dcpu='{s}' for target", .{cpu_str.?});
+            return .TargetUnsupported;
+        };
+        break :blk parsed;
+    };
+
     const zig_lib_dir_slice: ?[]const u8 = if (zig_lib_dir_opt) |p| mem.sliceTo(p, 0) else null;
     const local_cache_dir_slice: ?[]const u8 = if (local_cache_dir_opt) |p| mem.sliceTo(p, 0) else null;
     const global_cache_dir_slice: ?[]const u8 = if (global_cache_dir_opt) |p| mem.sliceTo(p, 0) else null;
@@ -865,7 +966,7 @@ pub export fn zap_fork_compile_zig_to_object(
     compileToObjectImpl(
         source_path_slice,
         out_object_path_slice,
-        target_query,
+        cpu_query,
         optimize,
         zig_lib_dir_slice,
         local_cache_dir_slice,
@@ -886,6 +987,13 @@ pub export fn zap_fork_compile_zig_to_object(
             // Diagnostic was written by the impl with the full path.
             return .InternalError;
         },
+        // The impl already wrote a target-naming diagnostic; surface it
+        // as `TargetUnsupported` (the semantically-correct code, and
+        // symmetric with the explicit-triple rejection paths above that
+        // also return `.TargetUnsupported`). Do NOT fall through to the
+        // generic `else` arm — that would clobber the precise message
+        // with "internal error: UnableToResolveTarget".
+        error.UnableToResolveTarget => return .TargetUnsupported,
         else => {
             diag.write("zap_fork: internal error: {s}", .{@errorName(err)});
             return .InternalError;
@@ -893,6 +1001,126 @@ pub export fn zap_fork_compile_zig_to_object(
     };
 
     return .Ok;
+}
+
+/// Result of `zap_fork_classify_subtool` / dispatched by
+/// `zap_fork_run_subtool`.
+pub const ZapForkSubtool = enum(c_int) {
+    /// argv[1] is not a recognized Zig toolchain subcommand.
+    not_a_subtool = 0,
+    /// argv[1] is `clang`, `-cc1`, or `-cc1as`.
+    clang = 1,
+    /// argv[1] is `ld.lld`, `lld-link`, or `wasm-ld`.
+    lld = 2,
+    /// argv[1] is `ar`, `dlltool`, `ranlib`, or `lib`.
+    llvm_ar = 3,
+};
+
+/// Classify `argv[1]` as a Zig toolchain subcommand that the embedded
+/// Zig compiler can service in-process.
+///
+/// Zig's cross-compilation architecture builds CRT/libc/compiler_rt by
+/// having the running executable re-invoke itself as
+/// `<self_exe> clang|-cc1|-cc1as|ld.lld|... <args>`. When a library
+/// embedder (Zap) is `self_exe`, it must recognize these subcommands
+/// and dispatch them into the embedded Zig tool entry points exactly
+/// as the Zig CLI does — otherwise the subprocess is a no-op and the
+/// cross build silently produces no artifact. Clang's driver
+/// legitimately spawns `<self_exe> -cc1`/`-cc1as` for multi-phase
+/// `.S` (assembler-with-cpp) inputs even with integrated-cc1, so the
+/// in-process `Compilation` flag alone is insufficient; the embedder
+/// MUST be a faithful `self_exe`.
+///
+/// `argc`/`argv` are the embedder's full process argv (argv[0] is the
+/// program path). Returns `.not_a_subtool` when `argc < 2` or argv[1]
+/// is not a recognized subcommand; the embedder then proceeds with its
+/// normal CLI dispatch.
+pub export fn zap_fork_classify_subtool(
+    argc: c_int,
+    argv: [*]const [*:0]const u8,
+) callconv(.c) ZapForkSubtool {
+    if (argc < 2) return .not_a_subtool;
+    const cmd = mem.sliceTo(argv[1], 0);
+    if (mem.eql(u8, cmd, "clang") or
+        mem.eql(u8, cmd, "-cc1") or
+        mem.eql(u8, cmd, "-cc1as"))
+        return .clang;
+    if (mem.eql(u8, cmd, "ld.lld") or
+        mem.eql(u8, cmd, "lld-link") or
+        mem.eql(u8, cmd, "wasm-ld"))
+        return .lld;
+    if (mem.eql(u8, cmd, "ar") or
+        mem.eql(u8, cmd, "dlltool") or
+        mem.eql(u8, cmd, "ranlib") or
+        mem.eql(u8, cmd, "lib"))
+        return .llvm_ar;
+    return .not_a_subtool;
+}
+
+/// Run the Zig toolchain subcommand identified by `argv[1]` in-process
+/// and return its process exit code (0 = success). The caller
+/// (embedder `main`) should pass this exit code straight to
+/// `std.process.exit` — these subcommands ARE the entire purpose of the
+/// process invocation (Zig spawns `<self_exe> <subtool> ...` as a
+/// dedicated child), so exiting with the returned code is correct.
+///
+/// `argv` mirrors the layout the Zig CLI's `mainArgs` sees: argv[0] is
+/// the program path, argv[1] is the subcommand, argv[2..] are the tool
+/// arguments. This matches what `clangMain`/`lldMain`/`llvmArMain`
+/// expect (each shaves argv[0] internally; `clangMain` additionally
+/// keeps `-cc1`/`-cc1as` at slot 1, exactly as the CLI path does).
+///
+/// Behavior is byte-identical to the Zig CLI's own dispatch in
+/// `mainArgs` (src/main.zig): `clang`/`-cc1`/`-cc1as` -> `clangMain`;
+/// `ld.lld`/`lld-link`/`wasm-ld` -> `lldMain(.., true)`;
+/// `ar`/`dlltool`/`ranlib`/`lib` -> `llvmArMain`. Returns 0xFF if
+/// `argv[1]` is not a recognized subtool (caller should have checked
+/// `zap_fork_classify_subtool` first) or on internal allocation
+/// failure.
+pub export fn zap_fork_run_subtool(
+    argc: c_int,
+    argv: [*]const [*:0]const u8,
+) callconv(.c) c_int {
+    if (argc < 2) return 0xFF;
+    const gpa = std.heap.c_allocator;
+
+    // Rebuild a `[]const []const u8` slice for the Zig tool entry
+    // points. They expect the same shape as `std.process.argsAlloc`
+    // would yield (argv[0] = program path, argv[1] = subcommand).
+    const n: usize = @intCast(argc);
+    const args = gpa.alloc([]const u8, n) catch return 0xFF;
+    defer gpa.free(args);
+    for (0..n) |i| args[i] = mem.sliceTo(argv[i], 0);
+
+    const main = @import("main.zig");
+    const cmd = args[1];
+
+    if (mem.eql(u8, cmd, "clang") or
+        mem.eql(u8, cmd, "-cc1") or
+        mem.eql(u8, cmd, "-cc1as"))
+    {
+        const code = main.clangMain(gpa, args) catch return 0xFF;
+        return code;
+    }
+    if (mem.eql(u8, cmd, "ld.lld") or
+        mem.eql(u8, cmd, "lld-link") or
+        mem.eql(u8, cmd, "wasm-ld"))
+    {
+        // `can_exit_early = true` matches the Zig CLI's `lldMain(.., true)`:
+        // this process exists solely to run LLD, so an early exit is
+        // correct and matches the behavior Zig's own re-spawn relies on.
+        const code = main.lldMain(gpa, args, true) catch return 0xFF;
+        return code;
+    }
+    if (mem.eql(u8, cmd, "ar") or
+        mem.eql(u8, cmd, "dlltool") or
+        mem.eql(u8, cmd, "ranlib") or
+        mem.eql(u8, cmd, "lib"))
+    {
+        const code = main.llvmArMain(gpa, args) catch return 0xFF;
+        return code;
+    }
+    return 0xFF;
 }
 
 const CompileToObjectError = error{
@@ -1066,9 +1294,32 @@ fn compileToObjectImpl(
     };
     defer dirs.deinit(io);
 
-    // Resolve the target query. We round-trip through resolveTargetQueryOrFatal
-    // so that the result matches what the rest of zir_api.zig produces.
-    const resolved_result = std.zig.resolveTargetQueryOrFatal(io, target_query);
+    // Resolve the target query GRACEFULLY. This MUST NOT use
+    // `std.zig.resolveTargetQueryOrFatal`: that helper calls
+    // `std.process.fatal` on any resolution failure, which aborts the
+    // entire embedder (Zap) process and bypasses Zap's structured
+    // diagnostic + non-zero-exit handling. A parseable-but-unresolvable
+    // `-Dtarget=`/`-Dcpu=` (e.g. a valid-enum triple the system
+    // resolver rejects, or a CPU/feature mismatch threaded in via
+    // `cpu_query`) must fail this primitive with a returned error and a
+    // target-naming diagnostic — EXACTLY symmetric with the user-binary
+    // path (`createImpl`, which already uses
+    // `std.zig.system.resolveTargetQuery` + a graceful
+    // `error.InvalidTargetQuery`). The Zap-side driver then surfaces
+    // this through `DriverDiagnostic` and a clean non-zero exit instead
+    // of a whole-process abort.
+    const resolved_result = std.zig.system.resolveTargetQuery(io, target_query) catch |resolve_err| {
+        diag.write(
+            "zap_fork: unable to resolve target {s}-{s}-{s}: {s}",
+            .{
+                if (target_query.cpu_arch) |a| @tagName(a) else "native",
+                if (target_query.os_tag) |o| @tagName(o) else "native",
+                if (target_query.abi) |ab| @tagName(ab) else "native",
+                @errorName(resolve_err),
+            },
+        );
+        return error.UnableToResolveTarget;
+    };
     const resolved_target: Package.Module.ResolvedTarget = .{
         .result = resolved_result,
         .is_native_os = target_query.isNativeOs(),
@@ -1102,6 +1353,15 @@ fn compileToObjectImpl(
     // and the vtable function pointers are all opaque to the libc
     // toggle).
     const target_requires_libc = resolved_target.result.requiresLibC();
+    // LTO note: ThinLTO would let the host-binary link step inline through
+    // the manager's vtable across the `.o` boundary, recovering the per-
+    // allocation overhead that retain/release/allocate pay today on every
+    // call. But Zig's `Compilation.Config.resolve` requires LLD for LTO
+    // and `target_util.hasLldSupport` returns false for Mach-O (Zig has
+    // its own Mach-O linker). So LTO is unavailable on macOS through this
+    // path. ELF and COFF could enable LTO if the fork is built with
+    // `-Denable-llvm=true`; that's worth revisiting once the perf-
+    // critical workloads run on Linux CI.
     const config = Compilation.Config.resolve(.{
         .output_mode = .Obj,
         .resolved_target = resolved_target,
@@ -1184,6 +1444,12 @@ fn compileToObjectImpl(
         .thread_limit = thread_limit,
         .environ_map = &environ_map,
         .self_exe_path = self_exe_path,
+        // The running executable is a library embedder (Zap), not the
+        // Zig compiler, so LLD must run in-process. Without this, ELF
+        // (and any other LLD-driven) targets would re-spawn the
+        // embedder as `<self_exe> ld.lld ...`, which has no such
+        // subcommand, silently producing no object file.
+        .internal_tools_in_process = true,
         .config = config,
         .root_mod = root_mod,
         .root_name = root_name_z,
@@ -1256,6 +1522,34 @@ fn compileToObjectImpl(
             diag.write("zap_fork: anyErrors() is true but error bundle is empty (compiler is in an anomalous state)", .{});
         }
         return error.CompilationFailed;
+    }
+
+    // Post-link artifact verification.
+    //
+    // `compilation.update()` succeeding and `anyErrors()` being false is
+    // NOT sufficient proof that the requested object was actually
+    // written. The linker flush path can complete "successfully" yet
+    // emit nothing (historically: the LLD relocatable step re-spawned
+    // the embedder as `<self_exe> ld.lld ...`, which produced no file;
+    // `internal_tools_in_process` now fixes that, but a general post-condition
+    // check belongs here regardless of linker path so this primitive
+    // can NEVER report `.Ok` without the artifact). If the object is
+    // absent or empty, surface a real error instead of silent success.
+    {
+        const st = cwd.statFile(io, out_object_path, .{}) catch |stat_err| {
+            diag.write(
+                "zap_fork: compilation reported success but produced no object file at '{s}' ({s}); the requested target may require a linker toolchain this build cannot provide",
+                .{ out_object_path, @errorName(stat_err) },
+            );
+            return error.CompilationFailed;
+        };
+        if (st.size == 0) {
+            diag.write(
+                "zap_fork: compilation reported success but produced an empty object file at '{s}'",
+                .{out_object_path},
+            );
+            return error.CompilationFailed;
+        }
     }
 }
 
@@ -1572,6 +1866,7 @@ fn createImpl(
     is_dynamic: bool,
     do_link_libc: bool,
     target_triple_opt: ?[]const u8,
+    cpu_features_opt: ?[]const u8,
 ) !*ZirContext {
     // Use c_allocator (libc malloc) instead of page_allocator.
     // page_allocator creates one mmap per allocation, hitting the kernel's
@@ -1655,10 +1950,42 @@ fn createImpl(
         (if (mem.eql(u8, t, "native")) "native" else t)
     else
         "native";
-    const target_query = std.zig.parseTargetQueryOrReportFatalError(ar, .{
+    // Optional explicit CPU model/feature set (mirrors `zig build`'s
+    // `-Dcpu=`). An empty string is treated as "unset" so callers can
+    // pass `""` for "the target's default CPU" without a separate
+    // sentinel. `std.Target.Query.ParseOptions.cpu_features` already
+    // accepts exactly this form (e.g. "baseline", "apple_m1",
+    // "x86_64_v3", or "<model>+feat-feat").
+    const cpu_features: ?[]const u8 = if (cpu_features_opt) |c|
+        (if (c.len == 0) null else c)
+    else
+        null;
+    // Parse the target query GRACEFULLY. The user-binary path must not
+    // use `parseTargetQueryOrReportFatalError`/`resolveTargetQueryOrFatal`:
+    // those call `std.process.fatal`, aborting the whole Zap process and
+    // bypassing Zap's diagnostic + non-zero-exit handling. An invalid
+    // `-Dtarget=`/`-Dcpu=` must fail this primitive with a returned
+    // error (surfaced as `CompilationCreateFailed`), exactly like the
+    // manager-`.o` path, instead of a hard `std.process.fatal`.
+    var query_diags: std.Target.Query.ParseOptions.Diagnostics = .{};
+    const target_query = std.Target.Query.parse(.{
         .arch_os_abi = arch_os_abi,
-    });
-    const resolved_result = std.zig.resolveTargetQueryOrFatal(io, target_query);
+        .cpu_features = cpu_features,
+        .diagnostics = &query_diags,
+    }) catch |parse_err| {
+        logErr(
+            "zap_fork: invalid target/cpu (target='{s}' cpu='{s}'): {s}",
+            .{ arch_os_abi, cpu_features orelse "", @errorName(parse_err) },
+        );
+        return error.InvalidTargetQuery;
+    };
+    const resolved_result = std.zig.system.resolveTargetQuery(io, target_query) catch |resolve_err| {
+        logErr(
+            "zap_fork: unable to resolve target '{s}' (cpu='{s}'): {s}",
+            .{ arch_os_abi, cpu_features orelse "", @errorName(resolve_err) },
+        );
+        return error.InvalidTargetQuery;
+    };
     const resolved_target: Package.Module.ResolvedTarget = .{
         .result = resolved_result,
         .is_native_os = target_query.isNativeOs(),
@@ -1687,6 +2014,8 @@ fn createImpl(
     else
         do_link_libc;
 
+    // See LTO note on the manager-compile path above; LTO is unavailable
+    // on Mach-O through Zig's Config.resolve.
     // Compilation config.
     const config = Compilation.Config.resolve(.{
         .output_mode = output_mode_enum,
@@ -1706,10 +2035,40 @@ fn createImpl(
     };
 
     // Root struct.
-    // Write a stub source file to the cwd. The path uses .none root (cwd-relative)
-    // so that struct-level imports resolve correctly against the cwd.
+    //
+    // The synthetic root-module stub is written UNDER the caller-supplied
+    // local cache directory (`local_cache_dir_path`), never a cwd-relative
+    // literal. `Compilation.Path.fromUnresolved` (below) resolves this
+    // directory against `dirs.cwd` and prefix-classifies the result
+    // against `dirs.local_cache.path` / `dirs.global_cache.path` — which
+    // `createImpl` set verbatim from the same C-ABI strings at the
+    // `ctx.dirs = .{ ... }` assignment above. Routing the stub under
+    // `local_cache_dir_path` therefore makes the stub land *inside* the
+    // cache root for BOTH callers, so the resulting `Path` classifies as
+    // `.local_cache`/`.global_cache` with a stable, cwd-independent
+    // `digest`:
+    //
+    //   * Manifest path: the caller passes the cwd-relative project cache
+    //     dir (`.zap-cache`). `{local_cache}/{root}.zig` is then exactly
+    //     `.zap-cache/{root}.zig` — byte-identical to the previous
+    //     hardcoded literal, so the on-disk location, the `Path` root
+    //     classification, and `Path.digest` are all unchanged.
+    //
+    //   * Script path: the caller passes a process-private *absolute*
+    //     cache dir (under the global script cache). The stub follows
+    //     there instead of leaking a `.zap-cache/` directory next to the
+    //     user's script, preserving the no-litter invariant.
+    //
+    // Struct-level imports are unaffected by the stub's directory: each
+    // Zap struct module builds its own `Compilation.Path` independently
+    // in `addStructImpl` (from the struct's own source dirname, or
+    // `dirs.local_cache.path` in `addStructSourceImpl`) and structs are
+    // wired through `root_mod.deps`, never via filesystem-relative
+    // `@import` against the root stub. The on-disk stub exists only for
+    // the root `File`'s identity/digest and `openInfo` readback; its ZIR
+    // is injected in-memory in `addZirImpl`.
     const root_name_z = try ar.dupeZ(u8, root_name_str);
-    const stub_dir = try std.fmt.allocPrint(ar, ".zap-cache/{s}.zig", .{root_name_str});
+    const stub_dir = try std.fs.path.join(ar, &.{ local_cache_dir_path, try std.fmt.allocPrint(ar, "{s}.zig", .{root_name_str}) });
     const stub_src_name = try std.fmt.allocPrint(ar, "{s}.zig", .{root_name_str});
 
     // Builder mode uses a comptime stub since the entry point is custom (not main).
@@ -1812,6 +2171,12 @@ fn createImpl(
         .thread_limit = thread_limit,
         .environ_map = &environ_map,
         .self_exe_path = self_exe_path,
+        // The running executable is a library embedder (Zap), not the
+        // Zig compiler, so LLD must run in-process. Without this, ELF
+        // (and any other LLD-driven) targets would re-spawn the
+        // embedder as `<self_exe> ld.lld ...`, which has no such
+        // subcommand, silently producing no binary.
+        .internal_tools_in_process = true,
         .config = config,
         .root_mod = root_mod,
         .root_name = root_name_z,
@@ -1964,7 +2329,31 @@ fn addZirImpl(ctx: *ZirContext, name: []const u8, data: *const ZirData) !void {
 }
 
 /// Inject finalized ZIR into a NAMED struct (not root).
-/// The struct must have been registered via addStructImpl/addStructSourceImpl first.
+///
+/// If the struct has already been registered via
+/// `addStructImpl`/`addStructSourceImpl` (the production Zap driver always
+/// does this — it discovers every struct from `program.functions` /
+/// `program.type_defs` and calls `zir_compilation_add_struct_source`
+/// before `zir_builder_inject_struct`), this attaches the ZIR to the
+/// existing struct module.
+///
+/// If the struct is NOT yet present in `root_mod.deps`, this primitive is
+/// now self-completing: it registers the struct into the module /
+/// dependency graph itself (the exact module + file + `module_roots` +
+/// bidirectional-deps wiring `addStructImpl` performs), then attaches the
+/// ZIR. Previously `addZirToStruct` hard-required a *separate* prior
+/// `addStruct` call and failed with "struct '<name>' not found in deps"
+/// otherwise — the primitive could not introduce a pure-ZIR struct that
+/// was reachable only through an `anytype` callback chain when driven
+/// directly (no source file on disk). `addStructImpl` performs no
+/// filesystem read of its `source_path` (it only builds `Compilation.Path`
+/// objects and creates a `Zcu.File` with `.source = null,
+/// .status = .never_loaded`; the stub-source / tree / ZIR are filled in
+/// below), so reusing it with the canonical synthetic pure-stub path
+/// (`<local_cache>/zap_structs/<name>.zig`, the same convention
+/// `addStructSourceImpl` uses) is exactly correct for a struct that exists
+/// only as injected ZIR. This generalizes to N-struct `anytype` chains:
+/// each injected struct self-registers on first injection.
 fn addZirToStructImpl(ctx: *ZirContext, name: []const u8, data: *const ZirData) !void {
     const gpa = ctx.gpa;
     const zcu = ctx.compilation.zcu orelse {
@@ -1972,7 +2361,25 @@ fn addZirToStructImpl(ctx: *ZirContext, name: []const u8, data: *const ZirData) 
         return error.OutOfMemory;
     };
 
-    // Find the named struct in root_mod.deps
+    // Find the named struct in root_mod.deps. If it is not registered yet
+    // (e.g. a pure-ZIR struct introduced solely via this injection — the
+    // bare primitive path, not the production Zap driver path), register
+    // it now using the canonical synthetic pure-stub path so the rest of
+    // this function can wire its file/ZIR exactly as for a pre-registered
+    // struct. This makes the primitive self-completing instead of silently
+    // depending on a separate prior `addStruct` call.
+    if (!ctx.root_mod.deps.contains(name)) {
+        const ar = ctx.arena();
+        const cache_path = ctx.dirs.local_cache.path orelse return error.OutOfMemory;
+        const synthetic_path = try std.fmt.allocPrintSentinel(
+            ar,
+            "{s}/zap_structs/{s}.zig",
+            .{ cache_path, name },
+            0,
+        );
+        try addStructImpl(ctx, name, synthetic_path);
+    }
+
     const target_mod = ctx.root_mod.deps.get(name) orelse {
         logErr("addZirToStruct: struct '{s}' not found in deps", .{name});
         return error.OutOfMemory;
@@ -4705,7 +5112,16 @@ fn injectStructZir(ctx: *ZirContext, name: []const u8, fzir: zir_builder.Finaliz
     try addZirToStructImpl(ctx, name, &data);
 }
 
-fn testRepoLibDir(allocator: Allocator, io: Io) ![]u8 {
+/// Resolve the repo `lib/` directory for tests. MUST return the
+/// sentinel-inclusive `[:0]u8` that `realPathFileAlloc` actually
+/// allocates (`dupeZ` allocates `len+1` bytes for the trailing NUL).
+/// Returning a plain `[]u8` here silently dropped the sentinel from
+/// the type, so callers' `allocator.free(...)` reported the slice
+/// length (`n`) as the free size while the allocation was `n+1` —
+/// tripping the DebugAllocator "Allocation size N does not match free
+/// size N-1" check in every test that resolved the lib dir. Keeping
+/// the `[:0]u8` type lets `free` see the true allocation size.
+fn testRepoLibDir(allocator: Allocator, io: Io) ![:0]u8 {
     const cwd = Dir.cwd();
     return cwd.realPathFileAlloc(io, "lib", allocator) catch |err| switch (err) {
         error.FileNotFound => blk: {
@@ -4788,6 +5204,7 @@ test "zir_api: injected executable update succeeds" {
         false,
         true,
         null,
+        null,
     );
     defer zir_compilation_destroy(ctx);
 
@@ -4857,6 +5274,7 @@ test "zir_api: function value passed as callback argument" {
         0, // debug
         false,
         true,
+        null,
         null,
     );
     defer zir_compilation_destroy(ctx);
@@ -4950,6 +5368,7 @@ test "zir_api: cross-struct callback via anytype" {
         0,
         false,
         true,
+        null,
         null,
     );
     defer zir_compilation_destroy(ctx);
@@ -5055,6 +5474,7 @@ test "zir_api: three-struct anytype chain (caller -> wrapper -> inner)" {
         0,
         false,
         true,
+        null,
         null,
     );
     defer zir_compilation_destroy(ctx);

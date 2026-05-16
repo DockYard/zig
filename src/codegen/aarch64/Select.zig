@@ -12302,9 +12302,15 @@ pub const CallAbiIterator = struct {
                 }
             },
             .opaque_type, .func_type => continue :type_key .{ .simple_type = .anyopaque },
-            .enum_type => continue :type_key .{
-                .int_type = ip.indexToKey(ip.loadEnumType(ty.toIntern()).int_tag_type).int_type,
-            },
+            // An enum's `int_tag_type` may be interned either as `.int_type`
+            // (arbitrary-width, e.g. `u3`) or as `.simple_type` (common
+            // widths like `u8`/`u32`/`usize`). Forcing `.int_type` here
+            // panics ("access of union field 'int_type' while field
+            // 'simple_type' is active") for the common case. Re-dispatch on
+            // the tag type's own key so the existing `.int_type` and
+            // `.simple_type` arms classify it correctly — identical to the
+            // enum handling in the sibling `type_key` switch in this file.
+            .enum_type => continue :type_key ip.indexToKey(ip.loadEnumType(ty.toIntern()).int_tag_type),
             .error_set_type,
             .inferred_error_set_type,
             => continue :type_key .{ .simple_type = .anyerror },

@@ -194,6 +194,25 @@ cache_parent: *Cache,
 parent_whole_cache: ?ParentWholeCache,
 /// Path to own executable for invoking `zig clang`.
 self_exe_path: ?[]const u8,
+/// When `true`, Zig's internal build tools that are normally invoked
+/// by re-spawning `self_exe_path` as a subcommand — the LLD linker
+/// (`<self_exe> ld.lld|lld-link|wasm-ld ...`) and the bundled Clang
+/// C/C++ compiler (`<self_exe> clang ...`, used to build CRT/libc
+/// startup objects, compiler_rt, etc.) — are instead driven IN-PROCESS
+/// via `lldMain` / `clangMain` (the same in-process entry points used
+/// on hosts that cannot spawn child processes).
+///
+/// Re-spawning `self_exe_path` is only correct when the running
+/// executable is the Zig compiler itself, which dispatches the
+/// `ld.lld`/`lld-link`/`wasm-ld`/`clang` subcommands to embedded LLD
+/// and Clang. Library embedders of the ZIR/object C-ABI (e.g. Zap) are
+/// NOT the Zig compiler and have no such subcommands, so re-spawning
+/// them silently fails to link / fails to build CRT objects and
+/// produces no usable artifact. Such embedders set this flag so the
+/// link and C-compile steps run in-process and actually emit the
+/// requested object/binary. Defaults to `false`, preserving the
+/// child-process behavior for the normal Zig CLI.
+internal_tools_in_process: bool,
 /// Owned by the caller of `Compilation.create`.
 dirs: Directories,
 libc_include_dir_list: []const []const u8,
@@ -1584,6 +1603,12 @@ pub const CreateOptions = struct {
     dirs: Directories,
     thread_limit: usize,
     self_exe_path: ?[]const u8 = null,
+    /// See `Compilation.internal_tools_in_process`. Set by library
+    /// embedders (Zap) whose running executable is not the Zig
+    /// compiler, so the LLD link/relocatable step AND the bundled
+    /// Clang CRT/libc compile step run in-process instead of
+    /// re-spawning `self_exe_path` as `<self_exe> ld.lld|clang ...`.
+    internal_tools_in_process: bool = false,
 
     /// Options that have been resolved by calling `resolveDefaults`.
     config: Compilation.Config,
@@ -2241,6 +2266,7 @@ pub fn create(gpa: Allocator, arena: Allocator, io: Io, diag: *CreateDiagnostic,
             .rc_source_files = options.rc_source_files,
             .cache_parent = cache,
             .self_exe_path = options.self_exe_path,
+            .internal_tools_in_process = options.internal_tools_in_process,
             .libc_include_dir_list = libc_dirs.libc_include_dir_list,
             .libc_framework_dir_list = libc_dirs.libc_framework_dir_list,
             .rc_includes = options.rc_includes,
@@ -5034,6 +5060,7 @@ fn workerDocsWasmFallible(comp: *Compilation, prog_node: std.Progress.Node) SubU
         .thread_limit = comp.thread_limit,
         .dirs = dirs,
         .self_exe_path = comp.self_exe_path,
+        .internal_tools_in_process = comp.internal_tools_in_process,
         .config = config,
         .root_mod = root_mod,
         .entry = .disabled,
@@ -5812,7 +5839,12 @@ fn updateCObject(comp: *Compilation, c_object: *CObject, c_obj_prog_node: std.Pr
             error.FileNotFound => {}, // the file wasn't created due to an error we reported
             else => log.warn("failed to delete '{s}': {s}", .{ dep_file_path, @errorName(err) }),
         };
-        if (std.process.can_spawn) {
+        // `internal_tools_in_process`: library embedders (Zap) are not
+        // the Zig compiler, so `<self_exe> clang ...` would not reach
+        // the bundled Clang and CRT/libc objects would silently fail to
+        // build. Force the in-process `clangMain` path for them, the
+        // same way the no-`can_spawn` host path already does.
+        if (std.process.can_spawn and !comp.internal_tools_in_process) {
             if (comp.clang_passthrough_mode) {
                 var child = std.process.spawn(io, .{
                     .argv = argv.items,
@@ -7478,6 +7510,7 @@ fn buildOutputFromZig(
         .cache_mode = .whole,
         .parent_whole_cache = parent_whole_cache,
         .self_exe_path = comp.self_exe_path,
+        .internal_tools_in_process = comp.internal_tools_in_process,
         .config = config,
         .root_mod = root_mod,
         .root_name = root_name,
@@ -7614,6 +7647,7 @@ pub fn build_crt_file(
         .thread_limit = comp.thread_limit,
         .dirs = comp.dirs.withoutLocalCache(),
         .self_exe_path = comp.self_exe_path,
+        .internal_tools_in_process = comp.internal_tools_in_process,
         .cache_mode = .whole,
         .config = config,
         .root_mod = root_mod,

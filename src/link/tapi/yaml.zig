@@ -22,7 +22,14 @@ pub const YamlError = error{
 } || ParseError || std.fmt.ParseIntError;
 
 pub const List = []Value;
-pub const Map = std.StringHashMap(Value);
+/// Insertion-ordered so that serialization (`Value.stringify`) is
+/// deterministic: struct fields are encoded in declaration order and parsed
+/// maps round-trip in document order. A plain `std.StringHashMap` iterates in
+/// hash-bucket order, which made YAML/TBD output non-reproducible (and is
+/// observable as reordered keys after std hash changes). Unmanaged because the
+/// std managed array-hash-map alias was removed; all entries live in the
+/// caller-provided arena, so the allocator is threaded explicitly.
+pub const Map = std.StringArrayHashMapUnmanaged(Value);
 
 pub const Value = union(enum) {
     empty,
@@ -75,7 +82,7 @@ pub const Value = union(enum) {
                 const first = list[0];
                 if (first.isCompound()) {
                     for (list, 0..) |elem, i| {
-                        try writer.writeByteNTimes(' ', args.indentation);
+                        try writer.splatByteAll(' ', args.indentation);
                         try writer.writeAll("- ");
                         try elem.stringify(writer, .{
                             .indentation = args.indentation + 2,
@@ -108,7 +115,7 @@ pub const Value = union(enum) {
                     const value = entry.value_ptr.*;
 
                     if (!args.should_inline_first_key or i != 0) {
-                        try writer.writeByteNTimes(' ', args.indentation);
+                        try writer.splatByteAll(' ', args.indentation);
                     }
                     try writer.print("{s}: ", .{key});
 
@@ -154,8 +161,8 @@ pub const Value = union(enum) {
         } else if (node.cast(Node.Map)) |map| {
             // TODO use ContextAdapted HashMap and do not duplicate keys, intern
             // in a contiguous string buffer.
-            var out_map = std.StringHashMap(Value).init(arena);
-            try out_map.ensureUnusedCapacity(math.cast(u32, map.values.items.len) orelse return error.Overflow);
+            var out_map: Map = .empty;
+            try out_map.ensureUnusedCapacity(arena, math.cast(u32, map.values.items.len) orelse return error.Overflow);
 
             for (map.values.items) |entry| {
                 const key = try arena.dupe(u8, tree.getRaw(entry.key, entry.key));
@@ -223,9 +230,9 @@ pub const Value = union(enum) {
 
                 return Value{ .list = try list.toOwnedSlice() };
             } else {
-                var map = Map.init(arena);
-                errdefer map.deinit();
-                try map.ensureTotalCapacity(info.fields.len);
+                var map: Map = .empty;
+                errdefer map.deinit(arena);
+                try map.ensureTotalCapacity(arena, info.fields.len);
 
                 inline for (info.fields) |field| {
                     if (try encode(arena, @field(input, field.name))) |value| {

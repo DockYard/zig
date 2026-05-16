@@ -1621,7 +1621,20 @@ fn spawnLld(comp: *Compilation, arena: Allocator, argv: []const []const u8) !voi
     // If possible, we run LLD as a child process because it does not always
     // behave properly as a library, unfortunately.
     // https://github.com/ziglang/zig/issues/3825
-    if (!std.process.can_spawn) {
+    //
+    // Two situations force in-process LLD instead:
+    //   1. The host cannot spawn child processes at all.
+    //   2. `comp.internal_tools_in_process` is set: the running
+    //      executable is a library embedder (e.g. Zap) rather than the
+    //      Zig compiler, so re-spawning `self_exe_path` as
+    //      `<self_exe> ld.lld ...` would not reach embedded LLD (the
+    //      embedder has no such subcommand) and would silently produce
+    //      no linked artifact. Driving LLD in-process via `lldMain`
+    //      performs the real link/relocatable step. The argv still
+    //      carries `self_exe_path` at argv[0] and the LLD linker name
+    //      at argv[1]; `lldMain` shaves argv[0] and dispatches on
+    //      argv[1] exactly as the re-spawn path would.
+    if (!std.process.can_spawn or comp.internal_tools_in_process) {
         const exit_code = try lldMain(arena, argv, false);
         if (exit_code == 0) return;
         if (comp.clang_passthrough_mode) std.process.exit(exit_code);

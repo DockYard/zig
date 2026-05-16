@@ -28,6 +28,27 @@ uavs: UavTable = .{},
 /// TLV initializers indexed by Atom.Index.
 tlv_initializers: TlvInitializerTable = .{},
 
+/// Self-hosted-emitted machine code / data for atoms that live in a
+/// non-Zig output section (i.e. a section created on the fly to honour a
+/// user `linksection` attribute, such as `__TEXT,__text` or
+/// `__DATA,__data`). Indexed by `Atom.Index`.
+///
+/// Zig-managed sections (`__TEXT_ZIG`, `__CONST_ZIG`, ...) keep a stable
+/// file region across incremental updates and flush relayout, so their
+/// atom contents can always be recovered by reading the file at
+/// `sect.offset + atom.value`. Non-Zig sections do NOT get that
+/// treatment: at flush, `MachO.allocateSections` reassigns the section's
+/// final file offset without relocating the bytes that were written at
+/// the provisional offset, and `MachO.resizeSections` then zero/`int3`-
+/// fills the in-memory `.out` buffer before `writeAtoms` reconstructs it.
+/// Reading the file at the final offset would therefore yield padding,
+/// not the emitted code. We instead retain the emitted bytes here so
+/// `getAtomData` can serve them as the single source of truth when
+/// `writeAtoms` rebuilds the non-Zig section's `.out` buffer — exactly
+/// mirroring how `tlv_initializers` backs the TLV branch of
+/// `getAtomData`.
+nonzig_atom_data: NonZigAtomDataTable = .{},
+
 /// A table of relocations.
 relocs: RelocationTable = .empty,
 
@@ -99,6 +120,11 @@ pub fn deinit(self: *ZigObject, allocator: Allocator) void {
         tlv_init.deinit(allocator);
     }
     self.tlv_initializers.deinit(allocator);
+
+    for (self.nonzig_atom_data.values()) |*atom_data| {
+        atom_data.deinit(allocator);
+    }
+    self.nonzig_atom_data.deinit(allocator);
 
     if (self.dwarf) |*dwarf| {
         dwarf.deinit();
@@ -183,6 +209,16 @@ pub fn getAtomData(self: ZigObject, macho_file: *MachO, atom: Atom, buffer: []u8
             @memset(buffer, 0);
         },
         else => {
+            if (!macho_file.isZigSection(atom.out_n_sect)) {
+                // Atom placed in a non-Zig output section via a user
+                // `linksection`. Its bytes are not recoverable from the
+                // file (the provisional offset is invalidated at flush),
+                // so serve the retained copy — the symmetric counterpart
+                // to the TLV branch above.
+                const retained = self.nonzig_atom_data.get(atom.atom_index).?;
+                @memcpy(buffer, retained.data);
+                return;
+            }
             const sect = macho_file.sections.items(.header)[atom.out_n_sect];
             const file_offset = sect.offset + atom.value;
             const amt = try macho_file.base.file.?.readPositionalAll(io, buffer, file_offset);
@@ -1016,9 +1052,32 @@ fn updateNavCode(
     }
 
     if (!sect.isZerofill()) {
-        const file_offset = sect.offset + atom.value;
-        macho_file.base.file.?.writePositionalAll(io, code, file_offset) catch |err|
-            return macho_file.base.cgFail(nav_index, "failed to write output file: {t}", .{err});
+        if (macho_file.isZigSection(sect_index)) {
+            // Zig-managed sections keep a stable file region across
+            // incremental updates and the flush relayout, so writing the
+            // code directly at its current file offset is durable and is
+            // what `getAtomData` reads back.
+            const file_offset = sect.offset + atom.value;
+            macho_file.base.file.?.writePositionalAll(io, code, file_offset) catch |err|
+                return macho_file.base.cgFail(nav_index, "failed to write output file: {t}", .{err});
+        } else {
+            // Non-Zig section (created on the fly to honour a user
+            // `linksection`). The provisional file offset is invalidated
+            // at flush, and the in-memory `.out` buffer is rebuilt from
+            // scratch by `writeAtoms` after `resizeSections` clears it.
+            // Retain the emitted bytes so `getAtomData` can serve them as
+            // the single source of truth — mirroring `tlv_initializers`.
+            const owned = gpa.dupe(u8, code) catch |err|
+                return macho_file.base.cgFail(nav_index, "failed to retain code: {s}", .{@errorName(err)});
+            const gop = self.nonzig_atom_data.getOrPut(gpa, atom.atom_index) catch |err| {
+                gpa.free(owned);
+                return macho_file.base.cgFail(nav_index, "failed to retain code: {s}", .{@errorName(err)});
+            };
+            if (gop.found_existing) {
+                gpa.free(gop.value_ptr.data);
+            }
+            gop.value_ptr.* = .{ .data = owned };
+        }
     }
 }
 
@@ -1801,11 +1860,22 @@ const TlvInitializer = struct {
     }
 };
 
+/// Retained self-hosted-emitted bytes for an atom that lives in a non-Zig
+/// output section. Owns its `data` slice. See `nonzig_atom_data`.
+const NonZigAtomData = struct {
+    data: []const u8 = &[0]u8{},
+
+    fn deinit(self: *NonZigAtomData, allocator: Allocator) void {
+        allocator.free(self.data);
+    }
+};
+
 const NavTable = std.AutoArrayHashMapUnmanaged(InternPool.Nav.Index, AvMetadata);
 const UavTable = std.AutoArrayHashMapUnmanaged(InternPool.Index, AvMetadata);
 const LazySymbolTable = std.AutoArrayHashMapUnmanaged(InternPool.Index, LazySymbolMetadata);
 const RelocationTable = std.ArrayList(std.ArrayList(Relocation));
 const TlvInitializerTable = std.AutoArrayHashMapUnmanaged(Atom.Index, TlvInitializer);
+const NonZigAtomDataTable = std.AutoArrayHashMapUnmanaged(Atom.Index, NonZigAtomData);
 
 const x86_64 = struct {
     fn writeTrampolineCode(source_addr: u64, target_addr: u64, buf: *[max_trampoline_len]u8) ![]u8 {

@@ -328,19 +328,29 @@ pub fn build(b: *std.Build) !void {
     const version = try b.allocator.dupeZ(u8, version_slice);
     exe_options.addOption([:0]const u8, "version", version);
 
-    if (enable_llvm) {
-        const cmake_cfg = if (static_llvm) null else blk: {
-            const io = b.graph.io;
-            const cwd: Io.Dir = .cwd();
-            if (findConfigH(b, config_h_path_option)) |config_h_path| {
-                const file_contents = cwd.readFileAlloc(io, config_h_path, b.allocator, .limited(max_config_h_bytes)) catch unreachable;
-                break :blk parseConfigH(b, file_contents);
-            } else {
-                std.log.warn("config.h could not be located automatically. Consider providing it explicitly via \"-Dconfig_h\"", .{});
-                break :blk null;
-            }
-        };
+    // Resolve the CMake LLVM config ONCE at function scope so every
+    // LLVM-linked artifact (the `exe`, the `lib`, AND the `test-unit`
+    // compiler-source unit-test binary) shares the exact same LLVM /
+    // Clang / LLD / zigcpp linkage. Previously this was computed inside
+    // the `if (enable_llvm)` block and applied only to `exe`/`lib`, so
+    // `test-unit` linked NONE of the `_ZigLLVM*` C++ shim symbols and
+    // failed at link time ("undefined symbol: _ZigLLVMTargetMachine…")
+    // for any `-Denable-llvm`/`-Dstatic-llvm` build — i.e. the fork's
+    // own unit-test step could not even link. Hoisting + reusing the
+    // config makes the test binary link identically to the compiler.
+    const cmake_cfg: ?CMakeConfig = if (!enable_llvm) null else if (static_llvm) null else blk: {
+        const io = b.graph.io;
+        const cwd: Io.Dir = .cwd();
+        if (findConfigH(b, config_h_path_option)) |config_h_path| {
+            const file_contents = cwd.readFileAlloc(io, config_h_path, b.allocator, .limited(max_config_h_bytes)) catch unreachable;
+            break :blk parseConfigH(b, file_contents);
+        } else {
+            std.log.warn("config.h could not be located automatically. Consider providing it explicitly via \"-Dconfig_h\"", .{});
+            break :blk null;
+        }
+    };
 
+    if (enable_llvm) {
         if (cmake_cfg) |cfg| {
             // Inside this code path, we have to coordinate with system packaged LLVM, Clang, and LLD.
             // That means we also have to rely on stage1 compiled c++ files. We parse config.h to find
@@ -618,10 +628,49 @@ pub fn build(b: *std.Build) !void {
         .use_llvm = use_llvm,
         .use_lld = use_llvm,
         .zig_lib_dir = b.path("lib"),
-        .max_rss = 2_700_000_000,
+        // The 2.7GB cap predates this target being LLVM-linked. The
+        // LLVM/Clang/LLD linkage fix below (`addCmakeCfgOptionsToExe`/
+        // `addStaticLlvmOptionsToModule`, required so `test-unit` can link
+        // the `_ZigLLVM*` C++ shim at all) makes `unit_tests` compile the
+        // full LLVM C++ translation units (`zig_llvm.cpp`,
+        // `zig_clang_*.cpp`) and link every LLVM/Clang/LLD library —
+        // exactly like the std-library test target below. That C++ compile
+        // peaks at ~6.6GB, far above the stale 2.7GB cap, so any run that
+        // must (re)build the shim was killed by the RSS gate with
+        // "memory usage peaked … exceeding the declared upper bound". Match
+        // the std-test target's 9.3GB cap (same LLVM C++ compile, same
+        // headroom) instead of the obsolete pre-LLVM value.
+        .max_rss = 9_300_000_000,
     });
     if (link_libc) {
         unit_tests.root_module.link_libc = true;
+    }
+    // Apply the SAME LLVM / Clang / LLD / zigcpp linkage the `exe` and
+    // `lib` targets get. `addCompilerMod` pulls in `codegen/llvm` and
+    // `link` (which reference `_ZigLLVM*` C++ shim symbols), so without
+    // this the unit-test binary fails to link under any
+    // `-Denable-llvm`/`-Dstatic-llvm` configuration — the fork's own
+    // `test-unit`/`test` step would be permanently broken at link
+    // time. Mirrors the `exe`/`lib` branch above exactly, reusing the
+    // function-scoped `cmake_cfg`.
+    if (enable_llvm) {
+        if (cmake_cfg) |cfg| {
+            try addCmakeCfgOptionsToExe(b, cfg, unit_tests, use_zig_libcxx);
+        } else {
+            try addStaticLlvmOptionsToModule(unit_tests.root_module, .{
+                .llvm_has_m68k = llvm_has_m68k,
+                .llvm_has_csky = llvm_has_csky,
+                .llvm_has_arc = llvm_has_arc,
+                .llvm_has_xtensa = llvm_has_xtensa,
+            });
+        }
+        if (target.result.os.tag == .windows) {
+            // LLVM depends on networking as of version 18.
+            unit_tests.root_module.linkSystemLibrary("ws2_32", .{});
+            unit_tests.root_module.linkSystemLibrary("version", .{});
+            unit_tests.root_module.linkSystemLibrary("uuid", .{});
+            unit_tests.root_module.linkSystemLibrary("ole32", .{});
+        }
     }
     unit_tests.root_module.addOptions("build_options", exe_options);
     unit_tests_step.dependOn(&b.addRunArtifact(unit_tests).step);

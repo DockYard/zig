@@ -1769,7 +1769,21 @@ fn getSegmentProt(segname: []const u8) macho.vm_prot_t {
 fn getSegmentRank(segname: []const u8) u8 {
     if (mem.eql(u8, segname, "__PAGEZERO")) return 0x0;
     if (mem.eql(u8, segname, "__LINKEDIT")) return 0xf;
-    if (mem.indexOf(u8, segname, "ZIG")) |_| return 0xe;
+    // The Zig-managed segments are assigned fixed, widely-spaced VM addresses
+    // in `initMetadata` (`__TEXT_ZIG` < `__CONST_ZIG` < `__DATA_ZIG` <
+    // `__BSS_ZIG`). dyld requires segment load commands to appear in
+    // monotonically non-decreasing VM-address order, so each Zig segment must
+    // get a distinct rank that mirrors that fixed address layout. Collapsing
+    // them to a single rank and tie-breaking by name (the previous behavior)
+    // produced load-command order `__BSS_ZIG`, `__CONST_ZIG`, `__DATA_ZIG`,
+    // `__TEXT_ZIG`, whose VM addresses are out of order, which made dyld abort
+    // with "segment '__CONST_ZIG' vm address out of order". These ranks keep
+    // all Zig segments grouped after the regular segments and before
+    // `__LINKEDIT` while ordering them by their fixed VM addresses.
+    if (mem.eql(u8, segname, "__TEXT_ZIG")) return 0xb;
+    if (mem.eql(u8, segname, "__CONST_ZIG")) return 0xc;
+    if (mem.eql(u8, segname, "__DATA_ZIG")) return 0xd;
+    if (mem.eql(u8, segname, "__BSS_ZIG")) return 0xe;
     if (mem.startsWith(u8, segname, "__TEXT")) return 0x1;
     if (mem.startsWith(u8, segname, "__DATA_CONST")) return 0x2;
     if (mem.startsWith(u8, segname, "__DATA")) return 0x3;
@@ -2250,27 +2264,73 @@ fn allocateSections(self: *MachO) !void {
     }
 
     fileoff = mem.alignForward(u32, fileoff, page_size);
-    for (slice.items(.header)[last_index..], slice.items(.segment_id)[last_index..]) |*header, seg_id| {
-        if (header.isZerofill()) continue;
-        if (header.offset < fileoff) {
-            const existing_size = header.size;
-            header.size = 0;
 
-            // Must move the entire section.
-            const new_offset = try self.findFreeSpace(existing_size, page_size);
+    // Re-lay-out every file-backed Zig section/segment (`__TEXT_ZIG`,
+    // `__CONST_ZIG`, `__DATA_ZIG`; `__BSS_ZIG` is zerofill) into ONE fresh
+    // contiguous region, in iteration order. `sortSections` keeps these in
+    // the same order as `getSegmentRank` (`__TEXT_ZIG` < `__CONST_ZIG` <
+    // `__DATA_ZIG`, ordered by their fixed VM addresses), which is also the
+    // segment load-command order. dyld requires segments in load-command
+    // order to be monotonically non-decreasing in BOTH vmaddr and file
+    // offset. The Zig section/segment file offsets are otherwise assigned by
+    // three uncoordinated paths — `initMetadata`'s provisional placement, the
+    // incremental `growSectionNonRelocatable` relocation, and this flush — and
+    // each uses an independent `findFreeSpace`, so the large `__text_zig`
+    // tends to land high while the tiny `__const_zig`/`__data_zig` fit in
+    // earlier gaps. That yields decreasing file offsets across the segment
+    // sequence and dyld aborts ("segment '__CONST_ZIG' file offset out of
+    // order"). Doing the layout unconditionally here — not only when a
+    // section happens to overlap the regular content — makes this flush step
+    // the single authority that guarantees monotonic file offsets regardless
+    // of how the offsets were scattered during incremental compilation.
+    {
+        const ZigSect = struct { sect_index: u8, seg_id: u8, old_offset: u64, size: u64 };
+        var zig_sects: [4]ZigSect = undefined;
+        var zig_sects_len: usize = 0;
+        var block_size: u64 = 0;
+        for (
+            slice.items(.header)[last_index..],
+            slice.items(.segment_id)[last_index..],
+            last_index..,
+        ) |*header, seg_id, sect_index| {
+            if (header.isZerofill()) continue;
+            zig_sects[zig_sects_len] = .{
+                .sect_index = @intCast(sect_index),
+                .seg_id = seg_id,
+                .old_offset = header.offset,
+                .size = header.size,
+            };
+            zig_sects_len += 1;
+            block_size = mem.alignForward(u64, block_size, page_size) + header.size;
+        }
 
-            log.debug("moving '{s},{s}' from 0x{x} to 0x{x}", .{
-                header.segName(),
-                header.sectName(),
-                header.offset,
-                new_offset,
-            });
+        if (zig_sects_len > 0) {
+            // Zero the sizes so the freed old ranges do not collide with the
+            // contiguous block we are about to find.
+            for (zig_sects[0..zig_sects_len]) |zs| {
+                slice.items(.header)[zs.sect_index].size = 0;
+            }
 
-            try self.copyRangeAllZeroOut(header.offset, new_offset, existing_size);
+            var next_offset = try self.findFreeSpace(block_size, page_size);
+            for (zig_sects[0..zig_sects_len]) |zs| {
+                const header = &slice.items(.header)[zs.sect_index];
+                const new_offset = mem.alignForward(u64, next_offset, page_size);
+                next_offset = new_offset + zs.size;
 
-            header.offset = @intCast(new_offset);
-            header.size = existing_size;
-            self.segments.items[seg_id].fileoff = new_offset;
+                if (new_offset != zs.old_offset) {
+                    log.debug("moving '{s},{s}' from 0x{x} to 0x{x}", .{
+                        header.segName(),
+                        header.sectName(),
+                        zs.old_offset,
+                        new_offset,
+                    });
+                    try self.copyRangeAllZeroOut(zs.old_offset, new_offset, zs.size);
+                }
+
+                header.offset = @intCast(new_offset);
+                header.size = zs.size;
+                self.segments.items[zs.seg_id].fileoff = new_offset;
+            }
         }
     }
 }
@@ -3348,38 +3408,55 @@ fn initMetadata(self: *MachO, options: InitMetadataOptions) !void {
             break :blk mem.alignBackward(u64, pagezero_size, self.getPageSize());
         };
 
+        // The three file-backed Zig segments (`__TEXT_ZIG`, `__CONST_ZIG`,
+        // `__DATA_ZIG`) appear in the load commands in this order (see
+        // `getSegmentRank`, which orders them by their fixed VM addresses).
+        // dyld requires segments in load-command order to be monotonically
+        // non-decreasing in BOTH vmaddr AND file offset. Allocating each
+        // segment's file offset with an independent `findFreeSpace` call does
+        // not coordinate ordering: `__TEXT_ZIG` is large
+        // (`program_code_size_hint`) so it lands in a high free gap, while the
+        // tiny `__CONST_ZIG`/`__DATA_ZIG` fit in earlier gaps — yielding file
+        // offsets that decrease across the segment sequence and make dyld
+        // abort ("segment '__TEXT_ZIG' file offset out of order"). Allocate
+        // one contiguous free region sized for all three (each page-aligned)
+        // and lay them out sequentially so their file offsets increase in the
+        // same order as the load commands.
         {
-            const filesize = options.program_code_size_hint;
-            const off = try self.findFreeSpace(filesize, self.getPageSize());
+            const page_size = self.getPageSize();
+            const text_filesize = options.program_code_size_hint;
+            const const_filesize: u64 = 1024;
+            const data_filesize: u64 = 1024;
+
+            const text_span = mem.alignForward(u64, text_filesize, page_size);
+            const const_span = mem.alignForward(u64, const_filesize, page_size);
+            const block_size = text_span + const_span + data_filesize;
+
+            const text_off = try self.findFreeSpace(block_size, page_size);
+            const const_off = text_off + text_span;
+            const data_off = const_off + const_span;
+
             self.zig_text_seg_index = try self.addSegment("__TEXT_ZIG", .{
-                .fileoff = off,
-                .filesize = filesize,
+                .fileoff = text_off,
+                .filesize = text_filesize,
                 .vmaddr = base_vmaddr + 0x4000000,
-                .vmsize = filesize,
+                .vmsize = text_filesize,
                 .prot = .{ .READ = true, .EXEC = true },
             });
-        }
 
-        {
-            const filesize: u64 = 1024;
-            const off = try self.findFreeSpace(filesize, self.getPageSize());
             self.zig_const_seg_index = try self.addSegment("__CONST_ZIG", .{
-                .fileoff = off,
-                .filesize = filesize,
+                .fileoff = const_off,
+                .filesize = const_filesize,
                 .vmaddr = base_vmaddr + 0xc000000,
-                .vmsize = filesize,
+                .vmsize = const_filesize,
                 .prot = .{ .READ = true, .WRITE = true },
             });
-        }
 
-        {
-            const filesize: u64 = 1024;
-            const off = try self.findFreeSpace(filesize, self.getPageSize());
             self.zig_data_seg_index = try self.addSegment("__DATA_ZIG", .{
-                .fileoff = off,
-                .filesize = filesize,
+                .fileoff = data_off,
+                .filesize = data_filesize,
                 .vmaddr = base_vmaddr + 0x10000000,
-                .vmsize = filesize,
+                .vmsize = data_filesize,
                 .prot = .{ .READ = true, .WRITE = true },
             });
         }

@@ -3938,10 +3938,19 @@ test "Builder: addInt returns valid Ref" {
     const a = try body.addInt(10);
     const b = try body.addInt(20);
 
-    // a should be inst[3] -> Ref(3 + 124 = 127)
-    try std.testing.expectEqual(@as(u32, 127), @intFromEnum(a));
-    // b should be inst[4] -> Ref(4 + 124 = 128)
-    try std.testing.expectEqual(@as(u32, 128), @intFromEnum(b));
+    // `a` is instruction index 3 and `b` is index 4. The concrete `Ref`
+    // integer is `Zir.Inst.Ref.static_len + index` (see `Index.toRef`);
+    // `static_len` is the InternPool static-ref count and changes whenever
+    // upstream adds static refs, so derive the expectation from the API
+    // rather than hardcoding it.
+    try std.testing.expectEqual(
+        @intFromEnum(Zir.Inst.Index.toRef(@enumFromInt(3))),
+        @intFromEnum(a),
+    );
+    try std.testing.expectEqual(
+        @intFromEnum(Zir.Inst.Index.toRef(@enumFromInt(4))),
+        @intFromEnum(b),
+    );
 
     // Use them in a binary op
     const sum = try body.addBinOp(.add, a, b);
@@ -4098,7 +4107,26 @@ test "Builder: struct_decl extended encoding" {
     const ext = data_items[0].extended;
 
     try std.testing.expectEqual(Zir.Inst.Extended.struct_decl, ext.opcode);
-    try std.testing.expectEqual(@as(u16, 0x0004), ext.small);
+    // This root struct has one declaration (`main`) and zero fields, so the
+    // only `StructDecl.Small` flag set is `has_decls_len` (bit 1). Asserting
+    // the bit via the actual `Small` layout keeps the check correct if the
+    // bitfield order changes, and documents intent. (The previous literal
+    // `0x0004` was `has_fields_len`, which is wrong for a fieldless struct —
+    // the builder correctly emits only `has_decls_len`.)
+    // The builder leaves `name_strategy`/`layout` at their zero values
+    // (`.parent`/`.auto`), matching the `small` it actually encodes.
+    const expected_small: u16 = @bitCast(Zir.Inst.StructDecl.Small{
+        .has_captures_len = false,
+        .has_decls_len = true,
+        .has_fields_len = false,
+        .name_strategy = .parent,
+        .layout = .auto,
+        .has_backing_int_type = false,
+        .any_field_aligns = false,
+        .any_field_defaults = false,
+        .any_comptime_fields = false,
+    });
+    try std.testing.expectEqual(expected_small, ext.small);
     // StructDecl payload should be at index 26 (after all func/decl payloads)
     try std.testing.expectEqual(@as(u32, 26), ext.operand);
 }
@@ -4115,10 +4143,21 @@ test "Builder: addCall" {
 
     const result = try builder.finalize();
 
-    // extended, declaration, restore_err_ret, int(42), decl_val("some_func"), break_inline(arg), dbg_stmt, call, ret_implicit, func, break_inline
+    // `addCall` reserves the `call` slot *before* emitting the argument
+    // bodies and the required `dbg_stmt`, then patches it (mirroring AstGen's
+    // pre-allocate-then-fill approach). So the real instruction order is:
+    //   0: extended(struct_decl)   1: declaration   2: restore_err_ret
+    //   3: int(42)                 4: decl_val("some_func")
+    //   5: call (reserved here, patched after args)
+    //   6: break_inline(arg)       7: dbg_stmt
+    //   8: ret_implicit            9: func          10: break_inline
+    // (The previous comment/expectation placed `call` last at index 7; that
+    // predates the reserve-then-patch design — index 7 is actually
+    // `dbg_stmt`.)
     try std.testing.expectEqual(@as(u32, 11), result.instructions_len);
     try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.decl_val), result.instructions_tags[4]);
-    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.call), result.instructions_tags[7]);
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.call), result.instructions_tags[5]);
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.dbg_stmt), result.instructions_tags[7]);
 }
 
 test "Builder: function with i64 return type" {
@@ -4696,8 +4735,12 @@ test "Builder: addSwitchBlock extra data layout" {
     const result = try body.addSwitchBlock(operand, &prongs);
     try std.testing.expect(@intFromEnum(result) > 0);
 
-    // Find the switch_block instruction index
-    const switch_idx = @intFromEnum(result) - @intFromEnum(Zir.Inst.Index.ref_start_index);
+    // Find the switch_block instruction index. `result` is a `Zir.Inst.Ref`;
+    // `Ref.toIndex` is the inverse of `Index.toRef` and subtracts the static
+    // InternPool ref count (`Ref.static_len`, formerly exposed as the
+    // `Zir.Inst.Index.ref_start_index` enum constant) to recover the raw
+    // instruction index used to index the builder's parallel arrays.
+    const switch_idx = @intFromEnum(Zir.Inst.Ref.toIndex(result).?);
 
     // Verify tag
     try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.switch_block), builder.tags.items[switch_idx]);
@@ -4712,8 +4755,13 @@ test "Builder: addSwitchBlock extra data layout" {
 
     // extra[payload_idx+1] = bits
     const bits: Zir.Inst.SwitchBlock.Bits = @bitCast(extra[payload_idx + 1]);
-    try std.testing.expectEqual(@as(u25, 2), bits.scalar_cases_len);
-    try std.testing.expect(bits.any_non_inline_capture);
+    // `scalar_cases_len` is `Zir.Inst.SwitchBlock.Bits.ScalarCasesLen` (now
+    // `u24`), and the "non-inline capture present" flag was renamed from
+    // `any_non_inline_capture` to `any_maybe_runtime_capture` (same meaning:
+    // at least one prong has a non-inline, possibly-runtime payload/tag
+    // capture). `addSwitchBlock` already populates these current fields.
+    try std.testing.expectEqual(@as(@FieldType(Zir.Inst.SwitchBlock.Bits, "scalar_cases_len"), 2), bits.scalar_cases_len);
+    try std.testing.expect(bits.any_maybe_runtime_capture);
 
     // extra[payload_idx+2] = first case item Ref (should be an enum_literal for "Ok")
     // Verify it's a valid instruction Ref (not zero/none)
@@ -4721,6 +4769,8 @@ test "Builder: addSwitchBlock extra data layout" {
 
     // extra[payload_idx+3] = ProngInfo for first case
     const prong0_info: Zir.Inst.SwitchBlock.ProngInfo = @bitCast(extra[payload_idx + 3]);
-    try std.testing.expectEqual(@as(u28, 1), prong0_info.body_len); // 0 body + 1 break
+    // `ProngInfo.body_len` is now `u27` (was `u28`); assert against the
+    // field's actual width so the check stays correct across width changes.
+    try std.testing.expectEqual(@as(@FieldType(Zir.Inst.SwitchBlock.ProngInfo, "body_len"), 1), prong0_info.body_len); // 0 body + 1 break
     try std.testing.expectEqual(Zir.Inst.SwitchBlock.ProngInfo.Capture.by_val, prong0_info.capture);
 }

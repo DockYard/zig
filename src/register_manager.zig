@@ -79,18 +79,29 @@ pub fn RegisterManager(
             @setEvalBranchQuota(3000);
 
             const Id = @TypeOf(reg.id());
-            comptime var min_id: Id = std.math.maxInt(Id);
-            comptime var max_id: Id = std.math.minInt(Id);
+            // `min_id`/`max_id` track the register-id range, but the dense
+            // lookup-table size (`max_id - min_id + 1`) and per-element index
+            // (`id - min_id`) are index-space computations. They must be done
+            // in `usize`: performing `max_id - min_id + 1` in the narrow `Id`
+            // type overflows it (e.g. for a `u3` id space with `max_id == 7`,
+            // `7 + 1` overflows `u3`), which current Zig rejects for typed
+            // `comptime var` arithmetic. Widening to `usize` is exactly
+            // value-preserving here (all ids are small non-negative integers).
+            comptime var min_id: usize = std.math.maxInt(Id);
+            comptime var max_id: usize = std.math.minInt(Id);
             inline for (set) |elem| {
-                const elem_id = comptime elem.id();
+                const elem_id: usize = comptime elem.id();
                 min_id = @min(elem_id, min_id);
                 max_id = @max(elem_id, max_id);
             }
 
             comptime var map: [max_id - min_id + 1]std.math.IntFittingRange(0, set.len) = @splat(set.len);
-            inline for (set, 0..) |elem, elem_index| map[comptime elem.id() - min_id] = elem_index;
+            inline for (set, 0..) |elem, elem_index| map[@as(usize, comptime elem.id()) - min_id] = elem_index;
 
-            const id_index = reg.id() -% min_id;
+            // Use wrapping subtraction in `usize` so an out-of-range register
+            // (`reg.id() < min_id`) wraps to a large value that the bounds
+            // check below rejects, mirroring the original `-%` behavior.
+            const id_index = @as(usize, reg.id()) -% min_id;
             if (id_index >= map.len) return null;
             const set_index = map[id_index];
             return if (set_index < set.len) @intCast(set_index) else null;
@@ -531,7 +542,7 @@ test "tryAllocReg: no spilling" {
     };
     defer function.deinit();
 
-    const mock_instruction: Air.Inst.Index = 1;
+    const mock_instruction: Air.Inst.Index = @enumFromInt(1);
     const gp = MockRegister1.gp;
 
     try expectEqual(@as(?MockRegister1, .r2), function.register_manager.tryAllocReg(mock_instruction, gp));
@@ -560,7 +571,7 @@ test "allocReg: spilling" {
     };
     defer function.deinit();
 
-    const mock_instruction: Air.Inst.Index = 1;
+    const mock_instruction: Air.Inst.Index = @enumFromInt(1);
     const gp = MockRegister1.gp;
 
     try expectEqual(@as(?MockRegister1, .r2), try function.register_manager.allocReg(mock_instruction, gp));
@@ -702,7 +713,7 @@ test "getReg" {
     };
     defer function.deinit();
 
-    const mock_instruction: Air.Inst.Index = 1;
+    const mock_instruction: Air.Inst.Index = @enumFromInt(1);
 
     try function.register_manager.getReg(.r3, mock_instruction);
 

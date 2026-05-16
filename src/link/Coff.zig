@@ -2224,6 +2224,57 @@ fn flushMoved(coff: *Coff, ni: MappedFile.Node.Index) !void {
     try ni.childrenMoved(coff.base.comp.gpa, &coff.mf);
 }
 
+/// Computes the virtual size to reserve for a section whose backing data is
+/// now `size` bytes, starting at relative virtual address `rva`.
+///
+/// The self-hosted COFF linker over-reserves virtual address space for each
+/// section so that subsequent incremental growth does not force every
+/// following section to be re-slid. The historical heuristic reserves four
+/// times the current section size (rounded up to `section_alignment`).
+///
+/// PE/COFF represents `virtual_size`, `virtual_address`, `size_of_image`, and
+/// `size_of_headers` as unsigned 32-bit fields, so the entire image's virtual
+/// layout must fit within a 32-bit RVA space. The 4x reservation is only a
+/// growth heuristic, not a hard requirement: the genuine requirement is that
+/// the section's virtual size is at least its (page-aligned) data size and
+/// that `rva + virtual_size` remains representable as a `u32` (it is consumed
+/// as `size_of_image`). Computing `size * 4` in the destination width and
+/// truncating it is therefore incorrect — for very large images (for example
+/// the self-hosted Debug build of `test/behavior.zig`, whose dominant section
+/// exceeds 1 GiB) `size * 4` overflows `u32` and the checked cast panics.
+///
+/// This computes the reservation entirely in wide arithmetic and bounds it by
+/// the address space the PE/COFF format can actually represent for a section
+/// at `rva`, while always honoring the real (page-aligned) data size. If even
+/// the real data cannot fit the 32-bit image space, that is a genuine
+/// PE-image-too-large condition and is surfaced as a proper link diagnostic
+/// rather than an integer-overflow panic.
+fn reserveVirtualSize(coff: *Coff, size: u64, rva: u32) error{LinkFailure}!u32 {
+    const section_alignment: u64 = coff.optionalHeaderField(.section_alignment);
+    // `size_of_image` is `rva + virtual_size` and must be a valid `u32`, so
+    // the section's virtual size may not push the image past the 32-bit RVA
+    // limit. This is the largest page-aligned virtual size that keeps
+    // `rva + virtual_size <= maxInt(u32)`.
+    const max_fit = std.mem.alignBackward(
+        u64,
+        @as(u64, std.math.maxInt(u32)) - rva,
+        section_alignment,
+    );
+    // The genuine requirement: the section's data must fit, page-aligned.
+    const needed = std.mem.alignForward(u64, size, section_alignment);
+    if (needed > max_fit) return coff.base.comp.link_diags.fail(
+        "PE/COFF image too large: section at RVA 0x{x} requires 0x{x} bytes of " ++
+            "virtual address space, exceeding the 32-bit image limit",
+        .{ rva, size },
+    );
+    // The growth heuristic: reserve 4x the data size (saturating to avoid
+    // overflowing the wide computation at pathological sizes), but never
+    // beyond what the 32-bit image space can represent for this section, and
+    // never below the page-aligned data size.
+    const desired = std.mem.alignForward(u64, size *| 4, section_alignment);
+    return @intCast(@max(needed, @min(desired, max_fit)));
+}
+
 fn flushResized(coff: *Coff, ni: MappedFile.Node.Index) !void {
     _, const size = ni.location(&coff.mf).resolve(&coff.mf);
     switch (coff.getNode(ni)) {
@@ -2232,16 +2283,15 @@ fn flushResized(coff: *Coff, ni: MappedFile.Node.Index) !void {
             switch (coff.optionalHeaderPtr()) {
                 inline else => |optional_header| coff.targetStore(
                     &optional_header.size_of_headers,
-                    @intCast(size),
+                    std.math.cast(u32, size) orelse return coff.base.comp.link_diags.fail(
+                        "PE/COFF headers too large: 0x{x} bytes exceeds the 32-bit limit",
+                        .{size},
+                    ),
                 ),
             }
             if (size > coff.image_section_table.items[0].get(coff).rva) try coff.virtualSlide(
                 0,
-                std.mem.alignForward(
-                    u32,
-                    @intCast(size * 4),
-                    coff.optionalHeaderField(.section_alignment),
-                ),
+                try coff.reserveVirtualSize(size, 0),
             );
         },
         .signature, .coff_header, .optional_header, .data_directories => unreachable,
@@ -2250,13 +2300,15 @@ fn flushResized(coff: *Coff, ni: MappedFile.Node.Index) !void {
             const sym = si.get(coff);
             const section_index = sym.section_number.toIndex();
             const section = &coff.sectionTableSlice()[section_index];
-            coff.targetStore(&section.size_of_raw_data, @intCast(size));
+            coff.targetStore(
+                &section.size_of_raw_data,
+                std.math.cast(u32, size) orelse return coff.base.comp.link_diags.fail(
+                    "PE/COFF section too large: raw data 0x{x} bytes exceeds the 32-bit limit",
+                    .{size},
+                ),
+            );
             if (size > coff.targetLoad(&section.virtual_size)) {
-                const virtual_size = std.mem.alignForward(
-                    u32,
-                    @intCast(size * 4),
-                    coff.optionalHeaderField(.section_alignment),
-                );
+                const virtual_size = try coff.reserveVirtualSize(size, sym.rva);
                 coff.targetStore(&section.virtual_size, virtual_size);
                 try coff.virtualSlide(section_index + 1, sym.rva + virtual_size);
             }

@@ -243,6 +243,7 @@ pub fn buildCrtFile(comp: *Compilation, in_crt_file: CrtFile, prog_node: std.Pro
                 .thread_limit = comp.thread_limit,
                 .dirs = comp.dirs.withoutLocalCache(),
                 .self_exe_path = comp.self_exe_path,
+                .internal_tools_in_process = comp.internal_tools_in_process,
                 .cache_mode = .whole,
                 .config = config,
                 .root_mod = root_mod,

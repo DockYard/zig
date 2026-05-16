@@ -407,11 +407,18 @@ test "duplicate map keys" {
 }
 
 fn testStringify(expected: []const u8, input: anytype) !void {
-    var output = std.array_list.Managed(u8).init(testing.allocator);
+    // `std.array_list.Managed(u8)` no longer exposes `.writer()` (the
+    // ArrayList/Io.Writer rework). This embedded test was committed-broken
+    // at the old API and only ever compiled from a stale `test-unit`
+    // cache; a clean-cache build failed here. Use the current
+    // `std.Io.Writer.Allocating` sink (`&aw.writer` is the `*Writer`,
+    // `aw.writer.buffered()` is the written bytes) — `yaml_mod.stringify`
+    // takes an `anytype` writer so it accepts it unchanged.
+    var output: std.Io.Writer.Allocating = .init(testing.allocator);
     defer output.deinit();
 
-    try yaml_mod.stringify(testing.allocator, input, output.writer());
-    try testing.expectEqualStrings(expected, output.items);
+    try yaml_mod.stringify(testing.allocator, input, &output.writer);
+    try testing.expectEqualStrings(expected, output.writer.buffered());
 }
 
 test "stringify an int" {

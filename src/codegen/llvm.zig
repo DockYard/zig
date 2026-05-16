@@ -1127,6 +1127,45 @@ pub const Object = struct {
         }
     }
 
+    /// Anchor a `linksection`-placed global or function against dead-strip.
+    ///
+    /// `linksection("SEG,SECT")` is an explicit request by the user to place
+    /// a declaration at a known location. For that placement to remain
+    /// meaningful the symbol must survive `-dead_strip` of the final image:
+    /// downstream code typically discovers it through a weak extern (e.g.
+    /// Zap's memory-manager `.zapmem` section), which resolves to null at
+    /// startup if the linker dead-stripped the data. The self-hosted Mach-O
+    /// backend encodes this by creating the section with
+    /// `S_REGULAR | S_ATTR_NO_DEAD_STRIP` (see
+    /// `link/MachO/ZigObject.getNavOutputSection`). The LLVM backend cannot
+    /// achieve the same guarantee by mangling the Mach-O section *specifier*
+    /// string: LLVM requires a single consistent `<segment>,<section>
+    /// [,<type>[,<attrs>]]` specifier for every symbol that lands in a given
+    /// named section, and the common case `linksection("__TEXT,__text")`
+    /// (or any user section also used implicitly) collides with the implicit
+    /// specifier LLVM assigns to every other symbol in that section,
+    /// aborting with "section type or attributes does not match previous
+    /// section specifier".
+    ///
+    /// The correct, code/data-format-agnostic mechanism is `@llvm.used`:
+    /// adding the symbol there marks it as referenced so neither the LLVM
+    /// optimizer nor the linker dead-strips it, with zero section-specifier
+    /// conflict. This mirrors how the sanitizer-coverage instrumentation in
+    /// this file keeps its own custom-section globals alive (see the
+    /// `o.used.append` calls in `updateFunc`). The section string itself is
+    /// emitted verbatim (the bare `SEG,SECT` the user wrote), so it always
+    /// matches LLVM's implicit specifier for that section.
+    fn markLinksectionUsed(
+        o: *Object,
+        ip: *const InternPool,
+        link_section: InternPool.OptionalNullTerminatedString,
+        global: Builder.Global.Index,
+    ) Allocator.Error!void {
+        if (link_section.toSlice(ip) == null) return;
+        const gpa = o.zcu.comp.gpa;
+        try o.used.append(gpa, global.toConst());
+    }
+
     pub fn updateFunc(
         o: *Object,
         pt: Zcu.PerThread,
@@ -1179,6 +1218,10 @@ pub const Object = struct {
             const section = nav.resolved.?.@"linksection".toSlice(ip) orelse break :s .none;
             break :s try o.builder.string(section);
         }, &o.builder);
+        // A `linksection`-placed function must survive `-dead_strip`: see
+        // `markLinksectionUsed`. The section string is emitted verbatim
+        // above so it matches LLVM's implicit specifier for that section.
+        try o.markLinksectionUsed(ip, nav.resolved.?.@"linksection", llvm_function.ptrConst(&o.builder).global);
         try o.addLlvmFunctionAttributes(pt, func.owner_nav, llvm_function);
 
         var attributes = try llvm_function.ptrConst(&o.builder).attributes.toWip(&o.builder);
@@ -1647,6 +1690,7 @@ pub const Object = struct {
             };
             llvm_function.setAlignment(llvm_align, &o.builder);
             llvm_function.setSection(llvm_section, &o.builder);
+            try o.markLinksectionUsed(ip, resolved.@"linksection", llvm_function.ptrConst(&o.builder).global);
             try o.addLlvmFunctionAttributes(pt, nav_id, llvm_function);
         } else {
             const file_scope = nav.srcInst(ip).resolveFile(ip);
@@ -1658,6 +1702,7 @@ pub const Object = struct {
             };
             llvm_variable.setAlignment(llvm_align, &o.builder);
             llvm_variable.setSection(llvm_section, &o.builder);
+            try o.markLinksectionUsed(ip, resolved.@"linksection", llvm_variable.ptrConst(&o.builder).global);
             llvm_variable.setMutability(if (resolved.@"const") .constant else .global, &o.builder);
             try llvm_variable.setInitializer(if (opt_extern != null) .no_init else try o.lowerValue(resolved.value), &o.builder);
             llvm_variable.setThreadLocal(tl: {
