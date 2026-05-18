@@ -343,9 +343,10 @@ pub fn create(arena: Allocator, options: CreateOptions) !*Package.Module {
         // Append disabled features after enabled ones, so that their effects aren't overwritten.
         for (target.cpu.arch.allFeaturesList()) |feature| {
             if (feature.llvm_name) |llvm_name| {
-                // Ignore these until we figure out how to handle the concept of omitting features.
-                // See https://github.com/ziglang/zig/issues/23539
-                if (target_util.isDynamicAMDGCNFeature(target, feature)) continue;
+                // Ignore features that should remain in Zig's target model
+                // but must not be forwarded in the LLVM target-features
+                // string.
+                if (target_util.shouldOmitLlvmCpuFeature(target, feature)) continue;
 
                 var is_enabled = target.cpu.features.isEnabled(feature.index);
                 if (target.cpu.arch == .s390x and @as(std.Target.s390x.Feature, @enumFromInt(feature.index)) == .backchain) {

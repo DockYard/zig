@@ -1979,7 +1979,8 @@ pub const Object = struct {
         const gop = try o.debug_file_map.getOrPut(gpa, file_index);
         errdefer assert(o.debug_file_map.remove(file_index));
         if (gop.found_existing) return gop.value_ptr.*;
-        const path = o.zcu.fileByIndex(file_index).path;
+        const file = o.zcu.fileByIndex(file_index);
+        const path = file.debug_path orelse file.path;
         const abs_path = try path.toAbsolute(o.zcu.comp.dirs, gpa);
         defer gpa.free(abs_path);
 

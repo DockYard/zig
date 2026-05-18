@@ -1359,6 +1359,12 @@ pub const FuncBody = struct {
     /// Call modifier for the next addCall (reset to 0 after use).
     /// 0=auto, 1=never_tail, 2=never_inline, 3=no_suspend, 4=always_tail, 5=always_inline, 6=compile_time
     call_modifier: u3 = 0,
+    /// Current source-language statement location for generated `dbg_stmt`
+    /// instructions. External ZIR frontends update this through the C ABI
+    /// before emitting source-mapped body instructions; call emission reuses
+    /// it for the AstGen-compatible `dbg_stmt` immediately before `.call`.
+    debug_line: u32 = 0,
+    debug_column: u32 = 0,
 
     /// When non-null AND body_tracking is false, "would-be body" instruction
     /// indices are captured here instead of being discarded. This lets callers
@@ -2051,7 +2057,7 @@ pub const FuncBody = struct {
             try arg_inst_indices.append(gpa, brk_idx);
         }
 
-        try self.emitBodyInstVoid(.dbg_stmt, .{ .dbg_stmt = .{ .line = 0, .column = 0 } });
+        try self.emitBodyInstVoid(.dbg_stmt, .{ .dbg_stmt = .{ .line = self.debug_line, .column = self.debug_column } });
 
         const payload_idx: u32 = @intCast(b.extra.items.len);
         const args_len: u32 = @intCast(args.len);
@@ -2100,7 +2106,7 @@ pub const FuncBody = struct {
         }
 
         // Sema requires dbg_stmt immediately before the call instruction body.
-        try self.emitBodyInstVoid(.dbg_stmt, .{ .dbg_stmt = .{ .line = 0, .column = 0 } });
+        try self.emitBodyInstVoid(.dbg_stmt, .{ .dbg_stmt = .{ .line = self.debug_line, .column = self.debug_column } });
 
         // Build Call payload matching AstGen's exact format:
         // [flags(u32), callee(Ref), arg_0_end, arg_1_end, ..., body_inst_0, body_inst_1, ...]
@@ -2298,6 +2304,8 @@ pub const FuncBody = struct {
     /// Add a debug statement with line/column info.
     /// ZIR tag: `.dbg_stmt`, data field: `dbg_stmt` (LineColumn).
     pub fn addDbgStmt(self: *FuncBody, line: u32, column: u32) !void {
+        self.debug_line = line;
+        self.debug_column = column;
         try self.emitBodyInstVoid(.dbg_stmt, .{ .dbg_stmt = .{
             .line = line,
             .column = column,

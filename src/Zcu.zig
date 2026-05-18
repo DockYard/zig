@@ -971,6 +971,11 @@ pub const File = struct {
     /// are deduplicated based on path; `Compilation.Path` guarantees this. Owned by this `File`,
     /// allocated into `gpa`.
     path: Compilation.Path,
+    /// Optional source path used only for debug information. ZIR-injected
+    /// frontends need stable synthetic `.zig` paths for module identity and
+    /// imports, but their DWARF should point at the source language file.
+    /// When null, debug info falls back to `path`.
+    debug_path: ?Compilation.Path,
 
     /// Populated only when emitting error messages; see `getSource`.
     source: ?[:0]const u8,

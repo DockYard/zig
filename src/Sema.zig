@@ -5320,6 +5320,7 @@ fn zirCImport(sema: *Sema, parent_block: *Block, inst: Zir.Inst.Index) CompileEr
             .stat = undefined,
             .is_builtin = false,
             .path = c_import_file_path,
+            .debug_path = null,
             .source = null,
             .tree = null,
             .zir = null,
@@ -5940,6 +5941,17 @@ fn zirSwitchContinue(sema: *Sema, start_block: *Block, inst: Zir.Inst.Index) Com
 
 fn zirDbgStmt(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void {
     if (block.isComptime() or block.ownerModule().strip) return;
+
+    // `analyzeCall` derives the call's debug node as `call_inst - 1`
+    // (AstGen's contract: a `dbg_stmt` is emitted immediately before
+    // every `call`). Front-ends that lower straight to ZIR without that
+    // per-call `dbg_stmt` (the Zap ZIR builder) leave some other
+    // instruction at that index. Reading its data as `.dbg_stmt` would
+    // be a union-field type confusion. When the instruction is not
+    // actually a `dbg_stmt`, there is simply no source statement to map
+    // for this site — skip it. Normal AstGen output always has the
+    // `dbg_stmt` here, so this is a no-op for it.
+    if (sema.code.instructions.items(.tag)[@intFromEnum(inst)] != .dbg_stmt) return;
 
     const inst_data = sema.code.instructions.items(.data)[@intFromEnum(inst)].dbg_stmt;
 

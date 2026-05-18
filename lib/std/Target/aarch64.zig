@@ -271,7 +271,6 @@ pub const all_features = blk: {
     std.debug.assert(len <= CpuFeature.Set.needed_bit_count);
     var result: [len]CpuFeature = undefined;
     result[@intFromEnum(Feature.a320)] = .{
-        .llvm_name = "a320",
         .description = "Cortex-A320 ARM processors",
         .dependencies = featureSet(&[_]Feature{
             .fuse_adrp_add,
@@ -492,7 +491,6 @@ pub const all_features = blk: {
         }),
     };
     result[@intFromEnum(Feature.disable_fast_inc_vl)] = .{
-        .llvm_name = "disable-fast-inc-vl",
         .description = "Do not prefer INC/DEC, ALL, { 1, 2, 4 } over ADDVL",
         .dependencies = featureSet(&[_]Feature{}),
     };
@@ -551,7 +549,6 @@ pub const all_features = blk: {
         }),
     };
     result[@intFromEnum(Feature.execute_only)] = .{
-        .llvm_name = "execute-only",
         .description = "Enable the generation of execute only code.",
         .dependencies = featureSet(&[_]Feature{}),
     };
@@ -906,7 +903,6 @@ pub const all_features = blk: {
         .dependencies = featureSet(&[_]Feature{}),
     };
     result[@intFromEnum(Feature.olympus)] = .{
-        .llvm_name = "olympus",
         .description = "NVIDIA Olympus processors",
         .dependencies = featureSet(&[_]Feature{
             .alu_lsl_fast,
@@ -1342,7 +1338,6 @@ pub const all_features = blk: {
         }),
     };
     result[@intFromEnum(Feature.ssve_fexpa)] = .{
-        .llvm_name = "ssve-fexpa",
         .description = "Enable SVE FEXPA instruction in Streaming SVE mode",
         .dependencies = featureSet(&[_]Feature{
             .sme2,
@@ -1482,14 +1477,12 @@ pub const all_features = blk: {
         }),
     };
     result[@intFromEnum(Feature.sve_sha3)] = .{
-        .llvm_name = "sve-sha3",
         .description = "Enable SVE SHA3 instructions",
         .dependencies = featureSet(&[_]Feature{
             .sha3,
         }),
     };
     result[@intFromEnum(Feature.sve_sm4)] = .{
-        .llvm_name = "sve-sm4",
         .description = "Enable SVE SM4 instructions",
         .dependencies = featureSet(&[_]Feature{
             .sm4,
@@ -1809,22 +1802,18 @@ pub const all_features = blk: {
         .dependencies = featureSet(&[_]Feature{}),
     };
     result[@intFromEnum(Feature.zcm_fpr32)] = .{
-        .llvm_name = "zcm-fpr32",
         .description = "Has zero-cycle register moves for FPR32 registers",
         .dependencies = featureSet(&[_]Feature{}),
     };
     result[@intFromEnum(Feature.zcm_fpr64)] = .{
-        .llvm_name = "zcm-fpr64",
         .description = "Has zero-cycle register moves for FPR64 registers",
         .dependencies = featureSet(&[_]Feature{}),
     };
     result[@intFromEnum(Feature.zcm_gpr32)] = .{
-        .llvm_name = "zcm-gpr32",
         .description = "Has zero-cycle register moves for GPR32 registers",
         .dependencies = featureSet(&[_]Feature{}),
     };
     result[@intFromEnum(Feature.zcm_gpr64)] = .{
-        .llvm_name = "zcm-gpr64",
         .description = "Has zero-cycle register moves for GPR64 registers",
         .dependencies = featureSet(&[_]Feature{}),
     };

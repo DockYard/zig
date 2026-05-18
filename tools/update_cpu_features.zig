@@ -16,6 +16,9 @@ const FeatureOverride = struct {
     /// If true, omit the feature, but all the dependencies of the feature
     /// are added in its place.
     flatten: bool = false,
+    /// If true, keep the Zig feature but do not pass its name through
+    /// `target-features` to LLVM.
+    omit_llvm_name: bool = false,
     zig_name: ?[]const u8 = null,
     desc: ?[]const u8 = null,
     omit_deps: []const []const u8 = &.{},
@@ -67,6 +70,20 @@ const targets = [_]ArchTarget{
                 .zig_name = "contextidr_el2",
                 .desc = "Enable RW operand Context ID Register (EL2)",
             },
+            // Zap currently links this fork against LLVM 20. These AArch64
+            // feature names are useful in Zig's target model but are rejected
+            // by that LLVM backend if included in `target-features`.
+            .{ .llvm_name = "a320", .omit_llvm_name = true },
+            .{ .llvm_name = "disable-fast-inc-vl", .omit_llvm_name = true },
+            .{ .llvm_name = "execute-only", .omit_llvm_name = true },
+            .{ .llvm_name = "olympus", .omit_llvm_name = true },
+            .{ .llvm_name = "ssve-fexpa", .omit_llvm_name = true },
+            .{ .llvm_name = "sve-sha3", .omit_llvm_name = true },
+            .{ .llvm_name = "sve-sm4", .omit_llvm_name = true },
+            .{ .llvm_name = "zcm-fpr32", .omit_llvm_name = true },
+            .{ .llvm_name = "zcm-fpr64", .omit_llvm_name = true },
+            .{ .llvm_name = "zcm-gpr32", .omit_llvm_name = true },
+            .{ .llvm_name = "zcm-gpr64", .omit_llvm_name = true },
             .{
                 .llvm_name = "neoversee1",
                 .flatten = true,
@@ -2085,6 +2102,7 @@ fn processOneTarget(io: Io, job: Job) void {
                     var deps = std.array_list.Managed([]const u8).init(arena);
                     var omit = false;
                     var flatten = false;
+                    var feature_llvm_name: ?[]const u8 = llvm_name;
                     var omit_deps: []const []const u8 = &.{};
                     var extra_deps: []const []const u8 = &.{};
                     for (target.feature_overrides) |feature_override| {
@@ -2096,6 +2114,9 @@ fn processOneTarget(io: Io, job: Job) void {
                             }
                             if (feature_override.flatten) {
                                 flatten = true;
+                            }
+                            if (feature_override.omit_llvm_name) {
+                                feature_llvm_name = null;
                             }
                             if (feature_override.zig_name) |override_name| {
                                 zig_name = override_name;
@@ -2146,7 +2167,7 @@ fn processOneTarget(io: Io, job: Job) void {
                         try deps.append(extra_dep);
                     }
                     const feature: Feature = .{
-                        .llvm_name = llvm_name,
+                        .llvm_name = feature_llvm_name,
                         .zig_name = zig_name,
                         .desc = desc,
                         .deps = deps.items,

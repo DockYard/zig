@@ -486,6 +486,7 @@ fn deinitFile(pt: Zcu.PerThread, file_index: Zcu.File.Index) void {
     const file = zcu.fileByIndex(file_index);
     log.debug("deinit File {f}", .{file.path.fmt(zcu.comp)});
     file.path.deinit(gpa);
+    if (file.debug_path) |*debug_path| debug_path.deinit(gpa);
     file.unload(gpa);
     if (file.prev_zir) |prev_zir| {
         prev_zir.deinit(gpa);
@@ -2440,6 +2441,7 @@ pub fn discoverImport(
     new_file.* = .{
         .status = .never_loaded,
         .path = new_path,
+        .debug_path = null,
         .stat = undefined,
         .is_builtin = false,
         .source = null,
@@ -2586,6 +2588,7 @@ pub fn populateModuleRootTable(pt: Zcu.PerThread) error{
         new_file.* = .{
             .status = .never_loaded,
             .path = path,
+            .debug_path = null,
             .stat = undefined,
             .is_builtin = false,
             .source = null,
@@ -2808,6 +2811,7 @@ pub fn updateBuiltinModule(pt: Zcu.PerThread, opts: Builtin) Allocator.Error!voi
         .status = .never_loaded,
         .stat = undefined,
         .path = path,
+        .debug_path = null,
         .is_builtin = true,
         .source = null,
         .tree = null,

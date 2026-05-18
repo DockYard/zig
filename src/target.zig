@@ -671,6 +671,34 @@ pub fn isDynamicAMDGCNFeature(target: *const std.Target, feature: std.Target.Cpu
     return false;
 }
 
+pub fn shouldOmitLlvmCpuFeature(target: *const std.Target, feature: std.Target.Cpu.Feature) bool {
+    if (isDynamicAMDGCNFeature(target, feature)) return true;
+
+    if (target.cpu.arch == .aarch64 or target.cpu.arch == .aarch64_be) {
+        const aarch64_feature: std.Target.aarch64.Feature = @enumFromInt(feature.index);
+        return switch (aarch64_feature) {
+            // Zap links this fork against LLVM 20. These feature names exist
+            // in Zig's AArch64 target model but are rejected by that LLVM
+            // backend when they are included in the target-features string.
+            .a320,
+            .disable_fast_inc_vl,
+            .execute_only,
+            .olympus,
+            .ssve_fexpa,
+            .sve_sha3,
+            .sve_sm4,
+            .zcm_fpr32,
+            .zcm_fpr64,
+            .zcm_gpr32,
+            .zcm_gpr64,
+            => true,
+            else => false,
+        };
+    }
+
+    return false;
+}
+
 pub fn llvmMachineAbi(target: *const std.Target) ?[:0]const u8 {
     return switch (target.cpu.arch) {
         .arm, .armeb, .thumb, .thumbeb => "aapcs",

@@ -26,6 +26,7 @@ hoisted: bool = true,
 referenced: bool = false,
 
 output_symtab_ctx: MachO.SymtabCtx = .{},
+parsed: bool = false,
 
 pub fn deinit(self: *Dylib, allocator: Allocator) void {
     allocator.free(self.path.sub_path);
@@ -45,12 +46,18 @@ pub fn deinit(self: *Dylib, allocator: Allocator) void {
     self.rpaths.deinit(allocator);
 }
 
+pub fn isParsed(self: *const Dylib) bool {
+    return self.parsed;
+}
+
 pub fn parse(self: *Dylib, macho_file: *MachO) !void {
+    if (self.isParsed()) return;
     switch (self.tag) {
         .tbd => try self.parseTbd(macho_file),
         .dylib => try self.parseBinary(macho_file),
     }
     try self.initSymbols(macho_file);
+    self.parsed = true;
 }
 
 fn parseBinary(self: *Dylib, macho_file: *MachO) !void {

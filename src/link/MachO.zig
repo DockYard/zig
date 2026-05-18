@@ -294,18 +294,7 @@ pub fn deinit(self: *MachO) void {
     self.dylibs.deinit(gpa);
 
     self.segments.deinit(gpa);
-    for (
-        self.sections.items(.atoms),
-        self.sections.items(.out),
-        self.sections.items(.thunks),
-        self.sections.items(.relocs),
-    ) |*atoms, *out, *thnks, *relocs| {
-        atoms.deinit(gpa);
-        out.deinit(gpa);
-        thnks.deinit(gpa);
-        relocs.deinit(gpa);
-    }
-    self.sections.deinit(gpa);
+    self.deinitSections();
 
     self.resolver.deinit(gpa);
 
@@ -336,6 +325,24 @@ pub fn deinit(self: *MachO) void {
     self.thunks.deinit(gpa);
 }
 
+fn deinitSections(self: *MachO) void {
+    const gpa = self.base.comp.gpa;
+    for (
+        self.sections.items(.atoms),
+        self.sections.items(.free_list),
+        self.sections.items(.out),
+        self.sections.items(.thunks),
+        self.sections.items(.relocs),
+    ) |*atoms, *free_list, *out, *thnks, *relocs| {
+        atoms.deinit(gpa);
+        free_list.deinit(gpa);
+        out.deinit(gpa);
+        thnks.deinit(gpa);
+        relocs.deinit(gpa);
+    }
+    self.sections.deinit(gpa);
+}
+
 pub fn flush(
     self: *MachO,
     arena: Allocator,
@@ -352,6 +359,8 @@ pub fn flush(
 
     const sub_prog_node = prog_node.start("MachO Flush", 0);
     defer sub_prog_node.end();
+
+    if (self.base.zcu_object_basename != null) try self.resetObjectInputFlushState();
 
     const zcu_obj_path: ?Path = if (self.base.zcu_object_basename) |raw| p: {
         break :p try comp.resolveEmitPathFlush(arena, .temp, raw);
@@ -621,6 +630,135 @@ pub fn flush(
             else => |e| return diags.fail("failed to invalidate kernel cache: {t}", .{e}),
         };
     }
+}
+
+fn resetObjectInputFlushState(self: *MachO) !void {
+    const comp = self.base.comp;
+    const gpa = comp.gpa;
+    const io = comp.io;
+
+    assert(self.zig_object == null);
+
+    for (self.file_handles.items) |handle| {
+        handle.close(io);
+    }
+    self.file_handles.clearRetainingCapacity();
+
+    for (self.files.items(.tags)[1..], self.files.items(.data)[1..]) |tag, *data| switch (tag) {
+        .null => {},
+        .zig_object => unreachable,
+        .internal => data.internal.deinit(gpa),
+        .object => data.object.deinit(gpa),
+        .dylib => data.dylib.deinit(gpa),
+    };
+    self.files.shrinkRetainingCapacity(1);
+    self.internal_object = null;
+    self.objects.clearRetainingCapacity();
+    self.dylibs.clearRetainingCapacity();
+
+    self.resetLinkPassState();
+    try self.strtab.append(gpa, 0);
+}
+
+fn resetLinkPassState(self: *MachO) void {
+    const gpa = self.base.comp.gpa;
+
+    self.segments.deinit(gpa);
+    self.segments = .empty;
+    self.deinitSections();
+    self.sections = .{};
+
+    self.resolver.deinit(gpa);
+    self.resolver = .{};
+
+    for (self.undefs.values()) |*val| {
+        val.deinit(gpa);
+    }
+    self.undefs.deinit(gpa);
+    self.undefs = .empty;
+    for (self.dupes.values()) |*val| {
+        val.deinit(gpa);
+    }
+    self.dupes.deinit(gpa);
+    self.dupes = .empty;
+
+    self.dyld_info_cmd = .{};
+    self.symtab_cmd = .{};
+    self.dysymtab_cmd = .{};
+    self.function_starts_cmd = .{ .cmd = .FUNCTION_STARTS };
+    self.data_in_code_cmd = .{ .cmd = .DATA_IN_CODE };
+    self.uuid_cmd = .{ .uuid = [_]u8{0} ** 16 };
+    self.codesig_cmd = .{ .cmd = .CODE_SIGNATURE };
+
+    self.pagezero_seg_index = null;
+    self.text_seg_index = null;
+    self.linkedit_seg_index = null;
+    self.text_sect_index = null;
+    self.data_sect_index = null;
+    self.got_sect_index = null;
+    self.stubs_sect_index = null;
+    self.stubs_helper_sect_index = null;
+    self.la_symbol_ptr_sect_index = null;
+    self.tlv_ptr_sect_index = null;
+    self.eh_frame_sect_index = null;
+    self.unwind_info_sect_index = null;
+    self.objc_stubs_sect_index = null;
+
+    self.zig_text_seg_index = null;
+    self.zig_const_seg_index = null;
+    self.zig_data_seg_index = null;
+    self.zig_bss_seg_index = null;
+    self.zig_text_sect_index = null;
+    self.zig_const_sect_index = null;
+    self.zig_data_sect_index = null;
+    self.zig_bss_sect_index = null;
+
+    self.debug_info_sect_index = null;
+    self.debug_abbrev_sect_index = null;
+    self.debug_str_sect_index = null;
+    self.debug_aranges_sect_index = null;
+    self.debug_line_sect_index = null;
+    self.debug_line_str_sect_index = null;
+    self.debug_loclists_sect_index = null;
+    self.debug_rnglists_sect_index = null;
+
+    for (self.thunks.items) |*thunk| thunk.deinit(gpa);
+    self.thunks.deinit(gpa);
+    self.thunks = .empty;
+
+    self.symtab.deinit(gpa);
+    self.symtab = .empty;
+    self.strtab.deinit(gpa);
+    self.strtab = .empty;
+    self.indsymtab = .{};
+    self.got.deinit(gpa);
+    self.got = .{};
+    self.stubs.deinit(gpa);
+    self.stubs = .{};
+    self.stubs_helper = .{};
+    self.objc_stubs.deinit(gpa);
+    self.objc_stubs = .{};
+    self.la_symbol_ptr = .{};
+    self.tlv_ptr.deinit(gpa);
+    self.tlv_ptr = .{};
+    self.rebase_section.deinit(gpa);
+    self.rebase_section = .{};
+    self.bind_section.deinit(gpa);
+    self.bind_section = .{};
+    self.weak_bind_section.deinit(gpa);
+    self.weak_bind_section = .{};
+    self.lazy_bind_section.deinit(gpa);
+    self.lazy_bind_section = .{};
+    self.export_trie.deinit(gpa);
+    self.export_trie = .{};
+    self.unwind_info.deinit(gpa);
+    self.unwind_info = .{};
+    self.data_in_code.deinit(gpa);
+    self.data_in_code = .{};
+
+    self.has_tlv.store(false, .seq_cst);
+    self.binds_to_weak.store(false, .seq_cst);
+    self.weak_defines.store(false, .seq_cst);
 }
 
 /// --verbose-link output
@@ -1253,6 +1391,10 @@ fn parseDependentDylibs(self: *MachO) !void {
                 .path = Path.initCwd(full_path),
                 .weak = is_weak,
             };
+            if (self.findDylibByPath(lib.path)) |file_index| {
+                dependents.appendAssumeCapacity(file_index);
+                continue;
+            }
             const file = try lib.path.root_dir.handle.openFile(io, lib.path.sub_path, .{});
             const fh = try self.addFileHandle(file);
             const fat_arch = try self.parseFatFile(file, lib.path);
@@ -1299,6 +1441,16 @@ fn parseDependentDylibs(self: *MachO) !void {
     }
 
     if (has_errors) return error.MissingLibraryDependencies;
+}
+
+fn findDylibByPath(self: *MachO, path: Path) ?File.Index {
+    for (self.dylibs.items) |index| {
+        const dylib = self.getFile(index).?.dylib;
+        if (dylib.path.root_dir.eql(path.root_dir) and std.mem.eql(u8, dylib.path.sub_path, path.sub_path)) {
+            return index;
+        }
+    }
+    return null;
 }
 
 /// When resolving symbols, we approach the problem similarly to `mold`.

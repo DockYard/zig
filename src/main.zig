@@ -12,10 +12,13 @@ comptime {
     _ = &api.zir_compilation_create;
     _ = &api.zir_compilation_add_zir;
     _ = &api.zir_compilation_update;
+    _ = &api.zir_compilation_update_with_progress;
     _ = &api.zir_compilation_destroy;
     _ = &api.zir_compilation_print_errors;
     _ = &api.zir_compilation_add_struct;
     _ = &api.zir_compilation_add_struct_source;
+    _ = &api.zir_compilation_set_root_debug_source;
+    _ = &api.zir_compilation_set_struct_debug_source;
     _ = &api.zir_compilation_set_builder_entry;
     _ = &api.zir_compilation_add_link_lib;
     _ = &api.zir_builder_create;

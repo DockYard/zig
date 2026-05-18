@@ -433,6 +433,16 @@ pub const Node = struct {
                 assert(!ipc.locked or !ipc.valid); // missing call to end()
                 if (ipc.locked or ipc.valid) ipc_file.close(io);
             }
+            global_progress.update_worker = null;
+            global_progress.terminal_mode = .off;
+            const old_freelist = @atomicLoad(Freelist, &global_progress.node_freelist, .acquire);
+            @atomicStore(
+                Freelist,
+                &global_progress.node_freelist,
+                .{ .head = .none, .generation = old_freelist.generation +% 1 },
+                .release,
+            );
+            @atomicStore(u32, &global_progress.node_end_index, 0, .release);
         }
     }
 

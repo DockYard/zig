@@ -61,6 +61,8 @@ pub const ZirContext = struct {
     builder_entry: ?[]const u8 = null,
     /// The struct-qualified entry point (e.g., "FooBar__Builder__manifest").
     builder_entry_mangled: ?[]const u8 = null,
+    /// True when this context was created with Zig's incremental cache mode.
+    is_incremental: bool = false,
 
     pub fn arena(self: *ZirContext) Allocator {
         return self.arena_state.allocator();
@@ -102,6 +104,39 @@ pub export fn zir_compilation_create(
         link_libc,
         null,
         null,
+        false,
+    ) catch null;
+}
+
+/// Create a persistent incremental compilation context targeting the native
+/// platform. Unlike `zir_compilation_create`, the output artifact is emitted
+/// into Zig's cache artifact directory; callers must query the produced path
+/// after `zir_compilation_update` and publish/copy it if they need a stable
+/// user-facing output path.
+pub export fn zir_compilation_create_incremental(
+    zig_lib_dir: [*:0]const u8,
+    local_cache_dir: [*:0]const u8,
+    global_cache_dir: [*:0]const u8,
+    output_path: [*:0]const u8,
+    root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
+) ?*ZirContext {
+    return createImpl(
+        mem.sliceTo(zig_lib_dir, 0),
+        mem.sliceTo(local_cache_dir, 0),
+        mem.sliceTo(global_cache_dir, 0),
+        mem.sliceTo(output_path, 0),
+        mem.sliceTo(root_name, 0),
+        output_mode,
+        optimize_mode,
+        is_dynamic,
+        link_libc,
+        null,
+        null,
+        true,
     ) catch null;
 }
 
@@ -141,6 +176,44 @@ pub export fn zir_compilation_create_cross(
         link_libc,
         target_str,
         cpu_str,
+        false,
+    ) catch null;
+}
+
+/// Create a persistent incremental compilation context with an explicit target
+/// triple and optional CPU model/feature set.
+///
+/// Output artifact semantics match `zir_compilation_create_incremental`: the
+/// artifact lives in the cache artifact directory and must be discovered via
+/// `zir_compilation_output_path_len` / `zir_compilation_copy_output_path`.
+pub export fn zir_compilation_create_cross_incremental(
+    zig_lib_dir: [*:0]const u8,
+    local_cache_dir: [*:0]const u8,
+    global_cache_dir: [*:0]const u8,
+    output_path: [*:0]const u8,
+    root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
+    target_triple: ?[*:0]const u8,
+    cpu_features: ?[*:0]const u8,
+) ?*ZirContext {
+    const target_str: ?[]const u8 = if (target_triple) |t| mem.sliceTo(t, 0) else null;
+    const cpu_str: ?[]const u8 = if (cpu_features) |c| mem.sliceTo(c, 0) else null;
+    return createImpl(
+        mem.sliceTo(zig_lib_dir, 0),
+        mem.sliceTo(local_cache_dir, 0),
+        mem.sliceTo(global_cache_dir, 0),
+        mem.sliceTo(output_path, 0),
+        mem.sliceTo(root_name, 0),
+        output_mode,
+        optimize_mode,
+        is_dynamic,
+        link_libc,
+        target_str,
+        cpu_str,
+        true,
     ) catch null;
 }
 
@@ -159,19 +232,29 @@ pub export fn zir_compilation_add_zir(
 /// Run semantic analysis, codegen, and linking.
 /// Returns 0 on success, non-zero if errors occurred.
 pub export fn zir_compilation_update(ctx: *ZirContext) i32 {
-    // `std.Progress` is process-global: `Progress.start` asserts that
-    // `node_end_index == 0` and the matching `prog_node.end()` does NOT
-    // reset that counter back to zero. Multiple compiles in the same
-    // process (e.g., the manager-object compile via
-    // `compileToObjectImpl` followed by the user-code compile here)
-    // would therefore trip the `unreachable` inside `Progress.start`
-    // on the second call.
-    //
-    // We side-step the singleton entirely by passing `Progress.Node.none`
-    // directly. The library's host (Zap's CLI) already prints its own
-    // progress via stderr; the internal compiler progress bar would
-    // overwrite that output anyway.
-    const prog_node: std.Progress.Node = .none;
+    return zirCompilationUpdateImpl(ctx, .none);
+}
+
+/// Run semantic analysis, codegen, and linking with Zig's native progress
+/// renderer enabled. This is intended for interactive embedders that have
+/// already established stderr as a terminal and cleared their own progress
+/// line before entering Zig's update pipeline.
+pub export fn zir_compilation_update_with_progress(ctx: *ZirContext) i32 {
+    var progress_buffer: [4096]u8 = undefined;
+    const prog_node = std.Progress.start(ctx.io(), .{
+        .root_name = "Zig",
+        .draw_buffer = &progress_buffer,
+    });
+    defer prog_node.end();
+    return zirCompilationUpdateImpl(ctx, prog_node);
+}
+
+fn zirCompilationUpdateImpl(ctx: *ZirContext, prog_node: std.Progress.Node) i32 {
+    validateInjectedZirReadyForUpdate(ctx) catch |err| {
+        logErr("incremental update preflight failed: {s}", .{@errorName(err)});
+        return -1;
+    };
+
     ctx.compilation.update(prog_node) catch |err| {
         logErr("update failed: {s}", .{@errorName(err)});
         // Print detailed errors
@@ -206,7 +289,6 @@ pub export fn zir_compilation_update(ctx: *ZirContext) i32 {
         dumpErrorBundle(error_bundle);
         return -1;
     }
-
     // Post-link artifact verification (mirrors the object-compile
     // primitive). `update()` returning cleanly and `anyErrors()` being
     // false does not by itself prove the binary was written: a linker
@@ -233,7 +315,116 @@ pub export fn zir_compilation_update(ctx: *ZirContext) i32 {
             return -1;
         }
     }
+    finalizePreparedInjectedZir(ctx) catch |err| {
+        logErr("incremental update finalization failed: {s}", .{@errorName(err)});
+        return -1;
+    };
     return 0;
+}
+
+fn finalizePreparedInjectedZir(ctx: *ZirContext) !void {
+    if (!ctx.is_incremental) return;
+
+    const zcu = ctx.compilation.zcu orelse return;
+    const gpa = ctx.gpa;
+
+    for (zcu.module_roots.keys(), zcu.module_roots.values()) |mod, opt_file_index| {
+        const file_index = opt_file_index.unwrap() orelse continue;
+        const file = zcu.fileByIndex(file_index);
+        if (!file.zir_injected) continue;
+        const prev_zir = file.prev_zir orelse continue;
+
+        const is_live_import = isFileInImportTable(zcu, file_index) and zcu.alive_files.contains(file_index);
+        if (is_live_import) {
+            logErr(
+                "incremental update left pending prev_zir for live module '{s}' after updateZirRefs",
+                .{mod.fully_qualified_name},
+            );
+            return error.PendingPreviousZir;
+        }
+
+        prev_zir.deinit(gpa);
+        gpa.destroy(prev_zir);
+        file.prev_zir = null;
+        file.module_changed = false;
+        file.zoir_invalidated = false;
+    }
+}
+
+fn isFileInImportTable(zcu: *const Zcu, file_index: Zcu.File.Index) bool {
+    for (zcu.import_table.keys()) |imported_file_index| {
+        if (imported_file_index == file_index) return true;
+    }
+    return false;
+}
+
+fn outputArtifactPathLength(emit: Cache.Path) usize {
+    const sub_path_len = emit.sub_path.len;
+    const root_path = emit.root_dir.path orelse return sub_path_len;
+    if (sub_path_len == 0) return root_path.len;
+    return root_path.len + std.fs.path.sep_str.len + sub_path_len;
+}
+
+fn writeOutputArtifactPath(emit: Cache.Path, out: []u8) void {
+    if (emit.root_dir.path) |root_path| {
+        @memcpy(out[0..root_path.len], root_path);
+        if (emit.sub_path.len == 0) return;
+        out[root_path.len] = std.fs.path.sep;
+        @memcpy(out[root_path.len + 1 ..][0..emit.sub_path.len], emit.sub_path);
+        return;
+    }
+    @memcpy(out[0..emit.sub_path.len], emit.sub_path);
+}
+
+fn outputArtifactPathLenImpl(ctx: *ZirContext) ?usize {
+    const lf = ctx.compilation.bin_file orelse {
+        logErr("output path requested but this compilation does not emit a binary", .{});
+        return null;
+    };
+    return outputArtifactPathLength(lf.emit);
+}
+
+/// Return whether this context was created for Zig incremental compilation.
+pub export fn zir_compilation_is_incremental(ctx: ?*ZirContext) callconv(.c) bool {
+    const c = ctx orelse return false;
+    return c.is_incremental and c.compilation.config.incremental;
+}
+
+/// Return the byte length, excluding the trailing NUL, of the current output
+/// artifact path. In incremental mode this is the cache artifact path; in
+/// direct mode it is the caller-requested path.
+///
+/// Returns 0 if the context is null or the compilation has no binary output.
+pub export fn zir_compilation_output_path_len(ctx: ?*ZirContext) callconv(.c) usize {
+    const c = ctx orelse return 0;
+    return outputArtifactPathLenImpl(c) orelse 0;
+}
+
+/// Copy the current output artifact path into `out`, NUL-terminated.
+///
+/// The return value is the required byte length excluding the NUL. No partial
+/// path is written when `out_len` is too small; `out[0]` is set to NUL when
+/// possible so callers never accidentally consume a truncated path.
+pub export fn zir_compilation_copy_output_path(
+    ctx: ?*ZirContext,
+    out: ?[*]u8,
+    out_len: usize,
+) callconv(.c) usize {
+    const c = ctx orelse return 0;
+    const lf = c.compilation.bin_file orelse {
+        logErr("output path requested but this compilation does not emit a binary", .{});
+        return 0;
+    };
+    const required_len = outputArtifactPathLength(lf.emit);
+    const out_ptr = out orelse return required_len;
+    if (out_len <= required_len) {
+        if (out_len > 0) out_ptr[0] = 0;
+        return required_len;
+    }
+    const out_slice = out_ptr[0..required_len];
+    writeOutputArtifactPath(lf.emit, out_slice);
+    out_ptr[required_len] = 0;
+    return required_len;
 }
 
 fn dumpErrorBundle(eb: std.zig.ErrorBundle) void {
@@ -423,6 +614,121 @@ pub export fn zir_compilation_destroy(ctx: *ZirContext) void {
     gpa.destroy(ctx);
 }
 
+fn requireIncrementalContext(ctx: *ZirContext, operation: []const u8) !void {
+    if (!ctx.is_incremental or !ctx.compilation.config.incremental) {
+        logErr("{s} requires a context created by zir_compilation_create_incremental or zir_compilation_create_cross_incremental", .{operation});
+        return error.NonIncrementalContext;
+    }
+    switch (ctx.compilation.cache_use) {
+        .incremental => {},
+        .none, .whole => {
+            logErr("{s} requires Compilation.CacheMode.incremental", .{operation});
+            return error.NonIncrementalContext;
+        },
+    }
+}
+
+fn validateInjectedZirReadyForUpdate(ctx: *ZirContext) !void {
+    if (!ctx.is_incremental) return;
+    try requireIncrementalContext(ctx, "zir_compilation_update");
+
+    const zcu = ctx.compilation.zcu orelse {
+        logErr("zir_compilation_update requires a ZCU", .{});
+        return error.MissingZcu;
+    };
+    for (zcu.module_roots.keys(), zcu.module_roots.values()) |mod, opt_file_index| {
+        const file_index = opt_file_index.unwrap() orelse continue;
+        const file = zcu.fileByIndex(file_index);
+        if (!file.zir_injected) continue;
+        if (file.prev_zir != null and file.zir == null) {
+            logErr(
+                "incremental update for module '{s}' is missing replacement ZIR; call the matching inject function after prepare_update and before update",
+                .{mod.fully_qualified_name},
+            );
+            return error.MissingInjectedZir;
+        }
+    }
+}
+
+const PreparedUpdateFile = struct {
+    file: *Zcu.File,
+    prev_zir: *Zir,
+};
+
+fn appendInjectedFileForPrepare(
+    files: *std.ArrayListUnmanaged(*Zcu.File),
+    gpa: Allocator,
+    file: *Zcu.File,
+    module_name: []const u8,
+) !void {
+    if (!file.zir_injected) {
+        logErr("prepare_update selected non-injected module '{s}'", .{module_name});
+        return error.NonInjectedModule;
+    }
+    if (file.prev_zir != null) {
+        logErr(
+            "prepare_update refused to overwrite pending prev_zir for module '{s}'; the previous incremental update did not reach updateZirRefs",
+            .{module_name},
+        );
+        return error.PendingPreviousZir;
+    }
+    if (file.zir == null) {
+        logErr("prepare_update found injected module '{s}' without current ZIR", .{module_name});
+        return error.MissingCurrentZir;
+    }
+
+    for (files.items) |existing| {
+        if (existing == file) return;
+    }
+    try files.append(gpa, file);
+}
+
+fn appendNamedInjectedFileForPrepare(
+    ctx: *ZirContext,
+    files: *std.ArrayListUnmanaged(*Zcu.File),
+    name: []const u8,
+) !void {
+    const zcu = ctx.compilation.zcu orelse return error.MissingZcu;
+    const target_mod = ctx.root_mod.deps.get(name) orelse {
+        logErr("prepare_update selected unknown module '{s}'", .{name});
+        return error.UnknownModule;
+    };
+    const file_opt = zcu.module_roots.get(target_mod) orelse {
+        logErr("prepare_update selected module '{s}' without root file", .{name});
+        return error.UnknownModule;
+    };
+    const file_index = file_opt.unwrap() orelse {
+        logErr("prepare_update selected module '{s}' without root file", .{name});
+        return error.UnknownModule;
+    };
+    try appendInjectedFileForPrepare(files, ctx.gpa, zcu.fileByIndex(file_index), name);
+}
+
+fn prepareInjectedFiles(ctx: *ZirContext, files: []const *Zcu.File) !void {
+    const gpa = ctx.gpa;
+    var prepared: std.ArrayListUnmanaged(PreparedUpdateFile) = .empty;
+    errdefer {
+        for (prepared.items) |entry| gpa.destroy(entry.prev_zir);
+        prepared.deinit(gpa);
+    }
+
+    try prepared.ensureTotalCapacity(gpa, files.len);
+    for (files) |file| {
+        const prev_zir = try gpa.create(Zir);
+        prev_zir.* = file.zir.?;
+        prepared.appendAssumeCapacity(.{
+            .file = file,
+            .prev_zir = prev_zir,
+        });
+    }
+
+    for (prepared.items) |entry| {
+        entry.file.prev_zir = entry.prev_zir;
+        entry.file.zir = null;
+    }
+    prepared.deinit(gpa);
+}
+
 /// Prepare the compilation for an incremental update.
 ///
 /// For every file in `module_roots` that was ZIR-injected, saves the current
@@ -433,6 +739,70 @@ pub export fn zir_compilation_destroy(ctx: *ZirContext) void {
 /// Returns 0 on success, -1 on error.
 pub export fn zir_compilation_prepare_update(ctx: ?*ZirContext) callconv(.c) i32 {
     const c = ctx orelse return -1;
+    requireIncrementalContext(c, "zir_compilation_prepare_update") catch return -2;
+    const gpa = c.gpa;
+    const zcu = c.compilation.zcu orelse return -1;
+
+    var files: std.ArrayListUnmanaged(*Zcu.File) = .empty;
+    defer files.deinit(gpa);
+
+    for (zcu.module_roots.keys(), zcu.module_roots.values()) |mod, opt_file_index| {
+        const file_index = opt_file_index.unwrap() orelse continue;
+        const file = zcu.fileByIndex(file_index);
+        if (!file.zir_injected) continue;
+        appendInjectedFileForPrepare(&files, gpa, file, mod.fully_qualified_name) catch return -1;
+    }
+
+    prepareInjectedFiles(c, files.items) catch return -1;
+    return 0;
+}
+
+/// Prepare only selected injected modules for an incremental update.
+///
+/// `names`/`name_lens` identify Zap struct modules in the root module's
+/// dependency table. `include_root` prepares the synthetic root ZIR file that
+/// owns the executable entrypoint. The function validates every selected file
+/// before mutating any file state, so allocation failure or an invalid module
+/// cannot leave a partially-prepared context behind.
+pub export fn zir_compilation_prepare_update_selected(
+    ctx: ?*ZirContext,
+    names: [*]const [*]const u8,
+    name_lens: [*]const usize,
+    count: usize,
+    include_root: bool,
+) callconv(.c) i32 {
+    const c = ctx orelse return -1;
+    requireIncrementalContext(c, "zir_compilation_prepare_update_selected") catch return -2;
+    const gpa = c.gpa;
+    const zcu = c.compilation.zcu orelse return -1;
+
+    var files: std.ArrayListUnmanaged(*Zcu.File) = .empty;
+    defer files.deinit(gpa);
+
+    if (include_root) {
+        const root_file_opt = zcu.module_roots.get(c.root_mod) orelse return -1;
+        const root_file_index = root_file_opt.unwrap() orelse return -1;
+        appendInjectedFileForPrepare(&files, gpa, zcu.fileByIndex(root_file_index), "root") catch return -1;
+    }
+
+    for (0..count) |index| {
+        const name = names[index][0..name_lens[index]];
+        appendNamedInjectedFileForPrepare(c, &files, name) catch return -1;
+    }
+
+    prepareInjectedFiles(c, files.items) catch return -1;
+    return 0;
+}
+
+/// Abort a prepared incremental update before `zir_compilation_update` starts.
+///
+/// This restores every prepared ZIR-injected module to its previous ZIR and
+/// clears the pending `prev_zir`. It is the rollback pair for embedders that
+/// successfully called `zir_compilation_prepare_update` but then failed while
+/// constructing or injecting replacement ZIR.
+pub export fn zir_compilation_abort_update(ctx: ?*ZirContext) callconv(.c) i32 {
+    const c = ctx orelse return -1;
+    requireIncrementalContext(c, "zir_compilation_abort_update") catch return -2;
     const gpa = c.gpa;
     const zcu = c.compilation.zcu orelse return -1;
 
@@ -441,22 +811,17 @@ pub export fn zir_compilation_prepare_update(ctx: ?*ZirContext) callconv(.c) i32
         const file = zcu.fileByIndex(file_index);
 
         if (!file.zir_injected) continue;
+        const prev_zir = file.prev_zir orelse continue;
 
-        if (file.zir) |current_zir| {
-            // If prev_zir already exists, free it first.
-            if (file.prev_zir) |prev| {
-                prev.deinit(gpa);
-                gpa.destroy(prev);
-            }
-
-            // Allocate a new Zir on the heap and copy the current ZIR into it.
-            const prev_zir_ptr = gpa.create(Zir) catch return -1;
-            prev_zir_ptr.* = current_zir;
-            file.prev_zir = prev_zir_ptr;
-
-            // Clear the current ZIR so new ZIR can be injected.
-            file.zir = null;
+        if (file.zir) |*replacement_zir| {
+            replacement_zir.deinit(gpa);
         }
+        file.zir = prev_zir.*;
+        file.prev_zir = null;
+        file.module_changed = false;
+        file.zoir_invalidated = false;
+        file.status = .success;
+        gpa.destroy(prev_zir);
     }
 
     return 0;
@@ -471,6 +836,7 @@ pub export fn zir_compilation_prepare_update(ctx: ?*ZirContext) callconv(.c) i32
 /// Returns 0 on success, -1 if the struct was not found.
 pub export fn zir_compilation_invalidate_file(ctx: ?*ZirContext, name: [*:0]const u8) callconv(.c) i32 {
     const c = ctx orelse return -1;
+    requireIncrementalContext(c, "zir_compilation_invalidate_file") catch return -2;
     const zcu = c.compilation.zcu orelse return -1;
 
     const mod_name = mem.sliceTo(name, 0);
@@ -977,12 +1343,14 @@ pub export fn zap_fork_compile_zig_to_object(
             diag.write("zap_fork: source not found: {s}", .{source_path_slice});
             return .SourceNotFound;
         },
-        // For CompilationFailed and CreateFailed, `compileToObjectImpl`
-        // has already written the structured diagnostic (an
-        // `ErrorBundle` or a `Compilation.CreateDiagnostic`) into the
-        // caller's buffer. Don't overwrite it here.
+        // For CompilationFailed, CreateFailed, and ConfigResolveFailed,
+        // `compileToObjectImpl` has already written the structured diagnostic
+        // (an `ErrorBundle`, a `Compilation.CreateDiagnostic`, or a precise
+        // configuration error) into the caller's buffer. Don't overwrite it
+        // here.
         error.CompilationFailed => return .CompilationFailed,
         error.CreateFailed => return .CompilationFailed,
+        error.ConfigResolveFailed => return .InternalError,
         error.OutputDirInaccessible => {
             // Diagnostic was written by the impl with the full path.
             return .InternalError;
@@ -1127,10 +1495,69 @@ const CompileToObjectError = error{
     SourceNotFound,
     CompilationFailed,
     CreateFailed,
+    ConfigResolveFailed,
     OutputDirInaccessible,
     OutOfMemory,
     UnableToResolveTarget,
 };
+
+fn objectCompileTargetName(target: *const std.Target) struct {
+    arch: []const u8,
+    os: []const u8,
+    abi: []const u8,
+} {
+    return .{
+        .arch = @tagName(target.cpu.arch),
+        .os = @tagName(target.os.tag),
+        .abi = @tagName(target.abi),
+    };
+}
+
+fn resolveObjectCompilationConfig(
+    resolved_target: Package.Module.ResolvedTarget,
+    optimize_mode: std.builtin.OptimizeMode,
+    link_libc: bool,
+    diag: ZapForkDiag,
+) CompileToObjectError!Compilation.Config {
+    const target = &resolved_target.result;
+    const target_name = objectCompileTargetName(target);
+
+    if (!build_options.have_llvm) {
+        diag.write(
+            "zap_fork: object compilation for {s}-{s}-{s} requires an LLVM-enabled Zig fork; rebuild the fork with -Denable-llvm",
+            .{ target_name.arch, target_name.os, target_name.abi },
+        );
+        return error.ConfigResolveFailed;
+    }
+
+    // This primitive compiles arbitrary production Zig source to a relocatable
+    // object. The self-hosted native backends do not yet cover the full Zig
+    // language and standard library surface needed by such sources; in
+    // particular, supported targets still report unimplemented lowering for
+    // ordered atomic loads, cmpxchg, and atomic RMW. Use the production LLVM
+    // backend unconditionally and fail configuration clearly when the running
+    // fork was built without it.
+    return Compilation.Config.resolve(.{
+        .output_mode = .Obj,
+        .resolved_target = resolved_target,
+        .is_test = false,
+        .have_zcu = true,
+        .emit_bin = true,
+        .root_optimize_mode = optimize_mode,
+        .root_strip = false,
+        .link_libc = link_libc,
+        .link_mode = null,
+        .lto = .none,
+        .use_llvm = true,
+        .use_lib_llvm = true,
+    }) catch |err| {
+        diag.write(
+            "zap_fork: unable to configure LLVM object compilation for {s}-{s}-{s}: {s}",
+            .{ target_name.arch, target_name.os, target_name.abi, @errorName(err) },
+        );
+        return error.ConfigResolveFailed;
+    };
+}
 
 fn compileToObjectImpl(
     source_path: []const u8,
@@ -1362,19 +1789,12 @@ fn compileToObjectImpl(
     // path. ELF and COFF could enable LTO if the fork is built with
     // `-Denable-llvm=true`; that's worth revisiting once the perf-
     // critical workloads run on Linux CI.
-    const config = Compilation.Config.resolve(.{
-        .output_mode = .Obj,
-        .resolved_target = resolved_target,
-        .is_test = false,
-        .have_zcu = true,
-        .emit_bin = true,
-        .root_optimize_mode = optimize_mode_enum,
-        .root_strip = false,
-        .link_libc = target_requires_libc,
-        .link_mode = null,
-        .lto = .none,
-        .use_llvm = build_options.have_llvm,
-    }) catch return error.OutOfMemory;
+    const config = try resolveObjectCompilationConfig(
+        resolved_target,
+        optimize_mode_enum,
+        target_requires_libc,
+        diag,
+    );
 
     // Verify the source file exists. We do this before constructing the
     // root module so that a missing source produces the precise
@@ -1484,13 +1904,10 @@ fn compileToObjectImpl(
     // `defer comp.destroy()`. Match that here.
     defer compilation.destroy();
 
-    // See the matching comment in `zir_compilation_update`. `Progress`
-    // is process-global and stateful across calls, but the manager
-    // compile is one of two sibling compiles that run inside a single
-    // Zap CLI invocation (the second being the user-code compile). The
-    // singleton state can only be initialized once per process, so we
-    // pass `.none` here and let the host (Zap CLI) own all progress
-    // reporting it cares about.
+    // The manager validation object is a nested build step owned by Zap's
+    // command-level progress reporter. Keep this primitive silent; the
+    // final user-code compile can opt into Zig's native progress through
+    // `zir_compilation_update_with_progress`.
     const prog_node: std.Progress.Node = .none;
     compilation.update(prog_node) catch |err| {
         logErr("zap_fork: compilation.update failed: {s}", .{@errorName(err)});
@@ -1627,6 +2044,7 @@ fn addStructImpl(ctx: *ZirContext, name: []const u8, source_path: []const u8) !v
         new_file.* = .{
             .status = .never_loaded,
             .path = path,
+            .debug_path = null,
             .stat = undefined,
             .is_builtin = false,
             .source = null,
@@ -1700,6 +2118,57 @@ fn addStructSourceImpl(ctx: *ZirContext, name: []const u8, source: []const u8) !
 
     // Register the struct using the existing addStructImpl.
     try addStructImpl(ctx, name, full_path_z);
+}
+
+fn setFileDebugSourceImpl(ctx: *ZirContext, file_index: Zcu.File.Index, source_path: []const u8) !void {
+    const zcu = ctx.compilation.zcu orelse return error.OutOfMemory;
+    const gpa = zcu.gpa;
+    const file = zcu.fileByIndex(file_index);
+    const debug_path = try Compilation.Path.fromUnresolved(gpa, ctx.dirs, &.{source_path});
+    errdefer debug_path.deinit(gpa);
+    if (file.debug_path) |*old_debug_path| old_debug_path.deinit(gpa);
+    file.debug_path = debug_path;
+}
+
+fn setRootDebugSourceImpl(ctx: *ZirContext, source_path: []const u8) !void {
+    const zcu = ctx.compilation.zcu orelse return error.OutOfMemory;
+    const root_file_opt = zcu.module_roots.get(ctx.root_mod) orelse return error.OutOfMemory;
+    const file_index = root_file_opt.unwrap() orelse return error.OutOfMemory;
+    try setFileDebugSourceImpl(ctx, file_index, source_path);
+}
+
+fn setStructDebugSourceImpl(ctx: *ZirContext, name: []const u8, source_path: []const u8) !void {
+    const zcu = ctx.compilation.zcu orelse return error.OutOfMemory;
+    const target_mod = ctx.root_mod.deps.get(name) orelse return error.OutOfMemory;
+    const file_opt = zcu.module_roots.get(target_mod) orelse return error.OutOfMemory;
+    const file_index = file_opt.unwrap() orelse return error.OutOfMemory;
+    try setFileDebugSourceImpl(ctx, file_index, source_path);
+}
+
+/// Set the source-language path used for DWARF for the root injected ZIR file.
+/// This does not affect module identity, imports, or cache keys; it only changes
+/// the debug file emitted by codegen.
+pub export fn zir_compilation_set_root_debug_source(
+    handle: ?*ZirContext,
+    source_path_ptr: [*]const u8,
+    source_path_len: u32,
+) callconv(.c) i32 {
+    const ctx = handle orelse return -1;
+    setRootDebugSourceImpl(ctx, source_path_ptr[0..source_path_len]) catch return -1;
+    return 0;
+}
+
+/// Set the source-language path used for DWARF for a named injected ZIR struct.
+pub export fn zir_compilation_set_struct_debug_source(
+    handle: ?*ZirContext,
+    name_ptr: [*]const u8,
+    name_len: u32,
+    source_path_ptr: [*]const u8,
+    source_path_len: u32,
+) callconv(.c) i32 {
+    const ctx = handle orelse return -1;
+    setStructDebugSourceImpl(ctx, name_ptr[0..name_len], source_path_ptr[0..source_path_len]) catch return -1;
+    return 0;
 }
 
 fn addLinkLibImpl(ctx: *ZirContext, lib_name: []const u8) !void {
@@ -1867,6 +2336,7 @@ fn createImpl(
     do_link_libc: bool,
     target_triple_opt: ?[]const u8,
     cpu_features_opt: ?[]const u8,
+    incremental: bool,
 ) !*ZirContext {
     // Use c_allocator (libc malloc) instead of page_allocator.
     // page_allocator creates one mmap per allocation, hitting the kernel's
@@ -1885,6 +2355,7 @@ fn createImpl(
         .dirs = undefined,
         .compilation = undefined,
         .root_mod = undefined,
+        .is_incremental = incremental,
     };
     ctx.arena_state = std.heap.ArenaAllocator.init(gpa);
     errdefer ctx.arena_state.deinit();
@@ -2024,11 +2495,18 @@ fn createImpl(
         .have_zcu = true,
         .emit_bin = true,
         .root_optimize_mode = optimize_mode_enum,
-        .root_strip = true,
+        // Keep debug info in Debug builds so generated Zap binaries are
+        // debuggable (DWARF / Mach-O debug map → lldb + the cog
+        // debugger, which hard-gates on debug info). Release modes stay
+        // stripped, byte-for-byte as before (no change to shipped
+        // artifacts). Mirrors the per-object path, which already keeps
+        // `root_strip = false`.
+        .root_strip = optimize_mode_enum != .Debug,
         .link_libc = effective_link_libc,
         .link_mode = if (output_mode_enum == .Lib and is_dynamic) .dynamic else null,
         .lto = .none,
         .use_llvm = build_options.have_llvm,
+        .incremental = incremental,
     }) catch |err| {
         logErr("Config.resolve failed: {s}", .{@errorName(err)});
         return error.OutOfMemory;
@@ -2147,8 +2625,6 @@ fn createImpl(
     ctx.root_mod = root_mod;
     ctx.output_mode = output_mode_enum;
 
-    const output_path_duped = try ar.dupe(u8, output_path);
-
     // When LLVM is available, the compiler can build compiler_rt itself,
     // but it needs self_exe_path to find the lib/ directory.
     const self_exe_path: ?[]const u8 = if (build_options.have_llvm)
@@ -2180,8 +2656,8 @@ fn createImpl(
         .config = config,
         .root_mod = root_mod,
         .root_name = root_name_z,
-        .cache_mode = .none,
-        .emit_bin = .{ .yes_path = output_path_duped },
+        .cache_mode = if (incremental) .incremental else .none,
+        .emit_bin = if (incremental) .yes_cache else .{ .yes_path = try ar.dupe(u8, output_path) },
         .skip_linker_dependencies = !build_options.have_llvm,
         .entry = entry,
     }) catch |err| {
@@ -2207,6 +2683,19 @@ fn addZirFromFinalized(ctx: *ZirContext, fzir: zir_builder.FinalizedZir) !void {
         .extra_len = fzir.extra_len,
     };
     return addZirImpl(ctx, "root", &zir_data);
+}
+
+fn addStructZirFromFinalized(ctx: *ZirContext, name: []const u8, fzir: zir_builder.FinalizedZir) !void {
+    const zir_data = ZirData{
+        .instructions_tags = @constCast(fzir.instructions_tags.ptr),
+        .instructions_data = @constCast(fzir.instructions_data.ptr),
+        .instructions_len = fzir.instructions_len,
+        .string_bytes = @constCast(fzir.string_bytes.ptr),
+        .string_bytes_len = fzir.string_bytes_len,
+        .extra = @constCast(fzir.extra.ptr),
+        .extra_len = fzir.extra_len,
+    };
+    return addZirToStructImpl(ctx, name, &zir_data);
 }
 
 fn addZirImpl(ctx: *ZirContext, name: []const u8, data: *const ZirData) !void {
@@ -5163,6 +5652,419 @@ fn testExpectSegmentVmaddrOrder(file_path: []const u8, allocator: Allocator) !vo
     }
 }
 
+fn testRootFile(ctx: *ZirContext) !*Zcu.File {
+    const zcu = ctx.compilation.zcu orelse return error.MissingZcu;
+    const file_index = (zcu.module_roots.get(ctx.root_mod) orelse return error.MissingRoot).unwrap() orelse return error.MissingRoot;
+    return zcu.fileByIndex(file_index);
+}
+
+fn testStructFile(ctx: *ZirContext, name: []const u8) !*Zcu.File {
+    const zcu = ctx.compilation.zcu orelse return error.MissingZcu;
+    const target_mod = ctx.root_mod.deps.get(name) orelse return error.MissingRoot;
+    const file_index = (zcu.module_roots.get(target_mod) orelse return error.MissingRoot).unwrap() orelse return error.MissingRoot;
+    return zcu.fileByIndex(file_index);
+}
+
+fn testOutputPath(allocator: Allocator, ctx: *ZirContext) ![:0]u8 {
+    const path_len = zir_compilation_output_path_len(ctx);
+    try std.testing.expect(path_len > 0);
+    const path = try allocator.allocSentinel(u8, path_len, 0);
+    errdefer allocator.free(path);
+    try std.testing.expectEqual(path_len, zir_compilation_copy_output_path(ctx, path.ptr, path.len + 1));
+    return path;
+}
+
+test "zir_api: object compilation config is LLVM backed" {
+    const io = std.testing.io;
+    const resolved_result = try std.zig.system.resolveTargetQuery(io, .{});
+    const resolved_target: Package.Module.ResolvedTarget = .{
+        .result = resolved_result,
+        .is_native_os = true,
+        .is_native_abi = true,
+        .is_explicit_dynamic_linker = false,
+    };
+
+    var diag_buf: [512]u8 = undefined;
+    @memset(&diag_buf, 0);
+    const diag = ZapForkDiag{
+        .buf = diag_buf[0..].ptr,
+        .cap = diag_buf.len,
+    };
+
+    const result = resolveObjectCompilationConfig(
+        resolved_target,
+        .Debug,
+        resolved_result.requiresLibC(),
+        diag,
+    );
+    if (build_options.have_llvm) {
+        const config = try result;
+        try std.testing.expect(config.use_llvm);
+        try std.testing.expect(config.use_lib_llvm);
+    } else {
+        try std.testing.expectError(error.ConfigResolveFailed, result);
+        const message = mem.sliceTo(diag_buf[0..].ptr, 0);
+        try std.testing.expect(mem.indexOf(u8, message, "requires an LLVM-enabled Zig fork") != null);
+    }
+}
+
+test "zir_api: incremental create uses cache artifact output contract" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = Dir.cwd();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "local-cache");
+    try tmp.dir.createDirPath(io, "global-cache");
+
+    const zig_lib_dir = try testRepoLibDir(allocator, io);
+    defer allocator.free(zig_lib_dir);
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const tmp_dir = try cwd.openDir(io, tmp_path, .{});
+    const orig_dir = try cwd.openDir(io, ".", .{});
+    try std.process.setCurrentDir(io, tmp_dir);
+    defer std.process.setCurrentDir(io, orig_dir) catch {};
+
+    const local_cache_dir = try std.fs.path.join(allocator, &.{ tmp_path, "local-cache" });
+    defer allocator.free(local_cache_dir);
+    const global_cache_dir = try std.fs.path.join(allocator, &.{ tmp_path, "global-cache" });
+    defer allocator.free(global_cache_dir);
+    const direct_output_path = try std.fs.path.join(allocator, &.{ tmp_path, "direct-output" });
+    defer allocator.free(direct_output_path);
+    const incremental_requested_output_path = try std.fs.path.join(allocator, &.{ tmp_path, "incremental-output" });
+    defer allocator.free(incremental_requested_output_path);
+
+    const direct_ctx = try createImpl(
+        zig_lib_dir,
+        local_cache_dir,
+        global_cache_dir,
+        direct_output_path,
+        "zir_api_direct_contract",
+        0,
+        1,
+        false,
+        true,
+        null,
+        null,
+        false,
+    );
+    defer zir_compilation_destroy(direct_ctx);
+
+    try std.testing.expect(!zir_compilation_is_incremental(direct_ctx));
+    try std.testing.expect(!direct_ctx.compilation.config.incremental);
+    switch (direct_ctx.compilation.cache_use) {
+        .none => {},
+        .incremental, .whole => return error.UnexpectedCacheMode,
+    }
+    const direct_artifact_path = try testOutputPath(allocator, direct_ctx);
+    defer allocator.free(direct_artifact_path);
+    try std.testing.expectEqualStrings(direct_output_path, direct_artifact_path);
+    try std.testing.expectEqual(@as(i32, -2), zir_compilation_prepare_update(direct_ctx));
+
+    const incremental_ctx = try createImpl(
+        zig_lib_dir,
+        local_cache_dir,
+        global_cache_dir,
+        incremental_requested_output_path,
+        "zir_api_incremental_contract",
+        0,
+        1,
+        false,
+        true,
+        null,
+        null,
+        true,
+    );
+    defer zir_compilation_destroy(incremental_ctx);
+
+    try std.testing.expect(zir_compilation_is_incremental(incremental_ctx));
+    try std.testing.expect(incremental_ctx.compilation.config.incremental);
+    switch (incremental_ctx.compilation.cache_use) {
+        .incremental => {},
+        .none, .whole => return error.UnexpectedCacheMode,
+    }
+
+    const incremental_artifact_path = try testOutputPath(allocator, incremental_ctx);
+    defer allocator.free(incremental_artifact_path);
+    try std.testing.expect(!std.mem.eql(u8, incremental_requested_output_path, incremental_artifact_path));
+
+    const incremental_cache_prefix = try std.fs.path.join(allocator, &.{ local_cache_dir, "o" });
+    defer allocator.free(incremental_cache_prefix);
+    try std.testing.expect(std.mem.startsWith(u8, incremental_artifact_path, incremental_cache_prefix));
+}
+
+test "zir_api: incremental update consumes injected prev_zir through updateZirRefs" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = Dir.cwd();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "local-cache");
+    try tmp.dir.createDirPath(io, "global-cache");
+
+    const zig_lib_dir = try testRepoLibDir(allocator, io);
+    defer allocator.free(zig_lib_dir);
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const tmp_dir = try cwd.openDir(io, tmp_path, .{});
+    const orig_dir = try cwd.openDir(io, ".", .{});
+    try std.process.setCurrentDir(io, tmp_dir);
+    defer std.process.setCurrentDir(io, orig_dir) catch {};
+
+    const local_cache_dir = try std.fs.path.join(allocator, &.{ tmp_path, "local-cache" });
+    defer allocator.free(local_cache_dir);
+    const global_cache_dir = try std.fs.path.join(allocator, &.{ tmp_path, "global-cache" });
+    defer allocator.free(global_cache_dir);
+    const requested_output_path = try std.fs.path.join(allocator, &.{ tmp_path, "incremental-update-output" });
+    defer allocator.free(requested_output_path);
+
+    const ctx = try createImpl(
+        zig_lib_dir,
+        local_cache_dir,
+        global_cache_dir,
+        requested_output_path,
+        "zir_api_incremental_update",
+        0,
+        1,
+        false,
+        true,
+        null,
+        null,
+        true,
+    );
+    defer zir_compilation_destroy(ctx);
+
+    try addStructSourceImpl(ctx, "zap_runtime", "pub fn noop() void {}\n");
+
+    {
+        var builder = try zir_builder.Builder.init(allocator);
+        defer builder.deinit();
+        const body = try builder.beginFunction("main", .void);
+        try builder.endFunction(body);
+        const fzir = try builder.finalize();
+        try addZirFromFinalized(ctx, fzir);
+    }
+
+    try std.testing.expectEqual(@as(i32, 0), zir_compilation_update(ctx));
+    const first_artifact_path = try testOutputPath(allocator, ctx);
+    defer allocator.free(first_artifact_path);
+    const first_artifact = try cwd.openFile(io, first_artifact_path, .{});
+    defer first_artifact.close(io);
+
+    try std.testing.expectEqual(@as(i32, 0), zir_compilation_prepare_update(ctx));
+    const root_file_after_prepare = try testRootFile(ctx);
+    try std.testing.expect(root_file_after_prepare.prev_zir != null);
+    try std.testing.expect(root_file_after_prepare.zir == null);
+
+    {
+        var builder = try zir_builder.Builder.init(allocator);
+        defer builder.deinit();
+        const body = try builder.beginFunction("main", .void);
+        try body.addRetImplicit();
+        try builder.endFunction(body);
+        const fzir = try builder.finalize();
+        try addZirFromFinalized(ctx, fzir);
+    }
+
+    try std.testing.expectEqual(@as(i32, 0), zir_compilation_update(ctx));
+    const root_file_after_update = try testRootFile(ctx);
+    try std.testing.expect(root_file_after_update.prev_zir == null);
+    try std.testing.expect(root_file_after_update.zir != null);
+}
+
+test "zir_api: selected update finalizes unused injected module prev_zir" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = Dir.cwd();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "local-cache");
+    try tmp.dir.createDirPath(io, "global-cache");
+
+    const zig_lib_dir = try testRepoLibDir(allocator, io);
+    defer allocator.free(zig_lib_dir);
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const tmp_dir = try cwd.openDir(io, tmp_path, .{});
+    const orig_dir = try cwd.openDir(io, ".", .{});
+    try std.process.setCurrentDir(io, tmp_dir);
+    defer std.process.setCurrentDir(io, orig_dir) catch {};
+
+    const local_cache_dir = try std.fs.path.join(allocator, &.{ tmp_path, "local-cache" });
+    defer allocator.free(local_cache_dir);
+    const global_cache_dir = try std.fs.path.join(allocator, &.{ tmp_path, "global-cache" });
+    defer allocator.free(global_cache_dir);
+    const requested_output_path = try std.fs.path.join(allocator, &.{ tmp_path, "incremental-unused-selected-output" });
+    defer allocator.free(requested_output_path);
+
+    const ctx = try createImpl(
+        zig_lib_dir,
+        local_cache_dir,
+        global_cache_dir,
+        requested_output_path,
+        "zir_api_incremental_unused_selected",
+        0,
+        1,
+        false,
+        true,
+        null,
+        null,
+        true,
+    );
+    defer zir_compilation_destroy(ctx);
+
+    try addStructSourceImpl(ctx, "zap_runtime", "pub fn noop() void {}\n");
+    try addStructSourceImpl(ctx, "UnusedStruct", "pub fn unused() void {}\n");
+
+    {
+        var builder = try zir_builder.Builder.init(allocator);
+        defer builder.deinit();
+        const body = try builder.beginFunction("unused", .void);
+        try builder.endFunction(body);
+        const fzir = try builder.finalize();
+        try addStructZirFromFinalized(ctx, "UnusedStruct", fzir);
+    }
+
+    {
+        var builder = try zir_builder.Builder.init(allocator);
+        defer builder.deinit();
+        const body = try builder.beginFunction("main", .void);
+        try builder.endFunction(body);
+        const fzir = try builder.finalize();
+        try addZirFromFinalized(ctx, fzir);
+    }
+
+    try std.testing.expectEqual(@as(i32, 0), zir_compilation_update(ctx));
+
+    const selected_names = [_][*]const u8{"UnusedStruct".ptr};
+    const selected_lens = [_]usize{"UnusedStruct".len};
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        zir_compilation_prepare_update_selected(ctx, selected_names[0..].ptr, selected_lens[0..].ptr, selected_names.len, false),
+    );
+
+    const unused_file_after_prepare = try testStructFile(ctx, "UnusedStruct");
+    try std.testing.expect(unused_file_after_prepare.prev_zir != null);
+    try std.testing.expect(unused_file_after_prepare.zir == null);
+
+    {
+        var builder = try zir_builder.Builder.init(allocator);
+        defer builder.deinit();
+        const body = try builder.beginFunction("unused", .void);
+        try body.addRetImplicit();
+        try builder.endFunction(body);
+        const fzir = try builder.finalize();
+        try addStructZirFromFinalized(ctx, "UnusedStruct", fzir);
+    }
+
+    try std.testing.expectEqual(@as(i32, 0), zir_compilation_update(ctx));
+
+    const unused_file_after_update = try testStructFile(ctx, "UnusedStruct");
+    try std.testing.expect(unused_file_after_update.prev_zir == null);
+    try std.testing.expect(unused_file_after_update.zir != null);
+
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        zir_compilation_prepare_update_selected(ctx, selected_names[0..].ptr, selected_lens[0..].ptr, selected_names.len, false),
+    );
+    try std.testing.expectEqual(@as(i32, 0), zir_compilation_abort_update(ctx));
+}
+
+test "zir_api: abort update restores prepared ZIR before update" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = Dir.cwd();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "local-cache");
+    try tmp.dir.createDirPath(io, "global-cache");
+
+    const zig_lib_dir = try testRepoLibDir(allocator, io);
+    defer allocator.free(zig_lib_dir);
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const tmp_dir = try cwd.openDir(io, tmp_path, .{});
+    const orig_dir = try cwd.openDir(io, ".", .{});
+    try std.process.setCurrentDir(io, tmp_dir);
+    defer std.process.setCurrentDir(io, orig_dir) catch {};
+
+    const local_cache_dir = try std.fs.path.join(allocator, &.{ tmp_path, "local-cache" });
+    defer allocator.free(local_cache_dir);
+    const global_cache_dir = try std.fs.path.join(allocator, &.{ tmp_path, "global-cache" });
+    defer allocator.free(global_cache_dir);
+    const requested_output_path = try std.fs.path.join(allocator, &.{ tmp_path, "incremental-abort-output" });
+    defer allocator.free(requested_output_path);
+
+    const ctx = try createImpl(
+        zig_lib_dir,
+        local_cache_dir,
+        global_cache_dir,
+        requested_output_path,
+        "zir_api_incremental_abort",
+        0,
+        1,
+        false,
+        true,
+        null,
+        null,
+        true,
+    );
+    defer zir_compilation_destroy(ctx);
+
+    try addStructSourceImpl(ctx, "zap_runtime", "pub fn noop() void {}\n");
+
+    {
+        var builder = try zir_builder.Builder.init(allocator);
+        defer builder.deinit();
+        const body = try builder.beginFunction("main", .void);
+        try builder.endFunction(body);
+        const fzir = try builder.finalize();
+        try addZirFromFinalized(ctx, fzir);
+    }
+
+    try std.testing.expectEqual(@as(i32, 0), zir_compilation_update(ctx));
+    try std.testing.expectEqual(@as(i32, 0), zir_compilation_prepare_update(ctx));
+
+    {
+        var builder = try zir_builder.Builder.init(allocator);
+        defer builder.deinit();
+        const body = try builder.beginFunction("main", .void);
+        try body.addRetImplicit();
+        try builder.endFunction(body);
+        const fzir = try builder.finalize();
+        try addZirFromFinalized(ctx, fzir);
+    }
+
+    const root_file_after_replacement = try testRootFile(ctx);
+    try std.testing.expect(root_file_after_replacement.prev_zir != null);
+    try std.testing.expect(root_file_after_replacement.zir != null);
+
+    try std.testing.expectEqual(@as(i32, 0), zir_compilation_abort_update(ctx));
+    const root_file_after_abort = try testRootFile(ctx);
+    try std.testing.expect(root_file_after_abort.prev_zir == null);
+    try std.testing.expect(root_file_after_abort.zir != null);
+    try std.testing.expect(!root_file_after_abort.module_changed);
+    try std.testing.expect(!root_file_after_abort.zoir_invalidated);
+    try std.testing.expectEqual(@as(i32, 0), zir_compilation_update(ctx));
+}
+
 test "zir_api: injected executable update succeeds" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -5205,6 +6107,7 @@ test "zir_api: injected executable update succeeds" {
         true,
         null,
         null,
+        false,
     );
     defer zir_compilation_destroy(ctx);
 
@@ -5276,6 +6179,7 @@ test "zir_api: function value passed as callback argument" {
         true,
         null,
         null,
+        false,
     );
     defer zir_compilation_destroy(ctx);
 
@@ -5370,6 +6274,7 @@ test "zir_api: cross-struct callback via anytype" {
         true,
         null,
         null,
+        false,
     );
     defer zir_compilation_destroy(ctx);
 
@@ -5476,6 +6381,7 @@ test "zir_api: three-struct anytype chain (caller -> wrapper -> inner)" {
         true,
         null,
         null,
+        false,
     );
     defer zir_compilation_destroy(ctx);
 
