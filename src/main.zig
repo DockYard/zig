@@ -10,6 +10,12 @@ comptime {
     // Force the compiler to analyze and export all ZIR API functions.
     const api = zir_api;
     _ = &api.zir_compilation_create;
+    _ = &api.zir_compilation_create_v2;
+    _ = &api.zir_compilation_create_incremental_v2;
+    _ = &api.zir_compilation_create_cross_v2;
+    _ = &api.zir_compilation_create_cross_incremental_v2;
+    _ = &api.zir_builder_emit_dbg_var_val;
+    _ = &api.zir_builder_emit_dbg_var_ptr;
     _ = &api.zir_compilation_add_zir;
     _ = &api.zir_compilation_update;
     _ = &api.zir_compilation_update_with_progress;

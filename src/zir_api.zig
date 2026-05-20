@@ -105,6 +105,72 @@ pub export fn zir_compilation_create(
         null,
         null,
         false,
+        .default,
+    ) catch null;
+}
+
+/// Phase 0 — DWARF foundation: per-mode debug-info policy values
+/// callers may pass to `zir_compilation_create_v2` / its cross variant.
+/// `default` leaves the historical behavior intact (Debug keeps DWARF,
+/// all other modes strip), so existing callers continue to work
+/// unchanged. `full` keeps DWARF regardless of the optimize mode —
+/// the policy Zap's Debug and ReleaseSafe modes want so panic / lldb
+/// / addr2line resolve to Zap file:line. `none` strips DWARF
+/// regardless of the optimize mode — used by ReleaseFast/Small
+/// when the build wants no debug info in the shipped binary (the
+/// matching split-debug artifact is produced from a sibling
+/// invocation rather than embedded).
+pub const DebugInfoPolicy = enum(u8) {
+    default = 0,
+    full = 1,
+    none = 2,
+};
+
+/// Safe `u8` -> `DebugInfoPolicy` conversion. The C-ABI callers pass
+/// the policy as a raw byte; out-of-range values map back to
+/// `.default` so a future Zap binary linked against an older fork
+/// (or vice versa) silently falls back to historical behavior rather
+/// than aborting. This is the explicit forward-compatibility seam.
+fn debugInfoPolicyFromU8(value: u8) error{InvalidPolicy}!DebugInfoPolicy {
+    return switch (value) {
+        0 => .default,
+        1 => .full,
+        2 => .none,
+        else => error.InvalidPolicy,
+    };
+}
+
+/// V2 of `zir_compilation_create` with an explicit debug-info
+/// policy. Identical semantics to the V1 version when
+/// `debug_info_policy == 0` (default). See `DebugInfoPolicy`.
+pub export fn zir_compilation_create_v2(
+    zig_lib_dir: [*:0]const u8,
+    local_cache_dir: [*:0]const u8,
+    global_cache_dir: [*:0]const u8,
+    output_path: [*:0]const u8,
+    root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
+    debug_info_policy: u8,
+) ?*ZirContext {
+    const policy: DebugInfoPolicy = debugInfoPolicyFromU8(debug_info_policy) catch
+        .default;
+    return createImpl(
+        mem.sliceTo(zig_lib_dir, 0),
+        mem.sliceTo(local_cache_dir, 0),
+        mem.sliceTo(global_cache_dir, 0),
+        mem.sliceTo(output_path, 0),
+        mem.sliceTo(root_name, 0),
+        output_mode,
+        optimize_mode,
+        is_dynamic,
+        link_libc,
+        null,
+        null,
+        false,
+        policy,
     ) catch null;
 }
 
@@ -137,6 +203,40 @@ pub export fn zir_compilation_create_incremental(
         null,
         null,
         true,
+        .default,
+    ) catch null;
+}
+
+/// V2 of `zir_compilation_create_incremental` with an explicit
+/// debug-info policy (see `DebugInfoPolicy`).
+pub export fn zir_compilation_create_incremental_v2(
+    zig_lib_dir: [*:0]const u8,
+    local_cache_dir: [*:0]const u8,
+    global_cache_dir: [*:0]const u8,
+    output_path: [*:0]const u8,
+    root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
+    debug_info_policy: u8,
+) ?*ZirContext {
+    const policy: DebugInfoPolicy = debugInfoPolicyFromU8(debug_info_policy) catch
+        .default;
+    return createImpl(
+        mem.sliceTo(zig_lib_dir, 0),
+        mem.sliceTo(local_cache_dir, 0),
+        mem.sliceTo(global_cache_dir, 0),
+        mem.sliceTo(output_path, 0),
+        mem.sliceTo(root_name, 0),
+        output_mode,
+        optimize_mode,
+        is_dynamic,
+        link_libc,
+        null,
+        null,
+        true,
+        policy,
     ) catch null;
 }
 
@@ -177,6 +277,44 @@ pub export fn zir_compilation_create_cross(
         target_str,
         cpu_str,
         false,
+        .default,
+    ) catch null;
+}
+
+/// V2 of `zir_compilation_create_cross` with an explicit debug-info
+/// policy (see `DebugInfoPolicy`).
+pub export fn zir_compilation_create_cross_v2(
+    zig_lib_dir: [*:0]const u8,
+    local_cache_dir: [*:0]const u8,
+    global_cache_dir: [*:0]const u8,
+    output_path: [*:0]const u8,
+    root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
+    target_triple: ?[*:0]const u8,
+    cpu_features: ?[*:0]const u8,
+    debug_info_policy: u8,
+) ?*ZirContext {
+    const target_str: ?[]const u8 = if (target_triple) |t| mem.sliceTo(t, 0) else null;
+    const cpu_str: ?[]const u8 = if (cpu_features) |c| mem.sliceTo(c, 0) else null;
+    const policy: DebugInfoPolicy = debugInfoPolicyFromU8(debug_info_policy) catch
+        .default;
+    return createImpl(
+        mem.sliceTo(zig_lib_dir, 0),
+        mem.sliceTo(local_cache_dir, 0),
+        mem.sliceTo(global_cache_dir, 0),
+        mem.sliceTo(output_path, 0),
+        mem.sliceTo(root_name, 0),
+        output_mode,
+        optimize_mode,
+        is_dynamic,
+        link_libc,
+        target_str,
+        cpu_str,
+        false,
+        policy,
     ) catch null;
 }
 
@@ -214,6 +352,44 @@ pub export fn zir_compilation_create_cross_incremental(
         target_str,
         cpu_str,
         true,
+        .default,
+    ) catch null;
+}
+
+/// V2 of `zir_compilation_create_cross_incremental` with an explicit
+/// debug-info policy (see `DebugInfoPolicy`).
+pub export fn zir_compilation_create_cross_incremental_v2(
+    zig_lib_dir: [*:0]const u8,
+    local_cache_dir: [*:0]const u8,
+    global_cache_dir: [*:0]const u8,
+    output_path: [*:0]const u8,
+    root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
+    target_triple: ?[*:0]const u8,
+    cpu_features: ?[*:0]const u8,
+    debug_info_policy: u8,
+) ?*ZirContext {
+    const target_str: ?[]const u8 = if (target_triple) |t| mem.sliceTo(t, 0) else null;
+    const cpu_str: ?[]const u8 = if (cpu_features) |c| mem.sliceTo(c, 0) else null;
+    const policy: DebugInfoPolicy = debugInfoPolicyFromU8(debug_info_policy) catch
+        .default;
+    return createImpl(
+        mem.sliceTo(zig_lib_dir, 0),
+        mem.sliceTo(local_cache_dir, 0),
+        mem.sliceTo(global_cache_dir, 0),
+        mem.sliceTo(output_path, 0),
+        mem.sliceTo(root_name, 0),
+        output_mode,
+        optimize_mode,
+        is_dynamic,
+        link_libc,
+        target_str,
+        cpu_str,
+        true,
+        policy,
     ) catch null;
 }
 
@@ -2337,6 +2513,7 @@ fn createImpl(
     target_triple_opt: ?[]const u8,
     cpu_features_opt: ?[]const u8,
     incremental: bool,
+    debug_info_policy: DebugInfoPolicy,
 ) !*ZirContext {
     // Use c_allocator (libc malloc) instead of page_allocator.
     // page_allocator creates one mmap per allocation, hitting the kernel's
@@ -2495,13 +2672,24 @@ fn createImpl(
         .have_zcu = true,
         .emit_bin = true,
         .root_optimize_mode = optimize_mode_enum,
-        // Keep debug info in Debug builds so generated Zap binaries are
-        // debuggable (DWARF / Mach-O debug map → lldb + the cog
-        // debugger, which hard-gates on debug info). Release modes stay
-        // stripped, byte-for-byte as before (no change to shipped
-        // artifacts). Mirrors the per-object path, which already keeps
-        // `root_strip = false`.
-        .root_strip = optimize_mode_enum != .Debug,
+        // Per-mode debug-info policy (Phase 0 of the Zap error system
+        // — `docs/error-system-research-brief.md` §VIII). The caller
+        // can override the historical default via `debug_info_policy`:
+        //   * `.default` — preserves prior behavior (Debug keeps
+        //     DWARF, every other mode strips). Existing callers
+        //     using the V1 ABI land here unchanged.
+        //   * `.full` — keeps DWARF regardless of the optimize mode.
+        //     Zap's Debug and ReleaseSafe both want this so panic /
+        //     lldb / addr2line resolve to Zap file:line.
+        //   * `.none` — strips DWARF regardless of the optimize mode.
+        //     Used by ReleaseFast/ReleaseSmall when the matching
+        //     split-debug artifact is produced via a sibling
+        //     invocation instead of being embedded in the binary.
+        .root_strip = switch (debug_info_policy) {
+            .default => optimize_mode_enum != .Debug,
+            .full => false,
+            .none => true,
+        },
         .link_libc = effective_link_libc,
         .link_mode = if (output_mode_enum == .Lib and is_dynamic) .dynamic else null,
         .lto = .none,
