@@ -23,6 +23,11 @@ comptime {
     _ = &api.zir_compilation_print_errors;
     _ = &api.zir_compilation_add_struct;
     _ = &api.zir_compilation_add_struct_source;
+    _ = &api.zir_compilation_prepare_update;
+    _ = &api.zir_compilation_prepare_update_selected;
+    _ = &api.zir_compilation_abort_update;
+    _ = &api.zir_compilation_invalidate_file;
+    _ = &api.zir_compilation_invalidate_root;
     _ = &api.zir_compilation_set_root_debug_source;
     _ = &api.zir_compilation_set_struct_debug_source;
     _ = &api.zir_compilation_set_builder_entry;

@@ -1004,6 +1004,13 @@ pub const File = struct {
     /// so everything needs to be re-done. `updateZirRefs` is responsible for resetting this flag.
     module_changed: bool,
 
+    /// ZIR-injected frontends can replace a file's ZIR without changing its
+    /// Zig module identity. When set, `updateZirRefs` treats the file as a
+    /// full-file content invalidation: existing tracked instructions for this
+    /// injected file are considered lost, source-file dependers are marked
+    /// outdated, and the root namespace is rebuilt from the replacement ZIR.
+    zir_injected_invalidated: bool = false,
+
     /// The ZIR for this file from the last update with no file failures. As such, this ZIR is never
     /// failed (although it may have compile errors).
     ///

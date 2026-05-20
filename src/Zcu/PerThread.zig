@@ -833,7 +833,116 @@ fn loadZirZoirCache(
 const UpdatedFile = struct {
     file: *Zcu.File,
     inst_map: std.AutoHashMapUnmanaged(Zir.Inst.Index, Zir.Inst.Index),
+    force_src_hash_invalidations: bool,
 };
+
+fn markAnalUnitOutdatedReady(
+    zcu: *Zcu,
+    unit: AnalUnit,
+) Allocator.Error!void {
+    const gpa = zcu.comp.gpa;
+
+    if (std.debug.runtime_safety) zcu.outdated_lock.lockUncancelable(zcu.comp.io);
+    defer if (std.debug.runtime_safety) zcu.outdated_lock.unlock(zcu.comp.io);
+
+    if (zcu.outdated.getPtr(unit)) |po_dep_count| {
+        po_dep_count.* = 0;
+    } else {
+        _ = zcu.potentially_outdated.fetchSwapRemove(unit);
+        try zcu.outdated.putNoClobber(gpa, unit, 0);
+    }
+
+    switch (unit.unwrap()) {
+        .func => |func| try zcu.outdated_ready.funcs.put(gpa, func, {}),
+        else => try zcu.outdated_ready.other.put(gpa, unit, {}),
+    }
+}
+
+fn markNavFunctionBodyOutdated(
+    zcu: *Zcu,
+    nav: InternPool.Nav.Index,
+) Allocator.Error!void {
+    const ip = &zcu.intern_pool;
+    const resolved = ip.getNav(nav).resolved orelse return;
+    if (resolved.value == .none) return;
+
+    switch (ip.indexToKey(resolved.value)) {
+        .func => try markAnalUnitOutdatedReady(zcu, .wrap(.{ .func = resolved.value })),
+        else => {},
+    }
+}
+
+fn markFileRootNamespaceDeclsOutdated(
+    zcu: *Zcu,
+    file_index: Zcu.File.Index,
+) Allocator.Error!void {
+    const file_root_type = zcu.fileRootType(file_index);
+    if (file_root_type == .none) return;
+
+    const ip = &zcu.intern_pool;
+    const namespace = zcu.namespacePtr(ip.loadStructType(file_root_type).namespace);
+
+    for (namespace.pub_decls.keys()) |nav| {
+        try zcu.markDependeeOutdated(.not_marked_po, .{ .nav_val = nav });
+        try zcu.markDependeeOutdated(.not_marked_po, .{ .nav_ty = nav });
+        try markNavFunctionBodyOutdated(zcu, nav);
+    }
+    for (namespace.priv_decls.keys()) |nav| {
+        try zcu.markDependeeOutdated(.not_marked_po, .{ .nav_val = nav });
+        try zcu.markDependeeOutdated(.not_marked_po, .{ .nav_ty = nav });
+        try markNavFunctionBodyOutdated(zcu, nav);
+    }
+    for (namespace.test_decls.items) |nav| {
+        try zcu.markDependeeOutdated(.not_marked_po, .{ .nav_val = nav });
+        try zcu.markDependeeOutdated(.not_marked_po, .{ .nav_ty = nav });
+        try markNavFunctionBodyOutdated(zcu, nav);
+    }
+}
+
+fn queueUpdatedZirFile(
+    zcu: *Zcu,
+    gpa: Allocator,
+    updated_files: *std.AutoArrayHashMapUnmanaged(Zcu.File.Index, UpdatedFile),
+    file_index: Zcu.File.Index,
+    file: *Zcu.File,
+) Allocator.Error!void {
+    if (updated_files.contains(file_index)) return;
+
+    if (file.module_changed) {
+        try markFileRootNamespaceDeclsOutdated(zcu, file_index);
+        try zcu.markDependeeOutdated(.not_marked_po, .{ .source_file = file_index });
+        try updated_files.putNoClobber(gpa, file_index, .{
+            .file = file,
+            // Do not map instructions across a whole-file content replacement.
+            // `module_changed` changes Zig module identity, so tracked instructions
+            // must be rediscovered from the replacement root namespace.
+            .inst_map = .{},
+            .force_src_hash_invalidations = true,
+        });
+        return;
+    }
+
+    const old_zir = file.prev_zir orelse return;
+    const new_zir = file.zir.?;
+    const gop = try updated_files.getOrPut(gpa, file_index);
+    assert(!gop.found_existing);
+    gop.value_ptr.* = .{
+        .file = file,
+        .inst_map = .{},
+        .force_src_hash_invalidations = file.zir_injected_invalidated,
+    };
+    try Zcu.mapOldZirToNew(gpa, old_zir.*, new_zir, &gop.value_ptr.inst_map);
+
+    if (file.zir_injected_invalidated) {
+        // Zap's injected-ZIR modules keep the same Zig module identity, but
+        // their frontend-owned source has changed. Preserve instruction
+        // mappings so existing Nav/function/codegen records are updated in
+        // place, while still forcing every mapped source-hash dependency in
+        // this file stale during the update loop below.
+        try markFileRootNamespaceDeclsOutdated(zcu, file_index);
+        try zcu.markDependeeOutdated(.not_marked_po, .{ .source_file = file_index });
+    }
+}
 
 fn cleanupUpdatedFiles(gpa: Allocator, updated_files: *std.AutoArrayHashMapUnmanaged(Zcu.File.Index, UpdatedFile)) void {
     for (updated_files.values()) |*elem| elem.inst_map.deinit(gpa);
@@ -857,14 +966,6 @@ fn updateZirRefs(pt: Zcu.PerThread) (Io.Cancelable || Allocator.Error)!void {
         if (!zcu.alive_files.contains(file_index)) continue;
         const file = zcu.fileByIndex(file_index);
         assert(file.status == .success);
-        if (file.module_changed) {
-            try updated_files.putNoClobber(gpa, file_index, .{
-                .file = file,
-                // We intentionally don't map any instructions here; that's the point, the whole file is outdated!
-                .inst_map = .{},
-            });
-            continue;
-        }
         switch (file.getMode()) {
             .zig => {}, // logic below
             .zon => {
@@ -875,15 +976,19 @@ fn updateZirRefs(pt: Zcu.PerThread) (Io.Cancelable || Allocator.Error)!void {
                 continue;
             },
         }
-        const old_zir = file.prev_zir orelse continue;
-        const new_zir = file.zir.?;
-        const gop = try updated_files.getOrPut(gpa, file_index);
-        assert(!gop.found_existing);
-        gop.value_ptr.* = .{
-            .file = file,
-            .inst_map = .{},
-        };
-        try Zcu.mapOldZirToNew(gpa, old_zir.*, new_zir, &gop.value_ptr.inst_map);
+        try queueUpdatedZirFile(zcu, gpa, &updated_files, file_index, file);
+    }
+
+    // Zap injects ZIR through module roots rather than always reaching these
+    // files through Zig source imports. They still own declarations tracked by
+    // Sema/codegen, so their `prev_zir` and `module_changed` state must feed
+    // the same invalidation machinery as normal files.
+    for (zcu.module_roots.values()) |opt_file_index| {
+        const file_index = opt_file_index.unwrap() orelse continue;
+        const file = zcu.fileByIndex(file_index);
+        if (!file.zir_injected) continue;
+        assert(file.status == .success);
+        try queueUpdatedZirFile(zcu, gpa, &updated_files, file_index, file);
     }
 
     if (updated_files.count() == 0)
@@ -930,7 +1035,7 @@ fn updateZirRefs(pt: Zcu.PerThread) (Io.Cancelable || Allocator.Error)!void {
 
             if (old_zir.getAssociatedSrcHash(old_inst)) |old_hash| hash_changed: {
                 if (new_zir.getAssociatedSrcHash(new_inst)) |new_hash| {
-                    if (std.zig.srcHashEql(old_hash, new_hash)) {
+                    if (!updated_file.force_src_hash_invalidations and std.zig.srcHashEql(old_hash, new_hash)) {
                         break :hash_changed;
                     }
                     log.debug("hash for (%{d} -> %{d}) changed: {x} -> {x}", .{
@@ -1013,6 +1118,7 @@ fn updateZirRefs(pt: Zcu.PerThread) (Io.Cancelable || Allocator.Error)!void {
             file.prev_zir = null;
         }
         file.module_changed = false;
+        file.zir_injected_invalidated = false;
 
         // For every file which has changed, re-scan the namespace of the file's root struct type.
         // These types are special-cased because they don't have an enclosing declaration which will

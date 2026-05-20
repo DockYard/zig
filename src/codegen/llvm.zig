@@ -1545,6 +1545,30 @@ pub const Object = struct {
         defer fg.deinit();
         deinit_wip = false;
 
+        // Seed the function-entry debug location to the subprogram itself.
+        // Without this seed `wip.debug_location` stays `.no_location` until an
+        // AIR `dbg_stmt` is encountered. Frontends that lower straight to ZIR
+        // (Zap's `zir_builder`) may emit functions whose bodies contain no
+        // `dbg_stmt` between the first instruction and an arithmetic op that
+        // synthesises a safety-panic call (`add_safe`/`sub_safe`/...). LLVM's
+        // verifier rejects bitcode where an inlinable call inside a function
+        // that has DI metadata lacks a `!dbg` annotation. Seeding the location
+        // here gives every such synthesised call a valid debug location
+        // anchored at the subprogram's own definition point — exactly what an
+        // AstGen-emitted `dbg_stmt` for the function's first statement would
+        // produce.
+        if (!fg.wip.strip) {
+            const line_number = zcu.navSrcLine(func.owner_nav) + 1;
+            fg.wip.debug_location = .{ .location = .{
+                .line = line_number,
+                .column = 0,
+                .scope = fg.scope.toOptional(),
+                .inlined_at = fg.inlined_at,
+            } };
+            fg.prev_dbg_line = line_number;
+            fg.prev_dbg_column = 0;
+        }
+
         try fg.genBody(air.getMainBody(), .poi);
 
         // If we saw any loads or stores involving `allowzero` pointers, we need to mark the whole

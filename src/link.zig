@@ -1567,7 +1567,6 @@ pub fn doZcuTask(comp: *Compilation, tid: Zcu.PerThread.Id, task: ZcuTask) void 
 
             const nav = zcu.funcInfo(func).owner_nav;
             const fqn_slice = ip.getNav(nav).fqn.toSlice(ip);
-
             const nav_prog_node = comp.link_prog_node.start(fqn_slice, 0);
             defer nav_prog_node.end();
 

@@ -360,7 +360,10 @@ pub fn flush(
     const sub_prog_node = prog_node.start("MachO Flush", 0);
     defer sub_prog_node.end();
 
-    if (self.base.zcu_object_basename != null) try self.resetObjectInputFlushState();
+    if (self.base.zcu_object_basename != null) {
+        try self.recreateOutputFileForObjectInputFlush();
+        try self.resetObjectInputFlushState();
+    }
 
     const zcu_obj_path: ?Path = if (self.base.zcu_object_basename) |raw| p: {
         break :p try comp.resolveEmitPathFlush(arena, .temp, raw);
@@ -658,6 +661,27 @@ fn resetObjectInputFlushState(self: *MachO) !void {
 
     self.resetLinkPassState();
     try self.strtab.append(gpa, 0);
+}
+
+fn recreateOutputFileForObjectInputFlush(self: *MachO) link.File.FlushError!void {
+    const comp = self.base.comp;
+    const io = comp.io;
+
+    if (self.base.file) |file| {
+        file.close(io);
+        self.base.file = null;
+    }
+
+    self.base.file = self.base.emit.root_dir.handle.createFile(io, self.base.emit.sub_path, .{
+        .truncate = true,
+        .read = true,
+        .permissions = link.File.determinePermissions(comp.config.output_mode, comp.config.link_mode),
+    }) catch |err| {
+        return comp.link_diags.fail(
+            "failed to recreate output file '{f}': {t}",
+            .{ std.fmt.alt(@as(Path, self.base.emit), .formatEscapeChar), err },
+        );
+    };
 }
 
 fn resetLinkPassState(self: *MachO) void {

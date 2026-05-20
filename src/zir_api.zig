@@ -511,7 +511,8 @@ fn finalizePreparedInjectedZir(ctx: *ZirContext) !void {
         const prev_zir = file.prev_zir orelse continue;
 
         const is_live_import = isFileInImportTable(zcu, file_index) and zcu.alive_files.contains(file_index);
-        if (is_live_import) {
+        const has_live_root_type = zcu.fileRootType(file_index) != .none;
+        if (is_live_import or has_live_root_type) {
             logErr(
                 "incremental update left pending prev_zir for live module '{s}' after updateZirRefs",
                 .{mod.fully_qualified_name},
@@ -523,6 +524,7 @@ fn finalizePreparedInjectedZir(ctx: *ZirContext) !void {
         gpa.destroy(prev_zir);
         file.prev_zir = null;
         file.module_changed = false;
+        file.zir_injected_invalidated = false;
         file.zoir_invalidated = false;
     }
 }
@@ -995,6 +997,7 @@ pub export fn zir_compilation_abort_update(ctx: ?*ZirContext) callconv(.c) i32 {
         file.zir = prev_zir.*;
         file.prev_zir = null;
         file.module_changed = false;
+        file.zir_injected_invalidated = false;
         file.zoir_invalidated = false;
         file.status = .success;
         gpa.destroy(prev_zir);
@@ -1003,11 +1006,12 @@ pub export fn zir_compilation_abort_update(ctx: ?*ZirContext) callconv(.c) i32 {
     return 0;
 }
 
-/// Mark a named struct's root file as changed for incremental recompilation.
+/// Validate that a named struct is present in the current prepared update.
 ///
-/// Looks up `name` in the root dependencies, finds its root file in
-/// `module_roots`, and sets `file.module_changed = true`. This tells the
-/// incremental pipeline to invalidate and re-analyze that struct.
+/// Injected-ZIR content edits are represented by `file.prev_zir` plus a new
+/// `file.zir`. The module identity is unchanged, but the external frontend
+/// selected this file as content-stale, so mark the injected file for
+/// full-file source-hash invalidation during `updateZirRefs`.
 ///
 /// Returns 0 on success, -1 if the struct was not found.
 pub export fn zir_compilation_invalidate_file(ctx: ?*ZirContext, name: [*:0]const u8) callconv(.c) i32 {
@@ -1021,9 +1025,36 @@ pub export fn zir_compilation_invalidate_file(ctx: ?*ZirContext, name: [*:0]cons
     const file_opt = zcu.module_roots.get(target_mod) orelse return -1;
     const file_index = file_opt.unwrap() orelse return -1;
     const file = zcu.fileByIndex(file_index);
+    if (!file.zir_injected) return -1;
+    if (file.prev_zir != null and file.zir == null) {
+        file.zir_injected_invalidated = true;
+        return 0;
+    }
+    if (file.prev_zir == null and file.zir != null) return 0;
+    return -1;
+}
 
-    file.module_changed = true;
-    return 0;
+/// Validate that the synthetic root file is present in the current prepared
+/// update.
+///
+/// Zap injects root ZIR for executable entrypoint glue separately from the
+/// per-struct modules. It uses the same injected-file invalidation path as
+/// struct modules without pretending the root module identity changed.
+pub export fn zir_compilation_invalidate_root(ctx: ?*ZirContext) callconv(.c) i32 {
+    const c = ctx orelse return -1;
+    requireIncrementalContext(c, "zir_compilation_invalidate_root") catch return -2;
+    const zcu = c.compilation.zcu orelse return -1;
+
+    const file_opt = zcu.module_roots.get(c.root_mod) orelse return -1;
+    const file_index = file_opt.unwrap() orelse return -1;
+    const file = zcu.fileByIndex(file_index);
+    if (!file.zir_injected) return -1;
+    if (file.prev_zir != null and file.zir == null) {
+        file.zir_injected_invalidated = true;
+        return 0;
+    }
+    if (file.prev_zir == null and file.zir != null) return 0;
+    return -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -2287,6 +2318,13 @@ fn addStructSourceImpl(ctx: *ZirContext, name: []const u8, source: []const u8) !
             logErr("addStructSource: writeStreaming failed: {s}", .{@errorName(err)});
             return error.OutOfMemory;
         };
+    }
+
+    if (ctx.root_mod.deps.get(name)) |existing_mod| {
+        const zcu = ctx.compilation.zcu orelse return error.OutOfMemory;
+        const file_opt = zcu.module_roots.get(existing_mod) orelse return error.OutOfMemory;
+        _ = file_opt.unwrap() orelse return error.OutOfMemory;
+        return;
     }
 
     // Null-terminate the strings for the C-ABI add_struct path.
@@ -5905,6 +5943,16 @@ fn testOutputPath(allocator: Allocator, ctx: *ZirContext) ![:0]u8 {
     return path;
 }
 
+fn testFileSha256(allocator: Allocator, io: Io, file_path: []const u8) ![std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    const cwd = Dir.cwd();
+    const bytes = try cwd.readFileAlloc(io, file_path, allocator, .limited(64 * 1024 * 1024));
+    defer allocator.free(bytes);
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return digest;
+}
+
 test "zir_api: object compilation config is LLVM backed" {
     const io = std.testing.io;
     const resolved_result = try std.zig.system.resolveTargetQuery(io, .{});
@@ -6029,6 +6077,63 @@ test "zir_api: incremental create uses cache artifact output contract" {
     try std.testing.expect(std.mem.startsWith(u8, incremental_artifact_path, incremental_cache_prefix));
 }
 
+test "zir_api: add_struct_source reuses existing module registration" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = Dir.cwd();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "local-cache");
+    try tmp.dir.createDirPath(io, "global-cache");
+
+    const zig_lib_dir = try testRepoLibDir(allocator, io);
+    defer allocator.free(zig_lib_dir);
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const tmp_dir = try cwd.openDir(io, tmp_path, .{});
+    const orig_dir = try cwd.openDir(io, ".", .{});
+    try std.process.setCurrentDir(io, tmp_dir);
+    defer std.process.setCurrentDir(io, orig_dir) catch {};
+
+    const local_cache_dir = try std.fs.path.join(allocator, &.{ tmp_path, "local-cache" });
+    defer allocator.free(local_cache_dir);
+    const global_cache_dir = try std.fs.path.join(allocator, &.{ tmp_path, "global-cache" });
+    defer allocator.free(global_cache_dir);
+    const output_path = try std.fs.path.join(allocator, &.{ tmp_path, "add-struct-source" });
+    defer allocator.free(output_path);
+
+    const ctx = try createImpl(
+        zig_lib_dir,
+        local_cache_dir,
+        global_cache_dir,
+        output_path,
+        "zir_api_add_struct_source",
+        0,
+        1,
+        false,
+        true,
+        null,
+        null,
+        true,
+    );
+    defer zir_compilation_destroy(ctx);
+
+    try addStructSourceImpl(ctx, "Bool", "comptime {}\n");
+    const first_mod = ctx.root_mod.deps.get("Bool") orelse return error.MissingRoot;
+    const first_file = try testStructFile(ctx, "Bool");
+
+    try addStructSourceImpl(ctx, "Bool", "comptime {}\n");
+    const second_mod = ctx.root_mod.deps.get("Bool") orelse return error.MissingRoot;
+    const second_file = try testStructFile(ctx, "Bool");
+
+    try std.testing.expect(first_mod == second_mod);
+    try std.testing.expect(first_file == second_file);
+}
+
 test "zir_api: incremental update consumes injected prev_zir through updateZirRefs" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -6095,6 +6200,13 @@ test "zir_api: incremental update consumes injected prev_zir through updateZirRe
     const root_file_after_prepare = try testRootFile(ctx);
     try std.testing.expect(root_file_after_prepare.prev_zir != null);
     try std.testing.expect(root_file_after_prepare.zir == null);
+    try std.testing.expect(!root_file_after_prepare.module_changed);
+    try std.testing.expect(!root_file_after_prepare.zir_injected_invalidated);
+
+    try std.testing.expectEqual(@as(i32, 0), zir_compilation_invalidate_root(ctx));
+    const root_file_after_invalidate = try testRootFile(ctx);
+    try std.testing.expect(!root_file_after_invalidate.module_changed);
+    try std.testing.expect(root_file_after_invalidate.zir_injected_invalidated);
 
     {
         var builder = try zir_builder.Builder.init(allocator);
@@ -6110,6 +6222,209 @@ test "zir_api: incremental update consumes injected prev_zir through updateZirRe
     const root_file_after_update = try testRootFile(ctx);
     try std.testing.expect(root_file_after_update.prev_zir == null);
     try std.testing.expect(root_file_after_update.zir != null);
+    try std.testing.expect(!root_file_after_update.module_changed);
+    try std.testing.expect(!root_file_after_update.zir_injected_invalidated);
+}
+
+test "zir_api: selected injected update reanalyzes changed function bodies" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = Dir.cwd();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "local-cache");
+    try tmp.dir.createDirPath(io, "global-cache");
+
+    const zig_lib_dir = try testRepoLibDir(allocator, io);
+    defer allocator.free(zig_lib_dir);
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const tmp_dir = try cwd.openDir(io, tmp_path, .{});
+    const orig_dir = try cwd.openDir(io, ".", .{});
+    try std.process.setCurrentDir(io, tmp_dir);
+    defer std.process.setCurrentDir(io, orig_dir) catch {};
+
+    const local_cache_dir = try std.fs.path.join(allocator, &.{ tmp_path, "local-cache" });
+    defer allocator.free(local_cache_dir);
+    const global_cache_dir = try std.fs.path.join(allocator, &.{ tmp_path, "global-cache" });
+    defer allocator.free(global_cache_dir);
+    const requested_output_path = try std.fs.path.join(allocator, &.{ tmp_path, "incremental-reanalyze-output" });
+    defer allocator.free(requested_output_path);
+
+    const ctx = try createImpl(
+        zig_lib_dir,
+        local_cache_dir,
+        global_cache_dir,
+        requested_output_path,
+        "zir_api_incremental_reanalyze",
+        0,
+        1,
+        false,
+        true,
+        null,
+        null,
+        true,
+    );
+    defer zir_compilation_destroy(ctx);
+
+    try addStructSourceImpl(ctx, "zap_runtime", "pub fn noop() void {}\n");
+    try addStructSourceImpl(ctx, "Subject", "pub fn value() u8 { return 1; }\n");
+
+    {
+        var builder = try zir_builder.Builder.init(allocator);
+        defer builder.deinit();
+        const body = try builder.beginFunction("value", .u8_type);
+        const one = try body.addInt(1);
+        try body.addRetNode(one);
+        try builder.endFunction(body);
+        const fzir = try builder.finalize();
+        try addStructZirFromFinalized(ctx, "Subject", fzir);
+    }
+
+    {
+        var builder = try zir_builder.Builder.init(allocator);
+        defer builder.deinit();
+        const body = try builder.beginFunction("main", .u8_type);
+        const subject_import = try body.addImport("Subject");
+        const value_ref = try body.addFieldPtrLoad(subject_import, "value");
+        const value = try body.addCallRef(value_ref, &.{});
+        try body.addRetNode(value);
+        try builder.endFunction(body);
+        const fzir = try builder.finalize();
+        try addZirFromFinalized(ctx, fzir);
+    }
+
+    try std.testing.expectEqual(@as(i32, 0), zir_compilation_update(ctx));
+
+    const selected_names = [_][*]const u8{"Subject".ptr};
+    const selected_lens = [_]usize{"Subject".len};
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        zir_compilation_prepare_update_selected(ctx, selected_names[0..].ptr, selected_lens[0..].ptr, selected_names.len, false),
+    );
+    try std.testing.expectEqual(@as(i32, 0), zir_compilation_invalidate_file(ctx, "Subject"));
+
+    {
+        var builder = try zir_builder.Builder.init(allocator);
+        defer builder.deinit();
+        const body = try builder.beginFunction("value", .u8_type);
+        const invalid_return_value = body.addBoolTrue();
+        try body.addRetNode(invalid_return_value);
+        try builder.endFunction(body);
+        const fzir = try builder.finalize();
+        try addStructZirFromFinalized(ctx, "Subject", fzir);
+    }
+
+    try std.testing.expect(zir_compilation_update(ctx) != 0);
+}
+
+test "zir_api: incremental MachO LLVM relink refreshes executable artifact" {
+    if (builtin.object_format != .macho or !build_options.have_llvm) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cwd = Dir.cwd();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "local-cache");
+    try tmp.dir.createDirPath(io, "global-cache");
+
+    const zig_lib_dir = try testRepoLibDir(allocator, io);
+    defer allocator.free(zig_lib_dir);
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const tmp_dir = try cwd.openDir(io, tmp_path, .{});
+    const orig_dir = try cwd.openDir(io, ".", .{});
+    try std.process.setCurrentDir(io, tmp_dir);
+    defer std.process.setCurrentDir(io, orig_dir) catch {};
+
+    const local_cache_dir = try std.fs.path.join(allocator, &.{ tmp_path, "local-cache" });
+    defer allocator.free(local_cache_dir);
+    const global_cache_dir = try std.fs.path.join(allocator, &.{ tmp_path, "global-cache" });
+    defer allocator.free(global_cache_dir);
+    const requested_output_path = try std.fs.path.join(allocator, &.{ tmp_path, "incremental-relink-output" });
+    defer allocator.free(requested_output_path);
+
+    const ctx = try createImpl(
+        zig_lib_dir,
+        local_cache_dir,
+        global_cache_dir,
+        requested_output_path,
+        "zir_api_incremental_relink",
+        0,
+        0,
+        false,
+        true,
+        null,
+        null,
+        true,
+    );
+    defer zir_compilation_destroy(ctx);
+
+    try addStructSourceImpl(ctx, "zap_runtime", "pub fn noop() void {}\n");
+    try addStructSourceImpl(ctx, "Subject", "pub fn value() i64 { return 1; }\n");
+
+    {
+        var builder = try zir_builder.Builder.init(allocator);
+        defer builder.deinit();
+        const body = try builder.beginFunction("value", .i64_type);
+        const one = try body.addInt(1);
+        try body.addRetNode(one);
+        try builder.endFunction(body);
+        const fzir = try builder.finalize();
+        try addStructZirFromFinalized(ctx, "Subject", fzir);
+    }
+
+    {
+        var builder = try zir_builder.Builder.init(allocator);
+        defer builder.deinit();
+        const body = try builder.beginFunction("main", .void);
+        const subject_import = try body.addImport("Subject");
+        const value_ref = try body.addFieldPtrLoad(subject_import, "value");
+        _ = try body.addCallRef(value_ref, &.{});
+        try body.addRetImplicit();
+        try builder.endFunction(body);
+        const fzir = try builder.finalize();
+        try addZirFromFinalized(ctx, fzir);
+    }
+
+    try std.testing.expectEqual(@as(i32, 0), zir_compilation_update(ctx));
+    const artifact_path = try testOutputPath(allocator, ctx);
+    defer allocator.free(artifact_path);
+    const first_digest = try testFileSha256(allocator, io, artifact_path);
+
+    const selected_names = [_][*]const u8{"Subject".ptr};
+    const selected_lens = [_]usize{"Subject".len};
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        zir_compilation_prepare_update_selected(ctx, selected_names[0..].ptr, selected_lens[0..].ptr, selected_names.len, false),
+    );
+    try std.testing.expectEqual(@as(i32, 0), zir_compilation_invalidate_file(ctx, "Subject"));
+
+    {
+        var builder = try zir_builder.Builder.init(allocator);
+        defer builder.deinit();
+        const body = try builder.beginFunction("value", .i64_type);
+        const two = try body.addInt(2);
+        try body.addRetNode(two);
+        try builder.endFunction(body);
+        const fzir = try builder.finalize();
+        try addStructZirFromFinalized(ctx, "Subject", fzir);
+    }
+
+    try std.testing.expectEqual(@as(i32, 0), zir_compilation_update(ctx));
+    const second_artifact_path = try testOutputPath(allocator, ctx);
+    defer allocator.free(second_artifact_path);
+    const second_digest = try testFileSha256(allocator, io, second_artifact_path);
+    try std.testing.expect(!mem.eql(u8, first_digest[0..], second_digest[0..]));
 }
 
 test "zir_api: selected update finalizes unused injected module prev_zir" {
@@ -6190,6 +6505,13 @@ test "zir_api: selected update finalizes unused injected module prev_zir" {
     const unused_file_after_prepare = try testStructFile(ctx, "UnusedStruct");
     try std.testing.expect(unused_file_after_prepare.prev_zir != null);
     try std.testing.expect(unused_file_after_prepare.zir == null);
+    try std.testing.expect(!unused_file_after_prepare.module_changed);
+    try std.testing.expect(!unused_file_after_prepare.zir_injected_invalidated);
+
+    try std.testing.expectEqual(@as(i32, 0), zir_compilation_invalidate_file(ctx, "UnusedStruct"));
+    const unused_file_after_invalidate = try testStructFile(ctx, "UnusedStruct");
+    try std.testing.expect(!unused_file_after_invalidate.module_changed);
+    try std.testing.expect(unused_file_after_invalidate.zir_injected_invalidated);
 
     {
         var builder = try zir_builder.Builder.init(allocator);
@@ -6206,6 +6528,8 @@ test "zir_api: selected update finalizes unused injected module prev_zir" {
     const unused_file_after_update = try testStructFile(ctx, "UnusedStruct");
     try std.testing.expect(unused_file_after_update.prev_zir == null);
     try std.testing.expect(unused_file_after_update.zir != null);
+    try std.testing.expect(!unused_file_after_update.module_changed);
+    try std.testing.expect(!unused_file_after_update.zir_injected_invalidated);
 
     try std.testing.expectEqual(
         @as(i32, 0),
@@ -6286,12 +6610,15 @@ test "zir_api: abort update restores prepared ZIR before update" {
     const root_file_after_replacement = try testRootFile(ctx);
     try std.testing.expect(root_file_after_replacement.prev_zir != null);
     try std.testing.expect(root_file_after_replacement.zir != null);
+    try std.testing.expect(!root_file_after_replacement.module_changed);
+    try std.testing.expect(!root_file_after_replacement.zir_injected_invalidated);
 
     try std.testing.expectEqual(@as(i32, 0), zir_compilation_abort_update(ctx));
     const root_file_after_abort = try testRootFile(ctx);
     try std.testing.expect(root_file_after_abort.prev_zir == null);
     try std.testing.expect(root_file_after_abort.zir != null);
     try std.testing.expect(!root_file_after_abort.module_changed);
+    try std.testing.expect(!root_file_after_abort.zir_injected_invalidated);
     try std.testing.expect(!root_file_after_abort.zoir_invalidated);
     try std.testing.expectEqual(@as(i32, 0), zir_compilation_update(ctx));
 }

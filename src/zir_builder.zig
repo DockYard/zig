@@ -3,6 +3,169 @@ const Zir = std.zig.Zir;
 const Ast = std.zig.Ast;
 const Allocator = std.mem.Allocator;
 
+fn hashU8(hasher: *std.zig.SrcHasher, value: u8) void {
+    hasher.update(&.{value});
+}
+
+fn hashU32(hasher: *std.zig.SrcHasher, value: u32) void {
+    var bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &bytes, value, .little);
+    hasher.update(&bytes);
+}
+
+fn hashI32(hasher: *std.zig.SrcHasher, value: i32) void {
+    hashU32(hasher, @bitCast(value));
+}
+
+fn hashU64(hasher: *std.zig.SrcHasher, value: u64) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, value, .little);
+    hasher.update(&bytes);
+}
+
+fn hashBytes(hasher: *std.zig.SrcHasher, bytes: []const u8) void {
+    hashU32(hasher, @intCast(bytes.len));
+    hasher.update(bytes);
+}
+
+fn hashU32Slice(hasher: *std.zig.SrcHasher, values: []const u32) void {
+    hashU32(hasher, @intCast(values.len));
+    for (values) |value| hashU32(hasher, value);
+}
+
+fn appendSrcHash(extra: *std.ArrayListUnmanaged(u32), allocator: Allocator, hash: std.zig.SrcHash) !void {
+    const words: [4]u32 = @bitCast(hash);
+    try extra.appendSlice(allocator, &words);
+}
+
+fn finishSrcHash(hasher: *std.zig.SrcHasher) std.zig.SrcHash {
+    var hash: std.zig.SrcHash = undefined;
+    hasher.final(&hash);
+    return hash;
+}
+
+fn hashRef(hasher: *std.zig.SrcHasher, ref: Zir.Inst.Ref) void {
+    hashU32(hasher, @intFromEnum(ref));
+}
+
+fn hashInstIndex(hasher: *std.zig.SrcHasher, index: Zir.Inst.Index) void {
+    hashU32(hasher, @intFromEnum(index));
+}
+
+fn hashNodeOffset(hasher: *std.zig.SrcHasher, offset: Ast.Node.Offset) void {
+    hashI32(hasher, @intFromEnum(offset));
+}
+
+fn hashTokenOffset(hasher: *std.zig.SrcHasher, offset: Ast.TokenOffset) void {
+    hashI32(hasher, @intFromEnum(offset));
+}
+
+fn hashInstData(hasher: *std.zig.SrcHasher, tag: Zir.Inst.Tag, data: Zir.Inst.Data) void {
+    hashU8(hasher, @intFromEnum(tag));
+    switch (Zir.Inst.Tag.data_tags[@intFromEnum(tag)]) {
+        .extended => {
+            hashU32(hasher, @intFromEnum(data.extended.opcode));
+            hashU32(hasher, data.extended.small);
+            hashU32(hasher, data.extended.operand);
+        },
+        .un_node => {
+            hashNodeOffset(hasher, data.un_node.src_node);
+            hashRef(hasher, data.un_node.operand);
+        },
+        .un_tok => {
+            hashTokenOffset(hasher, data.un_tok.src_tok);
+            hashRef(hasher, data.un_tok.operand);
+        },
+        .pl_node => {
+            hashNodeOffset(hasher, data.pl_node.src_node);
+            hashU32(hasher, data.pl_node.payload_index);
+        },
+        .pl_tok => {
+            hashTokenOffset(hasher, data.pl_tok.src_tok);
+            hashU32(hasher, data.pl_tok.payload_index);
+        },
+        .bin => {
+            hashRef(hasher, data.bin.lhs);
+            hashRef(hasher, data.bin.rhs);
+        },
+        .str => {
+            hashU32(hasher, @intFromEnum(data.str.start));
+            hashU32(hasher, data.str.len);
+        },
+        .str_tok => {
+            hashU32(hasher, @intFromEnum(data.str_tok.start));
+            hashTokenOffset(hasher, data.str_tok.src_tok);
+        },
+        .tok => hashTokenOffset(hasher, data.tok),
+        .node => hashNodeOffset(hasher, data.node),
+        .int => hashU64(hasher, data.int),
+        .float => hashU64(hasher, @bitCast(data.float)),
+        .ptr_type => {
+            hashU8(hasher, @bitCast(data.ptr_type.flags));
+            hashU32(hasher, @intFromEnum(data.ptr_type.size));
+            hashU32(hasher, data.ptr_type.payload_index);
+        },
+        .int_type => {
+            hashNodeOffset(hasher, data.int_type.src_node);
+            hashU32(hasher, @intFromEnum(data.int_type.signedness));
+            hashU32(hasher, data.int_type.bit_count);
+        },
+        .@"unreachable" => hashNodeOffset(hasher, data.@"unreachable".src_node),
+        .@"break" => {
+            hashRef(hasher, data.@"break".operand);
+            hashU32(hasher, data.@"break".payload_index);
+        },
+        .dbg_stmt => {
+            hashU32(hasher, data.dbg_stmt.line);
+            hashU32(hasher, data.dbg_stmt.column);
+        },
+        .inst_node => {
+            hashNodeOffset(hasher, data.inst_node.src_node);
+            hashInstIndex(hasher, data.inst_node.inst);
+        },
+        .str_op => {
+            hashU32(hasher, @intFromEnum(data.str_op.str));
+            hashRef(hasher, data.str_op.operand);
+        },
+        .@"defer" => {
+            hashU32(hasher, data.@"defer".index);
+            hashU32(hasher, data.@"defer".len);
+        },
+        .defer_err_code => {
+            hashRef(hasher, data.defer_err_code.err_code);
+            hashU32(hasher, data.defer_err_code.payload_index);
+        },
+        .save_err_ret_index => hashRef(hasher, data.save_err_ret_index.operand),
+        .elem_val_imm => {
+            hashRef(hasher, data.elem_val_imm.operand);
+            hashU32(hasher, data.elem_val_imm.idx);
+        },
+        .declaration => {
+            hashU32(hasher, @intFromEnum(data.declaration.src_node));
+            hashU32(hasher, data.declaration.payload_index);
+        },
+    }
+}
+
+fn hashInstRange(
+    hasher: *std.zig.SrcHasher,
+    tags: []const u8,
+    data: []const Zir.Inst.Data,
+) void {
+    hashU32(hasher, @intCast(tags.len));
+    for (tags, data) |tag_byte, inst_data| {
+        const tag: Zir.Inst.Tag = @enumFromInt(tag_byte);
+        hashInstData(hasher, tag, inst_data);
+    }
+}
+
+fn hashWordsAreZero(words: []const u32) bool {
+    for (words) |word| {
+        if (word != 0) return false;
+    }
+    return true;
+}
+
 /// Numeric field names for tuple struct fields ("0", "1", "2", ...).
 const index_field_names = [_][]const u8{
     "0", "1", "2",  "3",  "4",  "5",  "6",  "7",
@@ -293,6 +456,135 @@ pub const Builder = struct {
         return index;
     }
 
+    fn syntheticFunctionHash(
+        self: *const Builder,
+        body: *const FuncBody,
+        extra_end: usize,
+        instruction_end: usize,
+    ) std.zig.SrcHash {
+        var hasher = std.zig.SrcHasher.init(.{});
+        hasher.update("zap-zir-function-v1");
+        hashBytes(&hasher, body.name);
+        hashU32(&hasher, body.decl_inst);
+        hashU32(&hasher, @intFromEnum(body.ret_type));
+        hashU32(&hasher, @intFromBool(body.has_explicit_return));
+        hashU32(&hasher, @intFromBool(body.is_generic_return));
+        hashU32Slice(&hasher, body.param_inst_indices.items);
+        hashU32Slice(&hasher, body.body_inst_indices.items);
+        hashU32(&hasher, body.error_union_ret_type_inst orelse std.math.maxInt(u32));
+        hashU32(&hasher, body.optional_ret_type_inst orelse std.math.maxInt(u32));
+        hashU32(&hasher, body.imported_ret_type_inst orelse std.math.maxInt(u32));
+        hashU32(&hasher, body.imported_ret_import_inst orelse std.math.maxInt(u32));
+        hashU32(&hasher, body.union_ret_type_inst orelse std.math.maxInt(u32));
+        hashU32(&hasher, body.tuple_ret_type_inst orelse std.math.maxInt(u32));
+        hashU32(&hasher, body.decl_val_ret_type_inst orelse std.math.maxInt(u32));
+        hashU32(&hasher, body.custom_ret_type_result orelse std.math.maxInt(u32));
+        hashU32Slice(&hasher, body.custom_ret_type_body.items);
+        for (body.tuple_ret_types.items) |ref| hashU32(&hasher, @intFromEnum(ref));
+        for (body.tuple_element_type_refs.items) |ref| hashU32(&hasher, @intFromEnum(ref));
+
+        const inst_start: usize = @min(@as(usize, body.decl_inst + 1), instruction_end);
+        hashInstRange(&hasher, self.tags.items[inst_start..instruction_end], self.data.items[inst_start..instruction_end]);
+
+        const extra_start: usize = @min(body.extra_start, extra_end);
+        hashU32Slice(&hasher, self.extra.items[extra_start..extra_end]);
+
+        const string_start: usize = @min(body.string_start, self.string_bytes.items.len);
+        hashBytes(&hasher, self.string_bytes.items[string_start..]);
+
+        return finishSrcHash(&hasher);
+    }
+
+    fn hashInstructionIndices(self: *const Builder, hasher: *std.zig.SrcHasher, indices: []const u32) void {
+        hashU32(hasher, @intCast(indices.len));
+        for (indices) |index| {
+            hashU32(hasher, index);
+            if (index >= self.tags.items.len) continue;
+            const tag: Zir.Inst.Tag = @enumFromInt(self.tags.items[index]);
+            hashInstData(hasher, tag, self.data.items[index]);
+        }
+    }
+
+    fn syntheticRootStructFieldsHash(
+        self: *const Builder,
+        body_lens: []const u32,
+        body_insts: []const u32,
+    ) std.zig.SrcHash {
+        var hasher = std.zig.SrcHasher.init(.{});
+        hasher.update("zap-zir-root-struct-fields-v1");
+        hashU32(&hasher, @intCast(self.root_fields.items.len));
+        for (self.root_fields.items) |field| {
+            hashBytes(&hasher, field.name);
+            switch (field.body) {
+                .static_ref => |type_ref| {
+                    hashU8(&hasher, 0);
+                    hashRef(&hasher, type_ref);
+                },
+                .recorded => |recorded| {
+                    hashU8(&hasher, 1);
+                    hashRef(&hasher, recorded.final_ref);
+                    self.hashInstructionIndices(&hasher, recorded.instructions);
+                },
+            }
+        }
+        hashU32Slice(&hasher, body_lens);
+        self.hashInstructionIndices(&hasher, body_insts);
+        return finishSrcHash(&hasher);
+    }
+
+    fn syntheticStructFieldsHash(
+        self: *const Builder,
+        label: []const u8,
+        name: []const u8,
+        field_names: []const []const u8,
+        field_type_refs: []const Zir.Inst.Ref,
+        field_default_refs: ?[]const Zir.Inst.Ref,
+        decl_indices: []const u32,
+    ) std.zig.SrcHash {
+        var hasher = std.zig.SrcHasher.init(.{});
+        hasher.update(label);
+        hashBytes(&hasher, name);
+        hashU32(&hasher, @intCast(field_names.len));
+        for (field_names, field_type_refs) |field_name, type_ref| {
+            hashBytes(&hasher, field_name);
+            hashRef(&hasher, type_ref);
+        }
+        if (field_default_refs) |defaults| {
+            hashU8(&hasher, 1);
+            for (defaults) |default_ref| hashRef(&hasher, default_ref);
+        } else {
+            hashU8(&hasher, 0);
+        }
+        self.hashInstructionIndices(&hasher, decl_indices);
+        return finishSrcHash(&hasher);
+    }
+
+    fn syntheticEnumFieldsHash(
+        name: []const u8,
+        variant_names: []const []const u8,
+    ) std.zig.SrcHash {
+        var hasher = std.zig.SrcHasher.init(.{});
+        hasher.update("zap-zir-enum-fields-v1");
+        hashBytes(&hasher, name);
+        hashU32(&hasher, @intCast(variant_names.len));
+        for (variant_names) |variant_name| hashBytes(&hasher, variant_name);
+        return finishSrcHash(&hasher);
+    }
+
+    fn syntheticUnionFieldsHash(
+        variant_names: []const []const u8,
+        variant_types: []const Zir.Inst.Ref,
+    ) std.zig.SrcHash {
+        var hasher = std.zig.SrcHasher.init(.{});
+        hasher.update("zap-zir-union-fields-v1");
+        hashU32(&hasher, @intCast(variant_names.len));
+        for (variant_names, variant_types) |variant_name, variant_type| {
+            hashBytes(&hasher, variant_name);
+            hashRef(&hasher, variant_type);
+        }
+        return finishSrcHash(&hasher);
+    }
+
     /// Begin building a function. Returns a FuncBody for adding body instructions.
     ///
     /// The approach: we emit the declaration instruction immediately as a placeholder,
@@ -321,6 +613,8 @@ pub const Builder = struct {
             .restore_inst = restore_inst,
             .has_explicit_return = false,
             .ret_type = ret_type,
+            .extra_start = self.extra.items.len,
+            .string_start = self.string_bytes.items.len,
         };
 
         // Track restore_err_ret as first body instruction
@@ -517,11 +811,17 @@ pub const Builder = struct {
         try self.extra.append(self.gpa, 0);
         try self.extra.append(self.gpa, 0);
 
-        // proto_hash (4 u32s, all zero for synthetic ZIR)
-        try self.extra.append(self.gpa, 0);
-        try self.extra.append(self.gpa, 0);
-        try self.extra.append(self.gpa, 0);
-        try self.extra.append(self.gpa, 0);
+        const function_hash = self.syntheticFunctionHash(
+            body,
+            self.extra.items.len,
+            self.tags.items.len,
+        );
+
+        // Synthetic source hash. Zig's incremental pipeline compares
+        // associated source hashes to decide which analyzed units are
+        // outdated. Zap injects ZIR directly, so the generated ZIR content
+        // is the source of truth here rather than Zig source text.
+        try appendSrcHash(&self.extra, self.gpa, function_hash);
 
         // Emit func instruction
         const func_inst = try self.addInst(.func, encodePlNode(.zero, func_payload_idx));
@@ -539,11 +839,7 @@ pub const Builder = struct {
         // Build Declaration payload in extra
         const decl_payload_idx: u32 = @intCast(self.extra.items.len);
 
-        // src_hash (4 u32s, all zero)
-        try self.extra.append(self.gpa, 0);
-        try self.extra.append(self.gpa, 0);
-        try self.extra.append(self.gpa, 0);
-        try self.extra.append(self.gpa, 0);
+        try appendSrcHash(&self.extra, self.gpa, function_hash);
 
         // flags (packed u64 as 2 u32s)
         // Flags packed struct(u64): src_line: u30, src_column: u29, id: Id(u5)
@@ -660,12 +956,13 @@ pub const Builder = struct {
 
         // Build StructDecl payload in extra
         const struct_payload_idx: u32 = @intCast(self.extra.items.len);
+        const fields_hash = self.syntheticRootStructFieldsHash(
+            per_field_body_lens.items,
+            per_field_body_insts.items,
+        );
 
-        // fields_hash (4 u32s, all zero)
-        try self.extra.append(self.gpa, 0);
-        try self.extra.append(self.gpa, 0);
-        try self.extra.append(self.gpa, 0);
-        try self.extra.append(self.gpa, 0);
+        // Synthetic fields hash for Zig incremental namespace/type invalidation.
+        try appendSrcHash(&self.extra, self.gpa, fields_hash);
 
         // src_line
         try self.extra.append(self.gpa, 0);
@@ -897,12 +1194,17 @@ pub const Builder = struct {
 
         // Emit struct_decl extended instruction
         const struct_payload_idx: u32 = @intCast(self.extra.items.len);
+        const fields_hash = self.syntheticStructFieldsHash(
+            "zap-zir-nested-struct-fields-v1",
+            name,
+            field_names,
+            field_type_refs,
+            null,
+            struct_decl_indices.items,
+        );
 
         // StructDecl fixed payload: fields_hash (4), src_line, src_node
-        try self.extra.append(self.gpa, 0);
-        try self.extra.append(self.gpa, 0);
-        try self.extra.append(self.gpa, 0);
-        try self.extra.append(self.gpa, 0);
+        try appendSrcHash(&self.extra, self.gpa, fields_hash);
         try self.extra.append(self.gpa, 0); // src_line
         try self.extra.append(self.gpa, 0); // src_node
 
@@ -967,11 +1269,9 @@ pub const Builder = struct {
         // Build Declaration payload
         const decl_payload_idx: u32 = @intCast(self.extra.items.len);
 
-        // src_hash (4 u32s, all zero)
-        try self.extra.append(self.gpa, 0);
-        try self.extra.append(self.gpa, 0);
-        try self.extra.append(self.gpa, 0);
-        try self.extra.append(self.gpa, 0);
+        // Declaration source hash mirrors the struct fields hash so the
+        // enclosing Nav is invalidated when this synthetic type changes.
+        try appendSrcHash(&self.extra, self.gpa, fields_hash);
 
         // flags: pub_const_simple = id 7 (top 5 bits of u64)
         try self.extra.append(self.gpa, 0);
@@ -1070,12 +1370,17 @@ pub const Builder = struct {
 
         // Emit struct_decl extended instruction
         const struct_payload_idx: u32 = @intCast(self.extra.items.len);
+        const fields_hash = self.syntheticStructFieldsHash(
+            "zap-zir-struct-type-fields-v1",
+            name,
+            field_names,
+            field_type_refs,
+            field_default_refs,
+            &.{},
+        );
 
         // StructDecl fixed payload: fields_hash (4), src_line, src_node
-        try self.extra.append(self.gpa, 0);
-        try self.extra.append(self.gpa, 0);
-        try self.extra.append(self.gpa, 0);
-        try self.extra.append(self.gpa, 0);
+        try appendSrcHash(&self.extra, self.gpa, fields_hash);
         try self.extra.append(self.gpa, 0); // src_line
         try self.extra.append(self.gpa, 0); // src_node
 
@@ -1140,11 +1445,9 @@ pub const Builder = struct {
         // Build Declaration payload
         const decl_payload_idx: u32 = @intCast(self.extra.items.len);
 
-        // src_hash (4 u32s, all zero)
-        try self.extra.append(self.gpa, 0);
-        try self.extra.append(self.gpa, 0);
-        try self.extra.append(self.gpa, 0);
-        try self.extra.append(self.gpa, 0);
+        // Declaration source hash mirrors the struct fields hash so the
+        // enclosing Nav is invalidated when this synthetic type changes.
+        try appendSrcHash(&self.extra, self.gpa, fields_hash);
 
         // flags: pub_const_simple = id 7 (top 5 bits of u64)
         try self.extra.append(self.gpa, 0);
@@ -1184,12 +1487,10 @@ pub const Builder = struct {
 
         // Emit enum_decl extended instruction
         const enum_payload_idx: u32 = @intCast(self.extra.items.len);
+        const fields_hash = syntheticEnumFieldsHash(name, variant_names);
 
         // EnumDecl fixed payload: fields_hash (4), src_line, src_node
-        try self.extra.append(self.gpa, 0); // fields_hash_0
-        try self.extra.append(self.gpa, 0); // fields_hash_1
-        try self.extra.append(self.gpa, 0); // fields_hash_2
-        try self.extra.append(self.gpa, 0); // fields_hash_3
+        try appendSrcHash(&self.extra, self.gpa, fields_hash);
         try self.extra.append(self.gpa, 0); // src_line
         try self.extra.append(self.gpa, 0); // src_node
 
@@ -1221,11 +1522,9 @@ pub const Builder = struct {
         // Build Declaration payload
         const decl_payload_idx: u32 = @intCast(self.extra.items.len);
 
-        // src_hash (4 u32s, all zero)
-        try self.extra.append(self.gpa, 0);
-        try self.extra.append(self.gpa, 0);
-        try self.extra.append(self.gpa, 0);
-        try self.extra.append(self.gpa, 0);
+        // Declaration source hash mirrors the enum fields hash so the
+        // enclosing Nav is invalidated when this synthetic type changes.
+        try appendSrcHash(&self.extra, self.gpa, fields_hash);
 
         // flags: pub_const_simple = id 7 (top 5 bits of u64)
         try self.extra.append(self.gpa, 0);
@@ -1365,6 +1664,10 @@ pub const FuncBody = struct {
     /// it for the AstGen-compatible `dbg_stmt` immediately before `.call`.
     debug_line: u32 = 0,
     debug_column: u32 = 0,
+    /// Starting offsets for the synthetic source hash that backs Zig's
+    /// incremental invalidation for injected function declarations.
+    extra_start: usize = 0,
+    string_start: usize = 0,
 
     /// When non-null AND body_tracking is false, "would-be body" instruction
     /// indices are captured here instead of being discarded. This lets callers
@@ -2939,10 +3242,8 @@ pub const FuncBody = struct {
 
         // --- UnionDecl fixed payload (6 u32s) ---
         const union_payload_idx: u32 = @intCast(b.extra.items.len);
-        try b.extra.append(b.gpa, 0); // fields_hash_0
-        try b.extra.append(b.gpa, 0); // fields_hash_1
-        try b.extra.append(b.gpa, 0); // fields_hash_2
-        try b.extra.append(b.gpa, 0); // fields_hash_3
+        const fields_hash = Builder.syntheticUnionFieldsHash(variant_names, variant_types);
+        try appendSrcHash(&b.extra, b.gpa, fields_hash);
         try b.extra.append(b.gpa, 0); // src_line = 0
         try b.extra.append(b.gpa, 0); // src_node = 0
 
@@ -3909,11 +4210,8 @@ test "Builder: void main produces valid ZIR" {
     try std.testing.expectEqual(@as(u32, 1), result.extra[15]);
 
     // Declaration payload at extra[16]
-    // extra[16..19] = src_hash = all zeros
-    try std.testing.expectEqual(@as(u32, 0), result.extra[16]);
-    try std.testing.expectEqual(@as(u32, 0), result.extra[17]);
-    try std.testing.expectEqual(@as(u32, 0), result.extra[18]);
-    try std.testing.expectEqual(@as(u32, 0), result.extra[19]);
+    // extra[16..19] = synthetic src_hash
+    try std.testing.expect(!hashWordsAreZero(result.extra[16..20]));
     // extra[20] = flags_0 = 0
     try std.testing.expectEqual(@as(u32, 0), result.extra[20]);
     // extra[21] = flags_1 = 0x38000000 (pub_const_simple)
@@ -3928,8 +4226,8 @@ test "Builder: void main produces valid ZIR" {
     try std.testing.expectEqual(@as(u32, 5), result.extra[25]);
 
     // StructDecl payload at extra[26]
-    // extra[26..29] = fields_hash = all zeros
-    try std.testing.expectEqual(@as(u32, 0), result.extra[26]);
+    // extra[26..29] = synthetic fields_hash
+    try std.testing.expect(!hashWordsAreZero(result.extra[26..30]));
     // extra[30] = src_line = 0
     try std.testing.expectEqual(@as(u32, 0), result.extra[30]);
     // extra[31] = src_node = 0
@@ -4240,10 +4538,7 @@ test "Builder: function with i64 return type" {
     try std.testing.expectEqual(@as(u32, 0), result.extra[11]);
 
     // proto_hash at extra[12..15]
-    try std.testing.expectEqual(@as(u32, 0), result.extra[12]);
-    try std.testing.expectEqual(@as(u32, 0), result.extra[13]);
-    try std.testing.expectEqual(@as(u32, 0), result.extra[14]);
-    try std.testing.expectEqual(@as(u32, 0), result.extra[15]);
+    try std.testing.expect(!hashWordsAreZero(result.extra[12..16]));
 
     // Break payload at extra[16] (shifted by 1 compared to void case due to ret type Ref)
     try std.testing.expectEqual(@as(u32, 0x7FFFFFFF), result.extra[16]);
