@@ -2312,6 +2312,33 @@ pub const FuncBody = struct {
         } });
     }
 
+    /// Add a debug variable record (named local binding) for DWARF
+    /// `.debug_info`. `tag` selects between `.dbg_var_val` (the operand
+    /// is the local's value) and `.dbg_var_ptr` (the operand is a
+    /// pointer to the local). `name` is the source identifier — it is
+    /// interned into the builder's string table here so callers can
+    /// pass a transient slice. `operand` is the ZIR Ref of the local
+    /// being named.
+    ///
+    /// AstGen's equivalent helper (`GenZir.addDbgVar` in
+    /// `lib/std/zig/AstGen.zig`) emits these instructions for every
+    /// `var`/`const` declaration in normal Zig source. The Zap ZIR
+    /// builder uses this helper from the C-ABI export so Zap-named
+    /// locals show up under their Zap identifiers in debuggers.
+    pub fn addDbgVar(
+        self: *FuncBody,
+        tag: Zir.Inst.Tag,
+        name: []const u8,
+        operand: Zir.Inst.Ref,
+    ) !void {
+        std.debug.assert(tag == .dbg_var_val or tag == .dbg_var_ptr);
+        const name_idx = try self.builder.internString(name);
+        try self.emitBodyInstVoid(tag, .{ .str_op = .{
+            .str = @enumFromInt(name_idx),
+            .operand = operand,
+        } });
+    }
+
     /// Add explicit ret_node (return with a value).
     pub fn addRetNode(self: *FuncBody, operand: Zir.Inst.Ref) !void {
         try self.emitBodyInstVoid(.ret_node, Builder.encodeUnNode(.zero, operand));

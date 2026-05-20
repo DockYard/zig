@@ -3612,6 +3612,49 @@ pub export fn zir_builder_emit_dbg_stmt(
     return 0;
 }
 
+/// Emit a `dbg_var_val` ZIR instruction marking a named local binding
+/// whose `operand` is the local's *value*. The `name_ptr`/`name_len`
+/// pair carries the Zap source identifier (slice, not null-terminated;
+/// this function interns its own copy). Returns 0 on success, -1 on
+/// error.
+///
+/// The Zig fork's Sema preserves the name into AIR (`dbg_var_val`),
+/// and the LLVM backend writes a DWARF `.debug_info` local-variable
+/// record, so debuggers display the Zap name instead of a synthetic
+/// IR slot id.
+pub export fn zir_builder_emit_dbg_var_val(
+    handle: ?*ZirBuilderHandle,
+    name_ptr: [*]const u8,
+    name_len: u32,
+    operand: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    const name = name_ptr[0..name_len];
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    body.addDbgVar(.dbg_var_val, name, operand_ref) catch return -1;
+    return 0;
+}
+
+/// Emit a `dbg_var_ptr` ZIR instruction marking a named local binding
+/// whose `operand` is a *pointer* to the local. Identical contract to
+/// `zir_builder_emit_dbg_var_val` otherwise — exposed for symmetry
+/// with Zig's two DWARF flavors so Zap can lower pointer-bound locals
+/// (e.g. mutable slots, aliased borrows) correctly.
+pub export fn zir_builder_emit_dbg_var_ptr(
+    handle: ?*ZirBuilderHandle,
+    name_ptr: [*]const u8,
+    name_len: u32,
+    operand: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    const name = name_ptr[0..name_len];
+    const operand_ref: Zir.Inst.Ref = @enumFromInt(operand);
+    body.addDbgVar(.dbg_var_ptr, name, operand_ref) catch return -1;
+    return 0;
+}
+
 /// Emit @TypeOf(operand). Returns `@intFromEnum(Ref)` or `0xFFFFFFFF` on error.
 pub export fn zir_builder_emit_typeof(handle: ?*ZirBuilderHandle, operand: u32) callconv(.c) u32 {
     const b = getBuilder(handle) orelse return 0xFFFFFFFF;
