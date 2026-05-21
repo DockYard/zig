@@ -2328,6 +2328,27 @@ pub const FuncBody = struct {
         field_name: Zir.Inst.Ref,
         init_value: Zir.Inst.Ref,
     ) !Zir.Inst.Ref {
+        // Mirror AstGen's `@unionInit` lowering (`unionInit` in
+        // `lib/std/zig/AstGen.zig`): emit a `field_type_ref` to the
+        // variant's payload type BEFORE `union_init` so Sema's
+        // `zirUnionInit` finds `union_ty.assertHasLayout` satisfied.
+        // Sema reads the field-type result for type information
+        // about the payload coercion target — without it, an
+        // externally-imported union (file `Option_i64.zig` with
+        // `pub const Option_i64 = union(enum) { ... }`) reaches
+        // `union_init` unlaid-out and the assertion trips.
+        //
+        // The field-type instruction's Ref is intentionally
+        // discarded: the union_init payload doesn't read it back.
+        // The instruction's side effect — forcing layout
+        // resolution — is the only reason it's here. This matches
+        // standard ZIR ordering: `field_type_ref` immediately
+        // followed by `union_init`.
+        const ft_payload_idx: u32 = @intCast(self.builder.extra.items.len);
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(union_type));
+        try self.builder.extra.append(self.builder.gpa, @intFromEnum(field_name));
+        _ = try self.emitBodyInst(.field_type_ref, Builder.encodePlNode(.zero, ft_payload_idx));
+
         const payload_idx: u32 = @intCast(self.builder.extra.items.len);
         try self.builder.extra.append(self.builder.gpa, @intFromEnum(union_type));
         try self.builder.extra.append(self.builder.gpa, @intFromEnum(field_name));
