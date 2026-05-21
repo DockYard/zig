@@ -77,6 +77,7 @@ comptime {
     _ = &api.zir_builder_emit_struct_init_typed;
     _ = &api.zir_builder_emit_union_init;
     _ = &api.zir_builder_add_switch_block;
+    _ = &api.zir_builder_emit_value_placeholder;
     _ = &api.zir_builder_emit_call_ref;
     _ = &api.zir_builder_emit_type_info;
     _ = &api.zir_builder_emit_array_init_anon;

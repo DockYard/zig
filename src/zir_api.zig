@@ -3920,6 +3920,18 @@ pub export fn zir_builder_add_switch_block(
     prong_body_results: [*]const u32,
     prong_body_insts: [*]const u32,
     num_prongs: u32,
+    /// When `has_else` is non-zero, the trailing `else_body_len`
+    /// instruction indices (drawn from `prong_body_insts` AFTER the
+    /// scalar prong bodies) plus `else_body_result` form the `else`/`_`
+    /// catch-all prong.
+    has_else: u32,
+    else_body_len: u32,
+    else_body_result: u32,
+    /// When non-zero, the index of a `value_placeholder` instruction (see
+    /// `zir_builder_emit_value_placeholder`) that prong bodies reference to
+    /// read the captured payload. 0 means "no placeholder" (prong bodies
+    /// reference the switch_block Ref directly).
+    payload_capture_placeholder: u32,
 ) callconv(.c) u64 {
     const b = getBuilder(handle) orelse return 0xFFFFFFFFFFFFFFFF;
     const body = b.active_body orelse return 0xFFFFFFFFFFFFFFFF;
@@ -3937,16 +3949,43 @@ pub export fn zir_builder_add_switch_block(
             .has_capture = (prong_captures[i] & 1) != 0,
             .body_insts = prong_body_insts[body_offset .. body_offset + body_len],
             .body_result = @enumFromInt(prong_body_results[i]),
-            .use_capture_as_result = (prong_captures[i] & 2) != 0,
         };
         body_offset += body_len;
     }
 
-    const ref = body.addSwitchBlock(@enumFromInt(operand), prongs) catch return 0xFFFFFFFFFFFFFFFF;
+    const else_prong: ?ZirBuilder.FuncBody.SwitchElseProng = if (has_else != 0) .{
+        .body_insts = prong_body_insts[body_offset .. body_offset + else_body_len],
+        .body_result = @enumFromInt(else_body_result),
+    } else null;
+
+    const placeholder: ?Zir.Inst.Index = if (payload_capture_placeholder != 0)
+        @enumFromInt(payload_capture_placeholder)
+    else
+        null;
+
+    const ref = body.addSwitchBlock(
+        @enumFromInt(operand),
+        prongs,
+        else_prong,
+        placeholder,
+    ) catch return 0xFFFFFFFFFFFFFFFF;
     const ref_u32: u32 = @intFromEnum(ref);
     // The instruction index is ref minus the Ref.static_len offset
     const inst_idx: u32 = ref_u32 - @as(u32, @intCast(Zir.Inst.Ref.static_len));
     return @as(u64, ref_u32) | (@as(u64, inst_idx) << 32);
+}
+
+/// Emit a `value_placeholder` instruction and return its instruction index.
+/// Prong bodies of an upcoming `switch_block` reference this index to read
+/// the captured payload; the index is then handed to
+/// `zir_builder_add_switch_block` as `payload_capture_placeholder`. Returns
+/// 0xFFFFFFFF on error (0 is a valid index but never a placeholder in
+/// practice, so callers treat the high sentinel as the only failure value).
+pub export fn zir_builder_emit_value_placeholder(handle: ?*ZirBuilderHandle) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const idx = body.emitValuePlaceholder() catch return 0xFFFFFFFF;
+    return @intFromEnum(idx);
 }
 
 /// Emit a union initialization: @unionInit(union_type, field_name, init_value).

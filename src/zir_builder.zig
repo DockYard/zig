@@ -3092,40 +3092,58 @@ pub const FuncBody = struct {
     pub const SwitchProng = struct {
         /// Variant name string (will be interned as an enum_literal instruction).
         item_name: []const u8,
-        /// Whether this prong captures the payload: `.Ok => |val| ...`
+        /// Whether this prong captures the payload: `.Ok => |val| ...`.
+        /// When set, prong body instructions reference the payload-capture
+        /// instruction (the switch_block Ref, or the placeholder if one was
+        /// supplied) to read the matched variant's payload value.
         has_capture: bool,
         /// Pre-emitted ZIR instruction indices for the prong body.
         body_insts: []const u32,
-        /// The result value of this prong.
+        /// The result value of this prong (the operand of its `break`).
         body_result: Zir.Inst.Ref,
-        /// If true, the break operand will be the switch_block's own Ref
-        /// (which Sema resolves to the captured payload via inst_map).
-        /// This is used for the Ok prong where the result IS the captured payload.
-        use_capture_as_result: bool = false,
     };
 
-    /// Emit a complete switch_block instruction in a single pass.
+    /// Optional `else`/`_` catch-all prong for addSwitchBlock.
+    pub const SwitchElseProng = struct {
+        /// Pre-emitted ZIR instruction indices for the else body.
+        body_insts: []const u32,
+        /// The result value of the else prong.
+        body_result: Zir.Inst.Ref,
+    };
+
+    /// Emit a complete `switch_block` instruction in a single pass, using
+    /// the canonical `Zir.Inst.SwitchBlock` extra-data layout that Sema's
+    /// `UnwrappedSwitchBlock` reader and AstGen's writer agree on.
     ///
-    /// All prong body instructions must be pre-emitted by the caller
-    /// (with body_tracking OFF). This function atomically emits:
-    ///   1. enum_literal instructions for each prong item (body_tracking ON)
-    ///   2. break instructions for each prong (via addInst, no body tracking)
+    /// All prong body instructions must be pre-emitted by the caller (with
+    /// body_tracking OFF). This function atomically emits:
+    ///   1. enum_literal instructions for each scalar prong item (tracking ON)
+    ///   2. break instructions for each prong + the else prong (via addInst)
     ///   3. dbg_stmt (body_tracking ON)
     ///   4. switch_block instruction (body_tracking ON)
-    ///   5. Contiguous SwitchBlock extra data
+    ///   5. Contiguous SwitchBlock extra data in canonical order:
+    ///        header, [payload_capture_placeholder], [else_info],
+    ///        scalar ProngInfos, scalar ItemInfos, [else_body], scalar bodies.
     ///
-    /// Returns the switch_block Ref. Body instructions that reference this
-    /// Ref will receive the captured union payload at runtime (Sema maps
-    /// it via inst_map).
+    /// `payload_capture_placeholder`, when non-null, is the index of a
+    /// `value_placeholder` instruction (see `emitValuePlaceholder`) that the
+    /// prong bodies reference to read the captured payload. When null, prong
+    /// bodies reference the switch_block Ref itself (Sema falls back to the
+    /// switch inst when no placeholder is recorded). A placeholder is required
+    /// whenever the prong bodies were emitted before the switch_block index
+    /// was known — i.e. always, in the single-pass driver — so the caller
+    /// supplies one for every capturing switch.
     ///
-    /// Follows the addStructInitAnon pattern: all data known upfront,
-    /// single atomic emission, no implicit state mutation.
+    /// Returns the switch_block Ref.
     pub fn addSwitchBlock(
         self: *FuncBody,
         operand: Zir.Inst.Ref,
         prongs: []const SwitchProng,
+        else_prong: ?SwitchElseProng,
+        payload_capture_placeholder: ?Zir.Inst.Index,
     ) !Zir.Inst.Ref {
         const b = self.builder;
+        const has_else = else_prong != null;
 
         // ---- Phase 1: Emit enum_literal instructions (body_tracking ON) ----
         // These are visible in the function body and can be referenced by Sema.
@@ -3136,16 +3154,14 @@ pub const FuncBody = struct {
         }
 
         // ---- Phase 2: Emit break instructions (via addInst, not body) ----
-        // We need to know the future switch_block index for break targets.
-        // breaks + dbg_stmt are emitted first, then the switch_block.
-        // Future switch index = current + num_breaks + 1 (dbg_stmt).
+        // The future switch_block index = current tag count + num_breaks
+        // (one per scalar prong, plus one for the else prong) + 1 (dbg_stmt).
         // NOTE: We use .break (not .break_inline) because break_inline
         // triggers ComptimeBreak which creates post-hoc blocks that don't
         // integrate properly with switch_block's Sema handling. Regular
         // .break is what AstGen uses for switch prong exits.
-        const future_switch_idx: u32 = @intCast(b.tags.items.len + prongs.len + 1);
-
-        const switch_ref = Builder.instRef(future_switch_idx);
+        const num_breaks: u32 = @as(u32, @intCast(prongs.len)) + @intFromBool(has_else);
+        const future_switch_idx: u32 = @intCast(b.tags.items.len + num_breaks + 1);
 
         var break_indices = try b.gpa.alloc(u32, prongs.len);
         defer b.gpa.free(break_indices);
@@ -3153,17 +3169,19 @@ pub const FuncBody = struct {
             const break_payload_idx: u32 = @intCast(b.extra.items.len);
             try b.extra.append(b.gpa, 0); // Break.operand_src_node = 0
             try b.extra.append(b.gpa, future_switch_idx); // Break.block_inst
-
-            // For capture prongs with void_value as body_result, use the
-            // switch_block's own Ref. Sema resolves this through inst_map
-            // to the captured payload value.
-            const result = if (p.use_capture_as_result)
-                switch_ref
-            else
-                p.body_result;
-
             break_indices[pi] = try b.addInst(.@"break", .{ .@"break" = .{
-                .operand = result,
+                .operand = p.body_result,
+                .payload_index = break_payload_idx,
+            } });
+        }
+
+        var else_break_idx: u32 = undefined;
+        if (else_prong) |ep| {
+            const break_payload_idx: u32 = @intCast(b.extra.items.len);
+            try b.extra.append(b.gpa, 0); // Break.operand_src_node = 0
+            try b.extra.append(b.gpa, future_switch_idx); // Break.block_inst
+            else_break_idx = try b.addInst(.@"break", .{ .@"break" = .{
+                .operand = ep.body_result,
                 .payload_index = break_payload_idx,
             } });
         }
@@ -3184,7 +3202,15 @@ pub const FuncBody = struct {
             try capture.append(b.gpa, switch_idx);
         }
 
-        // ---- Phase 4: Write SwitchBlock extra data (contiguous) ----
+        // ---- Phase 4: Write SwitchBlock extra data (canonical order) ----
+        // Layout (see Zir.Inst.SwitchBlock doc + AstGen.switchExprFinalize):
+        //   raw_operand, bits,
+        //   [payload_capture_placeholder],   if placeholder
+        //   [else_info: ProngInfo.Else],     if has_else
+        //   scalar ProngInfo × scalar_cases_len,
+        //   scalar ItemInfo × scalar_cases_len,
+        //   [else_body insts],               if has_else
+        //   per scalar prong: prong_body insts (item bodies are empty here).
         var any_non_inline_capture = false;
         for (prongs) |p| {
             if (p.has_capture) any_non_inline_capture = true;
@@ -3197,21 +3223,33 @@ pub const FuncBody = struct {
         try b.extra.append(b.gpa, @bitCast(Zir.Inst.SwitchBlock.Bits{
             .has_multi_cases = false,
             .any_ranges = false,
-            .has_else = false,
+            .has_else = has_else,
             .has_under = false,
             .has_continue = false,
             .any_maybe_runtime_capture = any_non_inline_capture,
-            .payload_capture_inst_is_placeholder = false,
+            .payload_capture_inst_is_placeholder = payload_capture_placeholder != null,
             .tag_capture_inst_is_placeholder = false,
             .scalar_cases_len = @intCast(prongs.len),
         }));
 
-        // Scalar cases
-        for (prongs, 0..) |p, pi| {
-            // Item: enum literal Ref
-            try b.extra.append(b.gpa, @intFromEnum(item_refs[pi]));
+        // payload_capture_placeholder (if any)
+        if (payload_capture_placeholder) |placeholder_idx| {
+            try b.extra.append(b.gpa, @intFromEnum(placeholder_idx));
+        }
 
-            // ProngInfo
+        // else_info (if any)
+        if (else_prong) |ep| {
+            try b.extra.append(b.gpa, @bitCast(Zir.Inst.SwitchBlock.ProngInfo.Else{
+                .body_len = @intCast(ep.body_insts.len + 1), // +1 for break
+                .capture = .none,
+                .is_inline = false,
+                .has_tag_capture = false,
+                .is_simple_noreturn = false,
+            }));
+        }
+
+        // scalar ProngInfos (all contiguous)
+        for (prongs) |p| {
             try b.extra.append(b.gpa, @bitCast(Zir.Inst.SwitchBlock.ProngInfo{
                 .body_len = @intCast(p.body_insts.len + 1), // +1 for break
                 .capture = if (p.has_capture) .by_val else .none,
@@ -3219,13 +3257,28 @@ pub const FuncBody = struct {
                 .has_tag_capture = false,
                 .is_comptime_unreach = false,
             }));
+        }
 
-            // Body instruction indices
+        // scalar ItemInfos (all contiguous). Each is an enum-literal item
+        // carrying the interned enum_literal Ref for the variant name.
+        for (item_refs) |item_ref| {
+            try b.extra.append(b.gpa, @bitCast(Zir.Inst.SwitchBlock.ItemInfo{
+                .kind = .enum_literal,
+                .data = @intCast(@intFromEnum(item_ref)),
+            }));
+        }
+
+        // else body (if any), then scalar prong bodies.
+        if (else_prong) |ep| {
+            for (ep.body_insts) |inst_i| {
+                try b.extra.append(b.gpa, inst_i);
+            }
+            try b.extra.append(b.gpa, else_break_idx);
+        }
+        for (prongs, 0..) |p, pi| {
             for (p.body_insts) |inst_i| {
                 try b.extra.append(b.gpa, inst_i);
             }
-
-            // break (last body instruction)
             try b.extra.append(b.gpa, break_indices[pi]);
         }
 
@@ -3236,6 +3289,27 @@ pub const FuncBody = struct {
         } };
 
         return Builder.instRef(switch_idx);
+    }
+
+    /// Emit a `value_placeholder` extended instruction and return its index.
+    /// This is the same mechanism AstGen uses (`appendPlaceholder`) to give
+    /// switch prong bodies a stable instruction Ref for the payload capture
+    /// that they can reference before the switch_block instruction itself
+    /// exists. The placeholder never appears in any analyzed body — it is
+    /// recorded only in the SwitchBlock's `payload_capture_placeholder`
+    /// trailing slot, and Sema maps the captured payload value onto it.
+    pub fn emitValuePlaceholder(self: *FuncBody) !Zir.Inst.Index {
+        const b = self.builder;
+        const idx: u32 = @intCast(b.tags.items.len);
+        try b.tags.append(b.gpa, @intFromEnum(Zir.Inst.Tag.extended));
+        try b.data.append(b.gpa, .{ .extended = .{
+            .opcode = .value_placeholder,
+            .small = undefined,
+            .operand = undefined,
+        } });
+        // Deliberately NOT added to body_inst_indices / non_body_capture:
+        // a value_placeholder must never appear in an analyzed body.
+        return @enumFromInt(idx);
     }
 
     /// Emit a tagged union(enum) type declaration and store it as the return type.
@@ -5077,13 +5151,13 @@ test "Builder: addSwitchBlock extra data layout" {
     const ok_result = try body.addStr("ok_value");
     const err_result = try body.addStr("err_value");
 
-    // Single-pass switch emission
+    // Single-pass switch emission (no else prong, no payload placeholder).
     const prongs = [_]FuncBody.SwitchProng{
         .{ .item_name = "Ok", .has_capture = true, .body_insts = &.{}, .body_result = ok_result },
         .{ .item_name = "Error", .has_capture = true, .body_insts = &.{}, .body_result = err_result },
     };
 
-    const result = try body.addSwitchBlock(operand, &prongs);
+    const result = try body.addSwitchBlock(operand, &prongs, null, null);
     try std.testing.expect(@intFromEnum(result) > 0);
 
     // Find the switch_block instruction index. `result` is a `Zir.Inst.Ref`;
@@ -5113,15 +5187,22 @@ test "Builder: addSwitchBlock extra data layout" {
     // capture). `addSwitchBlock` already populates these current fields.
     try std.testing.expectEqual(@as(@FieldType(Zir.Inst.SwitchBlock.Bits, "scalar_cases_len"), 2), bits.scalar_cases_len);
     try std.testing.expect(bits.any_maybe_runtime_capture);
+    // No placeholder / else prong supplied in this test.
+    try std.testing.expect(!bits.payload_capture_inst_is_placeholder);
+    try std.testing.expect(!bits.has_else);
 
-    // extra[payload_idx+2] = first case item Ref (should be an enum_literal for "Ok")
-    // Verify it's a valid instruction Ref (not zero/none)
-    try std.testing.expect(extra[payload_idx + 2] > 0);
-
-    // extra[payload_idx+3] = ProngInfo for first case
-    const prong0_info: Zir.Inst.SwitchBlock.ProngInfo = @bitCast(extra[payload_idx + 3]);
+    // Canonical layout (no placeholder, no else): the header is followed by
+    // the contiguous scalar ProngInfos, then the contiguous scalar ItemInfos,
+    // then the prong bodies. So extra[payload_idx+2] is ProngInfo[0].
+    const prong0_info: Zir.Inst.SwitchBlock.ProngInfo = @bitCast(extra[payload_idx + 2]);
     // `ProngInfo.body_len` is now `u27` (was `u28`); assert against the
     // field's actual width so the check stays correct across width changes.
     try std.testing.expectEqual(@as(@FieldType(Zir.Inst.SwitchBlock.ProngInfo, "body_len"), 1), prong0_info.body_len); // 0 body + 1 break
     try std.testing.expectEqual(Zir.Inst.SwitchBlock.ProngInfo.Capture.by_val, prong0_info.capture);
+
+    // extra[payload_idx+4] = ItemInfo[0]: an enum_literal item carrying the
+    // interned enum_literal Ref for "Ok".
+    const item0_info: Zir.Inst.SwitchBlock.ItemInfo = @bitCast(extra[payload_idx + 4]);
+    try std.testing.expectEqual(Zir.Inst.SwitchBlock.ItemInfo.Kind.enum_literal, item0_info.kind);
+    try std.testing.expect(item0_info.data > 0);
 }
