@@ -106,6 +106,7 @@ pub export fn zir_compilation_create(
         null,
         false,
         .default,
+        .default,
     ) catch null;
 }
 
@@ -136,6 +137,35 @@ fn debugInfoPolicyFromU8(value: u8) error{InvalidPolicy}!DebugInfoPolicy {
         0 => .default,
         1 => .full,
         2 => .none,
+        else => error.InvalidPolicy,
+    };
+}
+
+/// Phase 0 — DWARF foundation: per-mode frame-pointer policy values
+/// callers may pass to the `zir_compilation_create_*_v3` ABIs. Frame
+/// pointers unlock `perf` / `samply` / async-signal-safe stack
+/// walking (the FP register chain is walkable without DWARF unwinder
+/// tables) at the cost of ~1-3% in optimized builds. The per-mode
+/// default (Zap's Phase 0 spec): on in Debug/ReleaseSafe, off in
+/// ReleaseFast/ReleaseSmall. The `-Dframe-pointers=on|off` CLI flag
+/// overrides the default and reaches this ABI as `.keep` / `.omit`;
+/// a missing flag reaches as `.default` so the per-module derivation
+/// in `Package.Module.create` keeps Zig's existing semantics.
+pub const FramePointerPolicy = enum(u8) {
+    default = 0,
+    keep = 1,
+    omit = 2,
+};
+
+/// Safe `u8` -> `FramePointerPolicy` conversion. Mirrors
+/// `debugInfoPolicyFromU8`: out-of-range values map back to
+/// `.default` so the fork ABI tolerates a mismatched embedder
+/// without aborting.
+fn framePointerPolicyFromU8(value: u8) error{InvalidPolicy}!FramePointerPolicy {
+    return switch (value) {
+        0 => .default,
+        1 => .keep,
+        2 => .omit,
         else => error.InvalidPolicy,
     };
 }
@@ -171,6 +201,7 @@ pub export fn zir_compilation_create_v2(
         null,
         false,
         policy,
+        .default,
     ) catch null;
 }
 
@@ -203,6 +234,7 @@ pub export fn zir_compilation_create_incremental(
         null,
         null,
         true,
+        .default,
         .default,
     ) catch null;
 }
@@ -237,6 +269,7 @@ pub export fn zir_compilation_create_incremental_v2(
         null,
         true,
         policy,
+        .default,
     ) catch null;
 }
 
@@ -278,6 +311,7 @@ pub export fn zir_compilation_create_cross(
         cpu_str,
         false,
         .default,
+        .default,
     ) catch null;
 }
 
@@ -315,6 +349,7 @@ pub export fn zir_compilation_create_cross_v2(
         cpu_str,
         false,
         policy,
+        .default,
     ) catch null;
 }
 
@@ -353,6 +388,7 @@ pub export fn zir_compilation_create_cross_incremental(
         cpu_str,
         true,
         .default,
+        .default,
     ) catch null;
 }
 
@@ -390,6 +426,176 @@ pub export fn zir_compilation_create_cross_incremental_v2(
         cpu_str,
         true,
         policy,
+        .default,
+    ) catch null;
+}
+
+// ---------------------------------------------------------------------------
+// V3 ABI — Phase 0 DWARF foundation, Gap C (frame-pointer override)
+// ---------------------------------------------------------------------------
+//
+// V3 extends V2 with one additional trailing `frame_pointer_policy: u8`
+// byte (see `FramePointerPolicy`). The semantics are independent of
+// the debug-info policy: the user can request any of the four
+// `{ debug_info, frame_pointers }` combinations and the fork honors
+// each. V2 stays byte-identical for callers that haven't migrated —
+// the V3 variants are added alongside, never on top of V2's
+// parameter list.
+
+/// V3 of `zir_compilation_create_v2` with an explicit frame-pointer
+/// policy (see `FramePointerPolicy`). The debug-info policy
+/// parameter retains its V2 semantics.
+pub export fn zir_compilation_create_v3(
+    zig_lib_dir: [*:0]const u8,
+    local_cache_dir: [*:0]const u8,
+    global_cache_dir: [*:0]const u8,
+    output_path: [*:0]const u8,
+    root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
+    debug_info_policy: u8,
+    frame_pointer_policy: u8,
+) ?*ZirContext {
+    const dbg_policy: DebugInfoPolicy = debugInfoPolicyFromU8(debug_info_policy) catch
+        .default;
+    const fp_policy: FramePointerPolicy = framePointerPolicyFromU8(frame_pointer_policy) catch
+        .default;
+    return createImpl(
+        mem.sliceTo(zig_lib_dir, 0),
+        mem.sliceTo(local_cache_dir, 0),
+        mem.sliceTo(global_cache_dir, 0),
+        mem.sliceTo(output_path, 0),
+        mem.sliceTo(root_name, 0),
+        output_mode,
+        optimize_mode,
+        is_dynamic,
+        link_libc,
+        null,
+        null,
+        false,
+        dbg_policy,
+        fp_policy,
+    ) catch null;
+}
+
+/// V3 of `zir_compilation_create_incremental_v2` with an explicit
+/// frame-pointer policy.
+pub export fn zir_compilation_create_incremental_v3(
+    zig_lib_dir: [*:0]const u8,
+    local_cache_dir: [*:0]const u8,
+    global_cache_dir: [*:0]const u8,
+    output_path: [*:0]const u8,
+    root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
+    debug_info_policy: u8,
+    frame_pointer_policy: u8,
+) ?*ZirContext {
+    const dbg_policy: DebugInfoPolicy = debugInfoPolicyFromU8(debug_info_policy) catch
+        .default;
+    const fp_policy: FramePointerPolicy = framePointerPolicyFromU8(frame_pointer_policy) catch
+        .default;
+    return createImpl(
+        mem.sliceTo(zig_lib_dir, 0),
+        mem.sliceTo(local_cache_dir, 0),
+        mem.sliceTo(global_cache_dir, 0),
+        mem.sliceTo(output_path, 0),
+        mem.sliceTo(root_name, 0),
+        output_mode,
+        optimize_mode,
+        is_dynamic,
+        link_libc,
+        null,
+        null,
+        true,
+        dbg_policy,
+        fp_policy,
+    ) catch null;
+}
+
+/// V3 of `zir_compilation_create_cross_v2` with an explicit
+/// frame-pointer policy.
+pub export fn zir_compilation_create_cross_v3(
+    zig_lib_dir: [*:0]const u8,
+    local_cache_dir: [*:0]const u8,
+    global_cache_dir: [*:0]const u8,
+    output_path: [*:0]const u8,
+    root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
+    target_triple: ?[*:0]const u8,
+    cpu_features: ?[*:0]const u8,
+    debug_info_policy: u8,
+    frame_pointer_policy: u8,
+) ?*ZirContext {
+    const target_str: ?[]const u8 = if (target_triple) |t| mem.sliceTo(t, 0) else null;
+    const cpu_str: ?[]const u8 = if (cpu_features) |c| mem.sliceTo(c, 0) else null;
+    const dbg_policy: DebugInfoPolicy = debugInfoPolicyFromU8(debug_info_policy) catch
+        .default;
+    const fp_policy: FramePointerPolicy = framePointerPolicyFromU8(frame_pointer_policy) catch
+        .default;
+    return createImpl(
+        mem.sliceTo(zig_lib_dir, 0),
+        mem.sliceTo(local_cache_dir, 0),
+        mem.sliceTo(global_cache_dir, 0),
+        mem.sliceTo(output_path, 0),
+        mem.sliceTo(root_name, 0),
+        output_mode,
+        optimize_mode,
+        is_dynamic,
+        link_libc,
+        target_str,
+        cpu_str,
+        false,
+        dbg_policy,
+        fp_policy,
+    ) catch null;
+}
+
+/// V3 of `zir_compilation_create_cross_incremental_v2` with an
+/// explicit frame-pointer policy.
+pub export fn zir_compilation_create_cross_incremental_v3(
+    zig_lib_dir: [*:0]const u8,
+    local_cache_dir: [*:0]const u8,
+    global_cache_dir: [*:0]const u8,
+    output_path: [*:0]const u8,
+    root_name: [*:0]const u8,
+    output_mode: u8,
+    optimize_mode: u8,
+    is_dynamic: bool,
+    link_libc: bool,
+    target_triple: ?[*:0]const u8,
+    cpu_features: ?[*:0]const u8,
+    debug_info_policy: u8,
+    frame_pointer_policy: u8,
+) ?*ZirContext {
+    const target_str: ?[]const u8 = if (target_triple) |t| mem.sliceTo(t, 0) else null;
+    const cpu_str: ?[]const u8 = if (cpu_features) |c| mem.sliceTo(c, 0) else null;
+    const dbg_policy: DebugInfoPolicy = debugInfoPolicyFromU8(debug_info_policy) catch
+        .default;
+    const fp_policy: FramePointerPolicy = framePointerPolicyFromU8(frame_pointer_policy) catch
+        .default;
+    return createImpl(
+        mem.sliceTo(zig_lib_dir, 0),
+        mem.sliceTo(local_cache_dir, 0),
+        mem.sliceTo(global_cache_dir, 0),
+        mem.sliceTo(output_path, 0),
+        mem.sliceTo(root_name, 0),
+        output_mode,
+        optimize_mode,
+        is_dynamic,
+        link_libc,
+        target_str,
+        cpu_str,
+        true,
+        dbg_policy,
+        fp_policy,
     ) catch null;
 }
 
@@ -2552,6 +2758,7 @@ fn createImpl(
     cpu_features_opt: ?[]const u8,
     incremental: bool,
     debug_info_policy: DebugInfoPolicy,
+    frame_pointer_policy: FramePointerPolicy,
 ) !*ZirContext {
     // Use c_allocator (libc malloc) instead of page_allocator.
     // page_allocator creates one mmap per allocation, hitting the kernel's
@@ -2837,6 +3044,18 @@ fn createImpl(
     const root_path = Compilation.Path.fromUnresolved(ar, ctx.dirs, &.{stub_dir}) catch
         return error.OutOfMemory;
 
+    // Phase 0 — DWARF foundation, Gap C: thread the frame-pointer
+    // policy into the root module's inherited overrides. `null` keeps
+    // Zig's per-mode default (`omit_frame_pointer = false` everywhere
+    // except ReleaseSmall on non-x86), which mirrors the historical
+    // V1/V2 behavior for callers that left the policy as `.default`.
+    // `.keep` / `.omit` pins the choice regardless of mode so
+    // `-Dframe-pointers=on|off` actually reaches the codegen pass.
+    const root_omit_frame_pointer: ?bool = switch (frame_pointer_policy) {
+        .default => null,
+        .keep => false,
+        .omit => true,
+    };
     const root_mod = Package.Module.create(ar, .{
         .paths = .{
             .root = root_path,
@@ -2844,7 +3063,10 @@ fn createImpl(
         },
         .fully_qualified_name = "root",
         .cc_argv = &.{},
-        .inherited = .{ .resolved_target = resolved_target },
+        .inherited = .{
+            .resolved_target = resolved_target,
+            .omit_frame_pointer = root_omit_frame_pointer,
+        },
         .global = config,
         .parent = null,
     }) catch return error.OutOfMemory;
@@ -6031,6 +6253,8 @@ test "zir_api: incremental create uses cache artifact output contract" {
         null,
         null,
         false,
+        .default,
+        .default,
     );
     defer zir_compilation_destroy(direct_ctx);
 
@@ -6058,6 +6282,8 @@ test "zir_api: incremental create uses cache artifact output contract" {
         null,
         null,
         true,
+        .default,
+        .default,
     );
     defer zir_compilation_destroy(incremental_ctx);
 
@@ -6119,6 +6345,8 @@ test "zir_api: add_struct_source reuses existing module registration" {
         null,
         null,
         true,
+        .default,
+        .default,
     );
     defer zir_compilation_destroy(ctx);
 
@@ -6176,6 +6404,8 @@ test "zir_api: incremental update consumes injected prev_zir through updateZirRe
         null,
         null,
         true,
+        .default,
+        .default,
     );
     defer zir_compilation_destroy(ctx);
 
@@ -6268,6 +6498,8 @@ test "zir_api: selected injected update reanalyzes changed function bodies" {
         null,
         null,
         true,
+        .default,
+        .default,
     );
     defer zir_compilation_destroy(ctx);
 
@@ -6366,6 +6598,8 @@ test "zir_api: incremental MachO LLVM relink refreshes executable artifact" {
         null,
         null,
         true,
+        .default,
+        .default,
     );
     defer zir_compilation_destroy(ctx);
 
@@ -6469,6 +6703,8 @@ test "zir_api: selected update finalizes unused injected module prev_zir" {
         null,
         null,
         true,
+        .default,
+        .default,
     );
     defer zir_compilation_destroy(ctx);
 
@@ -6580,6 +6816,8 @@ test "zir_api: abort update restores prepared ZIR before update" {
         null,
         null,
         true,
+        .default,
+        .default,
     );
     defer zir_compilation_destroy(ctx);
 
@@ -6666,6 +6904,8 @@ test "zir_api: injected executable update succeeds" {
         null,
         null,
         false,
+        .default,
+        .default,
     );
     defer zir_compilation_destroy(ctx);
 
@@ -6738,6 +6978,8 @@ test "zir_api: function value passed as callback argument" {
         null,
         null,
         false,
+        .default,
+        .default,
     );
     defer zir_compilation_destroy(ctx);
 
@@ -6833,6 +7075,8 @@ test "zir_api: cross-struct callback via anytype" {
         null,
         null,
         false,
+        .default,
+        .default,
     );
     defer zir_compilation_destroy(ctx);
 
@@ -6940,6 +7184,8 @@ test "zir_api: three-struct anytype chain (caller -> wrapper -> inner)" {
         null,
         null,
         false,
+        .default,
+        .default,
     );
     defer zir_compilation_destroy(ctx);
 
