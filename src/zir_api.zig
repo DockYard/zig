@@ -25,6 +25,81 @@ const introspect = @import("introspect.zig");
 const target_util = @import("target.zig");
 const build_options = @import("build_options");
 
+/// Root stub source for Zap executable outputs.
+///
+/// Zap injects all real declarations as ZIR in-memory; this on-disk stub
+/// exists only for the root `File`'s identity/digest and to provide the
+/// program's panic namespace and a trivial `main`.
+///
+/// Phase 1.5 (Zap error system) — per-optimize-mode overflow/bounds
+/// policy. In Debug and ReleaseSafe builds Zap lowers integer arithmetic
+/// to Zig's *checked* tags, so an overflow trips the safety check and
+/// calls one of the panic handlers below; an out-of-bounds index calls
+/// `outOfBounds`/`integerOutOfBounds`. Rather than `@trap()` (which
+/// aborts with SIGILL and no message), these specific handlers route to
+/// `zapAbort`, which prints the canonical Zap error-abort line
+/// `** (<kind>) <message>` and exits non-zero — byte-for-byte the same
+/// shape the runtime's `Kernel.raise_with_kind` produces for an explicit
+/// `raise %ArithmeticError{}` / `raise %IndexError{}`. So the safe-mode
+/// overflow/bounds traps are observationally identical to raising the
+/// corresponding stdlib `pub error`. In ReleaseFast/ReleaseSmall, Zap
+/// emits wrapping arithmetic and Zig elides bounds checks where provably
+/// safe, so these handlers are simply never reached for those checks.
+///
+/// The remaining handlers keep `@trap()`: they back safety checks outside
+/// the Phase 1.5 overflow/bounds contract (sentinel mismatch, inactive
+/// union field, etc.) and are routed to Zap errors in later phases.
+const zap_exe_stub_source =
+    "const std = @import(\"std\");\n" ++
+    "pub const std_options_debug_threaded_io: ?*std.Io.Threaded = null;\n" ++
+    "pub const std_options_debug_io: std.Io = std.Io.failing;\n" ++
+    "pub const panic = struct {\n" ++
+    // Canonical Zap error-abort: `** (<kind>) <message>\n` then exit(1).
+    // Matches runtime.Kernel.raise_with_kind so safe-mode traps look
+    // exactly like an explicit `raise %ArithmeticError{}` / IndexError.
+    "    fn zapAbort(kind: []const u8, message: []const u8) noreturn {\n" ++
+    "        _ = std.c.write(2, \"** (\", 4);\n" ++
+    "        _ = std.c.write(2, kind.ptr, kind.len);\n" ++
+    "        _ = std.c.write(2, \") \", 2);\n" ++
+    "        _ = std.c.write(2, message.ptr, message.len);\n" ++
+    "        _ = std.c.write(2, \"\\n\", 1);\n" ++
+    "        std.c.exit(1);\n" ++
+    "    }\n" ++
+    "    pub fn call(msg: []const u8, _: ?usize) noreturn {\n" ++
+    "        _ = std.c.write(2, msg.ptr, msg.len);\n" ++
+    "        _ = std.c.write(2, \"\\n\", 1);\n" ++
+    "        @trap();\n" ++
+    "    }\n" ++
+    "    pub fn sentinelMismatch(_: anytype, _: anytype) noreturn { @trap(); }\n" ++
+    "    pub fn unwrapError(_: anyerror) noreturn { @trap(); }\n" ++
+    // Phase 1.5 bounds policy → IndexError (Z1004).
+    "    pub fn outOfBounds(_: usize, _: usize) noreturn { zapAbort(\"index_error\", \"index out of bounds\"); }\n" ++
+    "    pub fn startGreaterThanEnd(_: usize, _: usize) noreturn { zapAbort(\"index_error\", \"slice start exceeds end\"); }\n" ++
+    "    pub fn inactiveUnionField(_: anytype, _: anytype) noreturn { @trap(); }\n" ++
+    "    pub fn sliceCastLenRemainder(_: usize) noreturn { @trap(); }\n" ++
+    "    pub fn reachedUnreachable() noreturn { @trap(); }\n" ++
+    "    pub fn unwrapNull() noreturn { @trap(); }\n" ++
+    "    pub fn castToNull() noreturn { @trap(); }\n" ++
+    "    pub fn incorrectAlignment() noreturn { @trap(); }\n" ++
+    "    pub fn invalidErrorCode() noreturn { @trap(); }\n" ++
+    "    pub fn integerOutOfBounds() noreturn { zapAbort(\"index_error\", \"integer index out of bounds\"); }\n" ++
+    // Phase 1.5 overflow policy → ArithmeticError (Z1003).
+    "    pub fn integerOverflow() noreturn { zapAbort(\"arithmetic_error\", \"integer overflow\"); }\n" ++
+    "    pub fn shlOverflow() noreturn { zapAbort(\"arithmetic_error\", \"left shift overflow\"); }\n" ++
+    "    pub fn shrOverflow() noreturn { zapAbort(\"arithmetic_error\", \"right shift overflow\"); }\n" ++
+    "    pub fn divideByZero() noreturn { zapAbort(\"arithmetic_error\", \"division by zero\"); }\n" ++
+    "    pub fn exactDivisionRemainder() noreturn { zapAbort(\"arithmetic_error\", \"exact division had a remainder\"); }\n" ++
+    "    pub fn integerPartOutOfBounds() noreturn { @trap(); }\n" ++
+    "    pub fn corruptSwitch() noreturn { @trap(); }\n" ++
+    "    pub fn shiftRhsTooBig() noreturn { zapAbort(\"arithmetic_error\", \"shift amount exceeds bit width\"); }\n" ++
+    "    pub fn invalidEnumValue() noreturn { @trap(); }\n" ++
+    "    pub fn forLenMismatch() noreturn { @trap(); }\n" ++
+    "    pub fn copyLenMismatch() noreturn { @trap(); }\n" ++
+    "    pub fn memcpyAlias() noreturn { @trap(); }\n" ++
+    "    pub fn noreturnReturned() noreturn { @trap(); }\n" ++
+    "};\n" ++
+    "pub fn main() void {}\n";
+
 /// Flat, C-ABI-safe representation of ZIR data.
 /// The caller builds these arrays directly, matching the internal Zir layout.
 pub const ZirData = extern struct {
@@ -2989,42 +3064,7 @@ fn createImpl(
     const stub_source = if (ctx.is_builder)
         "comptime {}\n"
     else if (output_mode_enum == .Exe)
-        "const std = @import(\"std\");\n" ++
-            "pub const std_options_debug_threaded_io: ?*std.Io.Threaded = null;\n" ++
-            "pub const std_options_debug_io: std.Io = std.Io.failing;\n" ++
-            "pub const panic = struct {\n" ++
-            "    pub fn call(msg: []const u8, _: ?usize) noreturn {\n" ++
-            "        _ = std.c.write(2, msg.ptr, msg.len);\n" ++
-            "        _ = std.c.write(2, \"\\n\", 1);\n" ++
-            "        @trap();\n" ++
-            "    }\n" ++
-            "    pub fn sentinelMismatch(_: anytype, _: anytype) noreturn { @trap(); }\n" ++
-            "    pub fn unwrapError(_: anyerror) noreturn { @trap(); }\n" ++
-            "    pub fn outOfBounds(_: usize, _: usize) noreturn { @trap(); }\n" ++
-            "    pub fn startGreaterThanEnd(_: usize, _: usize) noreturn { @trap(); }\n" ++
-            "    pub fn inactiveUnionField(_: anytype, _: anytype) noreturn { @trap(); }\n" ++
-            "    pub fn sliceCastLenRemainder(_: usize) noreturn { @trap(); }\n" ++
-            "    pub fn reachedUnreachable() noreturn { @trap(); }\n" ++
-            "    pub fn unwrapNull() noreturn { @trap(); }\n" ++
-            "    pub fn castToNull() noreturn { @trap(); }\n" ++
-            "    pub fn incorrectAlignment() noreturn { @trap(); }\n" ++
-            "    pub fn invalidErrorCode() noreturn { @trap(); }\n" ++
-            "    pub fn integerOutOfBounds() noreturn { @trap(); }\n" ++
-            "    pub fn integerOverflow() noreturn { @trap(); }\n" ++
-            "    pub fn shlOverflow() noreturn { @trap(); }\n" ++
-            "    pub fn shrOverflow() noreturn { @trap(); }\n" ++
-            "    pub fn divideByZero() noreturn { @trap(); }\n" ++
-            "    pub fn exactDivisionRemainder() noreturn { @trap(); }\n" ++
-            "    pub fn integerPartOutOfBounds() noreturn { @trap(); }\n" ++
-            "    pub fn corruptSwitch() noreturn { @trap(); }\n" ++
-            "    pub fn shiftRhsTooBig() noreturn { @trap(); }\n" ++
-            "    pub fn invalidEnumValue() noreturn { @trap(); }\n" ++
-            "    pub fn forLenMismatch() noreturn { @trap(); }\n" ++
-            "    pub fn copyLenMismatch() noreturn { @trap(); }\n" ++
-            "    pub fn memcpyAlias() noreturn { @trap(); }\n" ++
-            "    pub fn noreturnReturned() noreturn { @trap(); }\n" ++
-            "};\n" ++
-            "pub fn main() void {}\n"
+        zap_exe_stub_source
     else
         "comptime {}\n";
     cwd.createDirPath(io, stub_dir) catch {};
@@ -3205,42 +3245,7 @@ fn addZirImpl(ctx: *ZirContext, name: []const u8, data: *const ZirData) !void {
         const stub_source = if (ctx.is_builder)
             "comptime {}\n"
         else if (ctx.output_mode == .Exe)
-            "const std = @import(\"std\");\n" ++
-                "pub const std_options_debug_threaded_io: ?*std.Io.Threaded = null;\n" ++
-                "pub const std_options_debug_io: std.Io = std.Io.failing;\n" ++
-                "pub const panic = struct {\n" ++
-                "    pub fn call(msg: []const u8, _: ?usize) noreturn {\n" ++
-                "        _ = std.c.write(2, msg.ptr, msg.len);\n" ++
-                "        _ = std.c.write(2, \"\\n\", 1);\n" ++
-                "        @trap();\n" ++
-                "    }\n" ++
-                "    pub fn sentinelMismatch(_: anytype, _: anytype) noreturn { @trap(); }\n" ++
-                "    pub fn unwrapError(_: anyerror) noreturn { @trap(); }\n" ++
-                "    pub fn outOfBounds(_: usize, _: usize) noreturn { @trap(); }\n" ++
-                "    pub fn startGreaterThanEnd(_: usize, _: usize) noreturn { @trap(); }\n" ++
-                "    pub fn inactiveUnionField(_: anytype, _: anytype) noreturn { @trap(); }\n" ++
-                "    pub fn sliceCastLenRemainder(_: usize) noreturn { @trap(); }\n" ++
-                "    pub fn reachedUnreachable() noreturn { @trap(); }\n" ++
-                "    pub fn unwrapNull() noreturn { @trap(); }\n" ++
-                "    pub fn castToNull() noreturn { @trap(); }\n" ++
-                "    pub fn incorrectAlignment() noreturn { @trap(); }\n" ++
-                "    pub fn invalidErrorCode() noreturn { @trap(); }\n" ++
-                "    pub fn integerOutOfBounds() noreturn { @trap(); }\n" ++
-                "    pub fn integerOverflow() noreturn { @trap(); }\n" ++
-                "    pub fn shlOverflow() noreturn { @trap(); }\n" ++
-                "    pub fn shrOverflow() noreturn { @trap(); }\n" ++
-                "    pub fn divideByZero() noreturn { @trap(); }\n" ++
-                "    pub fn exactDivisionRemainder() noreturn { @trap(); }\n" ++
-                "    pub fn integerPartOutOfBounds() noreturn { @trap(); }\n" ++
-                "    pub fn corruptSwitch() noreturn { @trap(); }\n" ++
-                "    pub fn shiftRhsTooBig() noreturn { @trap(); }\n" ++
-                "    pub fn invalidEnumValue() noreturn { @trap(); }\n" ++
-                "    pub fn forLenMismatch() noreturn { @trap(); }\n" ++
-                "    pub fn copyLenMismatch() noreturn { @trap(); }\n" ++
-                "    pub fn memcpyAlias() noreturn { @trap(); }\n" ++
-                "    pub fn noreturnReturned() noreturn { @trap(); }\n" ++
-                "};\n" ++
-                "pub fn main() void {}\n"
+            zap_exe_stub_source
         else
             "comptime {}\n";
         const source = try gpa.allocSentinel(u8, stub_source.len, 0);
