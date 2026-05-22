@@ -3101,6 +3101,14 @@ pub const FuncBody = struct {
         body_insts: []const u32,
         /// The result value of this prong (the operand of its `break`).
         body_result: Zir.Inst.Ref,
+        /// Whether the prong body already self-terminates with a `noreturn`
+        /// instruction (e.g. a trailing `ret`). When set, `addSwitchBlock`
+        /// does NOT synthesize a trailing `break` for the prong: the body is
+        /// already terminal, so an appended `break` would be dead code whose
+        /// `br` target dangles and trips AIR Liveness. This mirrors how
+        /// AstGen omits the break for a switch prong whose body ends in
+        /// `return`. `body_result` is ignored for noreturn prongs.
+        body_is_noreturn: bool = false,
     };
 
     /// Optional `else`/`_` catch-all prong for addSwitchBlock.
@@ -3109,6 +3117,9 @@ pub const FuncBody = struct {
         body_insts: []const u32,
         /// The result value of the else prong.
         body_result: Zir.Inst.Ref,
+        /// Whether the else body self-terminates with a `noreturn`
+        /// instruction; see `SwitchProng.body_is_noreturn`.
+        body_is_noreturn: bool = false,
     };
 
     /// Emit a complete `switch_block` instruction in a single pass, using
@@ -3145,12 +3156,16 @@ pub const FuncBody = struct {
         const b = self.builder;
         const has_else = else_prong != null;
 
-        // ---- Phase 1: Emit enum_literal instructions (body_tracking ON) ----
-        // These are visible in the function body and can be referenced by Sema.
-        var item_refs = try b.gpa.alloc(Zir.Inst.Ref, prongs.len);
-        defer b.gpa.free(item_refs);
+        // ---- Phase 1: Intern each scalar prong's variant name ----
+        // A scalar `enum_literal` ItemInfo carries the interned
+        // NullTerminatedString index of the variant name directly (this is
+        // what AstGen does via `identAsString`); no enum_literal *instruction*
+        // is emitted. Sema's `resolveSwitchItem` reads `item_info.data` as a
+        // string index and resolves it against the operand's enum/union type.
+        var item_name_strs = try b.gpa.alloc(u32, prongs.len);
+        defer b.gpa.free(item_name_strs);
         for (prongs, 0..) |p, pi| {
-            item_refs[pi] = try self.addEnumLiteral(p.item_name);
+            item_name_strs[pi] = try b.internString(p.item_name);
         }
 
         // ---- Phase 2: Emit break instructions (via addInst, not body) ----
@@ -3160,12 +3175,26 @@ pub const FuncBody = struct {
         // triggers ComptimeBreak which creates post-hoc blocks that don't
         // integrate properly with switch_block's Sema handling. Regular
         // .break is what AstGen uses for switch prong exits.
-        const num_breaks: u32 = @as(u32, @intCast(prongs.len)) + @intFromBool(has_else);
+        // A `noreturn` prong body (ending in `ret`/`unreachable`) is already
+        // terminal; it gets no synthesized `break`. Count only the prongs
+        // that need one so the future switch_block index is exact.
+        var num_breaks: u32 = 0;
+        for (prongs) |p| {
+            if (!p.body_is_noreturn) num_breaks += 1;
+        }
+        const else_needs_break = if (else_prong) |ep| !ep.body_is_noreturn else false;
+        if (else_needs_break) num_breaks += 1;
         const future_switch_idx: u32 = @intCast(b.tags.items.len + num_breaks + 1);
 
+        // `break_indices[pi]` is the prong's break instruction index, or
+        // 0xFFFFFFFF for a noreturn prong (which appends no break).
         var break_indices = try b.gpa.alloc(u32, prongs.len);
         defer b.gpa.free(break_indices);
         for (prongs, 0..) |p, pi| {
+            if (p.body_is_noreturn) {
+                break_indices[pi] = 0xFFFFFFFF;
+                continue;
+            }
             const break_payload_idx: u32 = @intCast(b.extra.items.len);
             try b.extra.append(b.gpa, 0); // Break.operand_src_node = 0
             try b.extra.append(b.gpa, future_switch_idx); // Break.block_inst
@@ -3175,15 +3204,17 @@ pub const FuncBody = struct {
             } });
         }
 
-        var else_break_idx: u32 = undefined;
+        var else_break_idx: u32 = 0xFFFFFFFF;
         if (else_prong) |ep| {
-            const break_payload_idx: u32 = @intCast(b.extra.items.len);
-            try b.extra.append(b.gpa, 0); // Break.operand_src_node = 0
-            try b.extra.append(b.gpa, future_switch_idx); // Break.block_inst
-            else_break_idx = try b.addInst(.@"break", .{ .@"break" = .{
-                .operand = ep.body_result,
-                .payload_index = break_payload_idx,
-            } });
+            if (else_needs_break) {
+                const break_payload_idx: u32 = @intCast(b.extra.items.len);
+                try b.extra.append(b.gpa, 0); // Break.operand_src_node = 0
+                try b.extra.append(b.gpa, future_switch_idx); // Break.block_inst
+                else_break_idx = try b.addInst(.@"break", .{ .@"break" = .{
+                    .operand = ep.body_result,
+                    .payload_index = break_payload_idx,
+                } });
+            }
         }
 
         // ---- Phase 3: Emit dbg_stmt + switch_block (body_tracking ON) ----
@@ -3237,21 +3268,25 @@ pub const FuncBody = struct {
             try b.extra.append(b.gpa, @intFromEnum(placeholder_idx));
         }
 
-        // else_info (if any)
+        // else_info (if any). A noreturn else body has no trailing break, so
+        // its body_len excludes the +1 and `is_simple_noreturn` is set.
         if (else_prong) |ep| {
+            const else_break_count: u32 = @intFromBool(!ep.body_is_noreturn);
             try b.extra.append(b.gpa, @bitCast(Zir.Inst.SwitchBlock.ProngInfo.Else{
-                .body_len = @intCast(ep.body_insts.len + 1), // +1 for break
+                .body_len = @intCast(ep.body_insts.len + else_break_count),
                 .capture = .none,
                 .is_inline = false,
                 .has_tag_capture = false,
-                .is_simple_noreturn = false,
+                .is_simple_noreturn = ep.body_is_noreturn,
             }));
         }
 
-        // scalar ProngInfos (all contiguous)
+        // scalar ProngInfos (all contiguous). A noreturn prong body has no
+        // synthesized trailing break, so its body_len excludes the +1.
         for (prongs) |p| {
+            const prong_break_count: u32 = @intFromBool(!p.body_is_noreturn);
             try b.extra.append(b.gpa, @bitCast(Zir.Inst.SwitchBlock.ProngInfo{
-                .body_len = @intCast(p.body_insts.len + 1), // +1 for break
+                .body_len = @intCast(p.body_insts.len + prong_break_count),
                 .capture = if (p.has_capture) .by_val else .none,
                 .is_inline = false,
                 .has_tag_capture = false,
@@ -3260,26 +3295,28 @@ pub const FuncBody = struct {
         }
 
         // scalar ItemInfos (all contiguous). Each is an enum-literal item
-        // carrying the interned enum_literal Ref for the variant name.
-        for (item_refs) |item_ref| {
+        // whose `data` is the interned NullTerminatedString index of the
+        // variant name.
+        for (item_name_strs) |str_index| {
             try b.extra.append(b.gpa, @bitCast(Zir.Inst.SwitchBlock.ItemInfo{
                 .kind = .enum_literal,
-                .data = @intCast(@intFromEnum(item_ref)),
+                .data = @intCast(str_index),
             }));
         }
 
-        // else body (if any), then scalar prong bodies.
+        // else body (if any), then scalar prong bodies. A noreturn body is
+        // already terminal, so no trailing break index is appended for it.
         if (else_prong) |ep| {
             for (ep.body_insts) |inst_i| {
                 try b.extra.append(b.gpa, inst_i);
             }
-            try b.extra.append(b.gpa, else_break_idx);
+            if (!ep.body_is_noreturn) try b.extra.append(b.gpa, else_break_idx);
         }
         for (prongs, 0..) |p, pi| {
             for (p.body_insts) |inst_i| {
                 try b.extra.append(b.gpa, inst_i);
             }
-            try b.extra.append(b.gpa, break_indices[pi]);
+            if (!p.body_is_noreturn) try b.extra.append(b.gpa, break_indices[pi]);
         }
 
         // Patch switch_block instruction's payload_index
@@ -5200,8 +5237,8 @@ test "Builder: addSwitchBlock extra data layout" {
     try std.testing.expectEqual(@as(@FieldType(Zir.Inst.SwitchBlock.ProngInfo, "body_len"), 1), prong0_info.body_len); // 0 body + 1 break
     try std.testing.expectEqual(Zir.Inst.SwitchBlock.ProngInfo.Capture.by_val, prong0_info.capture);
 
-    // extra[payload_idx+4] = ItemInfo[0]: an enum_literal item carrying the
-    // interned enum_literal Ref for "Ok".
+    // extra[payload_idx+4] = ItemInfo[0]: an enum_literal item whose `data`
+    // is the interned NullTerminatedString index of the variant name "Ok".
     const item0_info: Zir.Inst.SwitchBlock.ItemInfo = @bitCast(extra[payload_idx + 4]);
     try std.testing.expectEqual(Zir.Inst.SwitchBlock.ItemInfo.Kind.enum_literal, item0_info.kind);
     try std.testing.expect(item0_info.data > 0);

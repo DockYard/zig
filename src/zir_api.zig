@@ -3932,6 +3932,15 @@ pub export fn zir_builder_add_switch_block(
     /// read the captured payload. 0 means "no placeholder" (prong bodies
     /// reference the switch_block Ref directly).
     payload_capture_placeholder: u32,
+    /// Per-prong `noreturn` flags: when `prong_noreturn_flags[i]` is
+    /// non-zero, prong `i`'s body already self-terminates (ends in `ret`/
+    /// `unreachable`), so no trailing `break` is synthesized for it. This is
+    /// what an early-return switch arm (e.g. the `?` operator's `Error`
+    /// prong) requires.
+    prong_noreturn_flags: [*]const u32,
+    /// When non-zero, the `else` body is noreturn (same contract as
+    /// `prong_noreturn_flags`).
+    else_is_noreturn: u32,
 ) callconv(.c) u64 {
     const b = getBuilder(handle) orelse return 0xFFFFFFFFFFFFFFFF;
     const body = b.active_body orelse return 0xFFFFFFFFFFFFFFFF;
@@ -3949,6 +3958,7 @@ pub export fn zir_builder_add_switch_block(
             .has_capture = (prong_captures[i] & 1) != 0,
             .body_insts = prong_body_insts[body_offset .. body_offset + body_len],
             .body_result = @enumFromInt(prong_body_results[i]),
+            .body_is_noreturn = prong_noreturn_flags[i] != 0,
         };
         body_offset += body_len;
     }
@@ -3956,6 +3966,7 @@ pub export fn zir_builder_add_switch_block(
     const else_prong: ?ZirBuilder.FuncBody.SwitchElseProng = if (has_else != 0) .{
         .body_insts = prong_body_insts[body_offset .. body_offset + else_body_len],
         .body_result = @enumFromInt(else_body_result),
+        .body_is_noreturn = else_is_noreturn != 0,
     } else null;
 
     const placeholder: ?Zir.Inst.Index = if (payload_capture_placeholder != 0)
