@@ -343,36 +343,51 @@ fn resolveInOFile(of: *OFile, stab_symbol: []const u8, address_symbol_offset: u6
 pub fn getDwarfForAddress(mf: *MachOFile, gpa: Allocator, io: Io, vaddr: u64) !struct { *Dwarf, u64 } {
     const symbol = Symbol.find(mf.symbols, vaddr) orelse return error.MissingDebugInfo;
 
-    if (symbol.ofile == Symbol.unknown_ofile) return error.MissingDebugInfo;
-
     // offset of `address` from start of `symbol`
     const address_symbol_offset = vaddr - symbol.addr;
 
-    // Take the symbol name from the N_FUN STAB entry; it keys both the OSO
-    // `.o` symbol table and the dSYM symbol table.
+    // The symbol name keys both the OSO `.o` symbol table and the dSYM
+    // symbol table. It comes from the N_FUN STAB entry when this image
+    // carries a debug map, or from the ordinary `.sect` symbol when it does
+    // not (a stripped release binary — see below).
     const stab_symbol = mem.sliceTo(mf.strings[symbol.strx..], 0);
 
     // Primary path: the per-translation-unit OSO `.o` file the debug-map
     // points at. This is the fast path when the build tree is intact.
-    const oso_result: ?(Error!*OFile) = oso: {
-        const gop = mf.ofiles.getOrPut(gpa, symbol.ofile) catch |err| break :oso err;
-        if (!gop.found_existing) {
-            const name = mem.sliceTo(mf.strings[symbol.ofile..], 0);
-            gop.value_ptr.* = loadOFile(gpa, io, name);
+    //
+    // `unknown_ofile` means this symbol has NO debug-map entry. That happens
+    // for an image whose debug map was stripped entirely (a ReleaseFast /
+    // ReleaseSmall binary shipped with only a sibling `.dSYM`): the symtab
+    // then carries just ordinary `.sect` symbols, all with `unknown_ofile`.
+    // Such a symbol has no OSO `.o` to consult, so we skip straight to the
+    // dSYM fallback below — which is exactly the cross-compilation /
+    // release post-mortem case `dsymutil` + a retained dSYM is designed for
+    // (and what `atos`/`lldb` resolve from). Previously this returned
+    // `MissingDebugInfo` here, making a stripped binary + sibling dSYM
+    // unresolvable for source lines even though the dSYM held the DWARF.
+    if (symbol.ofile != Symbol.unknown_ofile) {
+        const oso_result: ?(Error!*OFile) = oso: {
+            const gop = mf.ofiles.getOrPut(gpa, symbol.ofile) catch |err| break :oso err;
+            if (!gop.found_existing) {
+                const name = mem.sliceTo(mf.strings[symbol.ofile..], 0);
+                gop.value_ptr.* = loadOFile(gpa, io, name);
+            }
+            break :oso if (gop.value_ptr.*) |*of| of else |err| err;
+        };
+        if (oso_result) |maybe_of| {
+            if (maybe_of) |of| {
+                if (resolveInOFile(of, stab_symbol, address_symbol_offset)) |hit| return hit;
+            } else |_| {}
         }
-        break :oso if (gop.value_ptr.*) |*of| of else |err| err;
-    };
-    if (oso_result) |maybe_of| {
-        if (maybe_of) |of| {
-            if (resolveInOFile(of, stab_symbol, address_symbol_offset)) |hit| return hit;
-        } else |_| {}
     }
 
     // Fallback: the sibling `.dSYM` bundle, which `dsymutil` populated with
-    // the consolidated DWARF from those same `.o` files. This rescues the
-    // common case where the `.o` files were transient (e.g. compiled into a
-    // temporary directory that has since been removed) but the dSYM was
-    // retained next to the binary.
+    // the consolidated DWARF keyed by symbol name. This rescues two cases:
+    // (1) the OSO `.o` files were transient (e.g. compiled into a temporary
+    // directory that has since been removed) but the dSYM was retained next
+    // to the binary; and (2) the binary was fully stripped of its debug map
+    // (`unknown_ofile` above), so the dSYM is the only debug info — the
+    // canonical shipped-release shape.
     const dsym_of = mf.getDsymOFile(gpa, io) catch return error.MissingDebugInfo;
     if (resolveInOFile(dsym_of, stab_symbol, address_symbol_offset)) |hit| return hit;
 
