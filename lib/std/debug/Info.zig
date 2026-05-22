@@ -103,7 +103,15 @@ pub fn resolveAddresses(
                         src_loc.* = .invalid;
                         continue;
                     },
-                    error.InvalidMachO, error.InvalidDwarf => return error.InvalidDebugInfo,
+                    // `getDwarfForAddress` swallows malformed-OSO / dSYM
+                    // errors internally (its only surfaced failures are
+                    // `MissingDebugInfo`, handled above, plus allocator
+                    // errors), so the previously-listed
+                    // `error.InvalidMachO, error.InvalidDwarf` prong is no
+                    // longer reachable — it would make this `switch`
+                    // reference errors outside the inferred error set and
+                    // fail to compile. Any remaining error (e.g.
+                    // `OutOfMemory`) propagates unchanged.
                     else => |e| return e,
                 };
                 if (dwarf.ranges.items.len == 0) {
