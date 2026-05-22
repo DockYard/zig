@@ -28,76 +28,30 @@ const build_options = @import("build_options");
 /// Root stub source for Zap executable outputs.
 ///
 /// Zap injects all real declarations as ZIR in-memory; this on-disk stub
-/// exists only for the root `File`'s identity/digest and to provide the
-/// program's panic namespace and a trivial `main`.
+/// exists only for the root `File`'s identity/digest and to give error
+/// reporting a valid AST tree (`SrcLoc.span`). Its ZIR is discarded — only
+/// `file.tree` (parsed from this source) survives; `file.zir` is replaced
+/// by the injected ZIR in `addZirImpl`.
 ///
-/// Phase 1.5 (Zap error system) — per-optimize-mode overflow/bounds
-/// policy. In Debug and ReleaseSafe builds Zap lowers integer arithmetic
-/// to Zig's *checked* tags, so an overflow trips the safety check and
-/// calls one of the panic handlers below; an out-of-bounds index calls
-/// `outOfBounds`/`integerOutOfBounds`. Rather than `@trap()` (which
-/// aborts with SIGILL and no message), these specific handlers route to
-/// `zapAbort`, which prints the canonical Zap error-abort line
-/// `** (<kind>) <message>` and exits non-zero — byte-for-byte the same
-/// shape the runtime's `Kernel.raise_with_kind` produces for an explicit
-/// `raise %ArithmeticError{}` / `raise %IndexError{}`. So the safe-mode
-/// overflow/bounds traps are observationally identical to raising the
-/// corresponding stdlib `pub error`. In ReleaseFast/ReleaseSmall, Zap
-/// emits wrapping arithmetic and Zig elides bounds checks where provably
-/// safe, so these handlers are simply never reached for those checks.
+/// Crucially, that means decls written HERE are invisible to Sema: Zig
+/// scans the *injected ZIR's* root struct namespace, not this AST. A
+/// previous version of this stub declared a `pub const panic` namespace
+/// hoping to route safe-mode overflow/bounds traps to a Zap-style abort,
+/// but because the stub's ZIR is thrown away that namespace was dead —
+/// `@hasDecl(root, "panic")` saw the injected ZIR (which carried no panic
+/// decl), so every Zig safety check fell through to Zig's default panic.
 ///
-/// The remaining handlers keep `@trap()`: they back safety checks outside
-/// the Phase 1.5 overflow/bounds contract (sentinel mismatch, inactive
-/// union field, etc.) and are routed to Zap errors in later phases.
+/// Phase 2.b fixes this at the source: Zap's root-ZIR builder now injects
+/// `pub const panic = @import("zap_runtime").ZapPanic;` directly into the
+/// root struct ZIR (via `zir_builder_begin_const_decl`/`end_const_decl`),
+/// so Zig's panic interface resolves `root.panic` to the Zap crash printer
+/// (`runtime.ZapPanic` → `Runtime.crashReport`). The dead stub panic
+/// namespace is therefore removed; this stub is now purely identity +
+/// std-options + a trivial `main`.
 const zap_exe_stub_source =
     "const std = @import(\"std\");\n" ++
     "pub const std_options_debug_threaded_io: ?*std.Io.Threaded = null;\n" ++
     "pub const std_options_debug_io: std.Io = std.Io.failing;\n" ++
-    "pub const panic = struct {\n" ++
-    // Canonical Zap error-abort: `** (<kind>) <message>\n` then exit(1).
-    // Matches runtime.Kernel.raise_with_kind so safe-mode traps look
-    // exactly like an explicit `raise %ArithmeticError{}` / IndexError.
-    "    fn zapAbort(kind: []const u8, message: []const u8) noreturn {\n" ++
-    "        _ = std.c.write(2, \"** (\", 4);\n" ++
-    "        _ = std.c.write(2, kind.ptr, kind.len);\n" ++
-    "        _ = std.c.write(2, \") \", 2);\n" ++
-    "        _ = std.c.write(2, message.ptr, message.len);\n" ++
-    "        _ = std.c.write(2, \"\\n\", 1);\n" ++
-    "        std.c.exit(1);\n" ++
-    "    }\n" ++
-    "    pub fn call(msg: []const u8, _: ?usize) noreturn {\n" ++
-    "        _ = std.c.write(2, msg.ptr, msg.len);\n" ++
-    "        _ = std.c.write(2, \"\\n\", 1);\n" ++
-    "        @trap();\n" ++
-    "    }\n" ++
-    "    pub fn sentinelMismatch(_: anytype, _: anytype) noreturn { @trap(); }\n" ++
-    "    pub fn unwrapError(_: anyerror) noreturn { @trap(); }\n" ++
-    // Phase 1.5 bounds policy → IndexError (Z1004).
-    "    pub fn outOfBounds(_: usize, _: usize) noreturn { zapAbort(\"index_error\", \"index out of bounds\"); }\n" ++
-    "    pub fn startGreaterThanEnd(_: usize, _: usize) noreturn { zapAbort(\"index_error\", \"slice start exceeds end\"); }\n" ++
-    "    pub fn inactiveUnionField(_: anytype, _: anytype) noreturn { @trap(); }\n" ++
-    "    pub fn sliceCastLenRemainder(_: usize) noreturn { @trap(); }\n" ++
-    "    pub fn reachedUnreachable() noreturn { @trap(); }\n" ++
-    "    pub fn unwrapNull() noreturn { @trap(); }\n" ++
-    "    pub fn castToNull() noreturn { @trap(); }\n" ++
-    "    pub fn incorrectAlignment() noreturn { @trap(); }\n" ++
-    "    pub fn invalidErrorCode() noreturn { @trap(); }\n" ++
-    "    pub fn integerOutOfBounds() noreturn { zapAbort(\"index_error\", \"integer index out of bounds\"); }\n" ++
-    // Phase 1.5 overflow policy → ArithmeticError (Z1003).
-    "    pub fn integerOverflow() noreturn { zapAbort(\"arithmetic_error\", \"integer overflow\"); }\n" ++
-    "    pub fn shlOverflow() noreturn { zapAbort(\"arithmetic_error\", \"left shift overflow\"); }\n" ++
-    "    pub fn shrOverflow() noreturn { zapAbort(\"arithmetic_error\", \"right shift overflow\"); }\n" ++
-    "    pub fn divideByZero() noreturn { zapAbort(\"arithmetic_error\", \"division by zero\"); }\n" ++
-    "    pub fn exactDivisionRemainder() noreturn { zapAbort(\"arithmetic_error\", \"exact division had a remainder\"); }\n" ++
-    "    pub fn integerPartOutOfBounds() noreturn { @trap(); }\n" ++
-    "    pub fn corruptSwitch() noreturn { @trap(); }\n" ++
-    "    pub fn shiftRhsTooBig() noreturn { zapAbort(\"arithmetic_error\", \"shift amount exceeds bit width\"); }\n" ++
-    "    pub fn invalidEnumValue() noreturn { @trap(); }\n" ++
-    "    pub fn forLenMismatch() noreturn { @trap(); }\n" ++
-    "    pub fn copyLenMismatch() noreturn { @trap(); }\n" ++
-    "    pub fn memcpyAlias() noreturn { @trap(); }\n" ++
-    "    pub fn noreturnReturned() noreturn { @trap(); }\n" ++
-    "};\n" ++
     "pub fn main() void {}\n";
 
 /// Flat, C-ABI-safe representation of ZIR data.
@@ -3523,6 +3477,48 @@ pub export fn zir_builder_end_root_field_body(
     const body = b.active_body orelse return -1;
     const ref: Zir.Inst.Ref = @enumFromInt(final_ref);
     b.endRootFieldBody(body, ref) catch return -1;
+    return 0;
+}
+
+/// Begin recording the value body of a named comptime constant
+/// declaration `pub const <name> = <expr>;` at the current namespace scope.
+/// Pushes a transient `FuncBody` so subsequent `zir_builder_emit_*` calls
+/// capture the initializer expression's instructions into the declaration's
+/// value body. Caller must finish with `zir_builder_end_const_decl`.
+///
+/// Declaration analogue of `zir_builder_begin_root_field_body` (which
+/// records a struct field type body): this produces a NAMESPACE DECLARATION
+/// listed under the enclosing struct_decl's `decls`, not a struct field.
+/// Used by Zap's root-ZIR builder to inject `pub const panic =
+/// @import("zap_runtime").ZapPanic;` so Zig's panic interface routes safety
+/// panics through the Zap crash printer.
+///
+/// Returns 0 on success, -1 on error.
+pub export fn zir_builder_begin_const_decl(
+    handle: ?*ZirBuilderHandle,
+    name_ptr: [*]const u8,
+    name_len: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const name = name_ptr[0..name_len];
+    _ = b.beginConstDecl(name) catch return -1;
+    return 0;
+}
+
+/// Finish recording a const declaration's value body. `value_ref` is the
+/// Ref the body produces — the initializer expression's result, which
+/// becomes the operand of the synthesized terminating `break_inline`. The
+/// declaration is registered for the enclosing struct_decl.
+///
+/// Returns 0 on success, -1 on error.
+pub export fn zir_builder_end_const_decl(
+    handle: ?*ZirBuilderHandle,
+    value_ref: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    const ref: Zir.Inst.Ref = @enumFromInt(value_ref);
+    b.endConstDecl(body, ref) catch return -1;
     return 0;
 }
 

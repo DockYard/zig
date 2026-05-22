@@ -397,6 +397,134 @@ pub const Builder = struct {
         self.gpa.destroy(body);
     }
 
+    /// Begin recording the value body of a named comptime constant
+    /// declaration `pub const <name> = <expr>;` at the current namespace
+    /// scope (the root struct_decl, or a nested struct between
+    /// `beginStructDecl`/`endStructDecl`). Allocates a transient `FuncBody`
+    /// and installs it as `active_body`, so any subsequent
+    /// `zir_builder_emit_*` calls record the expression's instructions into
+    /// this declaration's value body. Caller must finish with
+    /// `endConstDecl(body, value_ref)`.
+    ///
+    /// This is the declaration analogue of `beginRootFieldBody` (which
+    /// records a struct *field type* body): both record into a transient
+    /// `FuncBody`, but a const decl produces a NAMESPACE DECLARATION
+    /// (appended to `decl_indices` and emitted in the struct_decl's `decls`
+    /// trailer) rather than a struct field. Unlike `beginFunction`, there
+    /// is no `func`/`restore_err_ret_index` instruction and no params — the
+    /// value body is exactly the recorded expression instructions plus a
+    /// trailing `break_inline value_ref`, the same shape AstGen emits for a
+    /// `pub const x = <expr>;` whose initializer is not itself a function.
+    ///
+    /// Used by Zap's root-ZIR builder to inject the root `pub const panic`
+    /// namespace (`@import("zap_runtime").ZapPanic`) so Zig's panic
+    /// interface (`@hasDecl(root, "panic")`) routes safety panics to the
+    /// Zap crash printer.
+    pub fn beginConstDecl(self: *Builder, decl_name: []const u8) !*FuncBody {
+        std.debug.assert(self.active_body == null);
+
+        const name_copy = try self.gpa.dupe(u8, decl_name);
+        errdefer self.gpa.free(name_copy);
+
+        // Emit the placeholder declaration instruction now (fixed up in
+        // endConstDecl), exactly as beginFunction does, so the value body's
+        // `break_inline` can target it as its block_inst.
+        const decl_inst = try self.addInst(.declaration, encodeDeclaration(0, 0));
+
+        const body = try self.gpa.create(FuncBody);
+        errdefer self.gpa.destroy(body);
+
+        body.* = FuncBody{
+            .builder = self,
+            .body_inst_indices = .empty,
+            .param_inst_indices = .empty,
+            .name = name_copy,
+            .decl_inst = decl_inst,
+            .restore_inst = 0, // unused: a const decl body has no err-ret restore
+            // No implicit return is ever synthesized for a const decl —
+            // endConstDecl is the sink, not endFunction.
+            .has_explicit_return = true,
+            .ret_type = .void, // unused for a const value body
+            .extra_start = self.extra.items.len,
+            .string_start = self.string_bytes.items.len,
+        };
+
+        self.active_body = body;
+        return body;
+    }
+
+    /// Finish recording a const declaration's value body. `value_ref` is
+    /// the Ref the body produces — the initializer expression's result.
+    /// Emits the trailing `break_inline value_ref` (targeting the
+    /// declaration placeholder), builds the `pub_const_simple` declaration
+    /// payload (synthetic source hash + flags + name + value body), fixes
+    /// up the placeholder, and registers the declaration in `decl_indices`
+    /// so `finalize()` lists it under the enclosing struct_decl's `decls`.
+    pub fn endConstDecl(self: *Builder, body: *FuncBody, value_ref: Zir.Inst.Ref) !void {
+        std.debug.assert(self.active_body == body);
+
+        const decl_inst = body.decl_inst;
+
+        // Trailing break_inline: operand = value_ref, block_inst = the
+        // declaration placeholder. Mirrors the function path's terminating
+        // break (endFunction), minus the intervening `func` instruction.
+        const break_payload_idx: u32 = @intCast(self.extra.items.len);
+        try self.extra.append(self.gpa, @bitCast(@as(i32, std.math.maxInt(i32)))); // operand_src_node = none
+        try self.extra.append(self.gpa, decl_inst); // block_inst = declaration
+        const break_inst = try self.addInst(.break_inline, encodeBreak(value_ref, break_payload_idx));
+
+        // The value body is the recorded expression instructions in order,
+        // followed by the break_inline. Take ownership of the recorded
+        // indices (as beginConstDecl recorded them via body_tracking).
+        const recorded_instructions = try body.body_inst_indices.toOwnedSlice(self.gpa);
+        defer self.gpa.free(recorded_instructions);
+        const value_body_len: u32 = @intCast(recorded_instructions.len + 1);
+
+        const decl_hash = self.syntheticFunctionHash(
+            body,
+            self.extra.items.len,
+            self.tags.items.len,
+        );
+
+        // Build Declaration payload in extra (matches endFunction).
+        const decl_payload_idx: u32 = @intCast(self.extra.items.len);
+
+        try appendSrcHash(&self.extra, self.gpa, decl_hash);
+
+        // flags (packed Declaration.Flags as 2 u32s): id=pub_const_simple(7)
+        // in the top 5 bits of the u64, src_line=0, src_column=0.
+        // flags_0 = 0, flags_1 = 7 << 27 = 0x38000000.
+        try self.extra.append(self.gpa, 0);
+        try self.extra.append(self.gpa, 0x38000000);
+
+        // name: NullTerminatedString
+        const name_idx = try self.internString(body.name);
+        try self.extra.append(self.gpa, name_idx);
+
+        // value_body_len
+        try self.extra.append(self.gpa, value_body_len);
+
+        // value_body: recorded expression instructions, then break_inline.
+        for (recorded_instructions) |inst_idx| {
+            try self.extra.append(self.gpa, inst_idx);
+        }
+        try self.extra.append(self.gpa, break_inst);
+
+        // Fix up the declaration placeholder with the real payload index.
+        self.data.items[decl_inst] = encodeDeclaration(0, decl_payload_idx);
+
+        // Register the declaration for the enclosing struct_decl.
+        try self.decl_indices.append(self.gpa, decl_inst);
+
+        // Clean up the transient body. `name` ownership was consumed by
+        // `internString` (which copied it), so free the dup'd name now.
+        self.gpa.free(body.name);
+        body.body_inst_indices.deinit(self.gpa);
+        body.param_inst_indices.deinit(self.gpa);
+        self.active_body = null;
+        self.gpa.destroy(body);
+    }
+
     /// Legacy bulk API — kept as a thin wrapper around the streaming
     /// API above so downstream callers that haven't migrated yet
     /// continue to work. Each `(name, ref)` pair becomes one
