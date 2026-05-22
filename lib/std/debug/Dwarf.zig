@@ -469,7 +469,17 @@ fn scanAllFunctions(di: *Dwarf, gpa: Allocator, endian: Endian) ScanError!void {
                         var this_die_obj = die_obj;
                         // Prevent endless loops
                         for (0..3) |_| {
-                            if (this_die_obj.getAttr(AT.name)) |_| {
+                            // Prefer `DW_AT_linkage_name` (the fully-qualified
+                            // mangled symbol, e.g. `Demo.deeper__0`) over the
+                            // unqualified `DW_AT_name` (`deeper__0`). The linkage
+                            // name is the canonical name a backtrace symbolizer
+                            // should report: it matches the linker symbol table
+                            // and any sidecar keyed on mangled names (Zap's
+                            // `.zap-symbols` reverse map relies on this). Fall
+                            // back to `DW_AT_name` when no linkage name exists.
+                            if (this_die_obj.getAttr(AT.linkage_name)) |_| {
+                                break :x try this_die_obj.getAttrString(di, endian, AT.linkage_name, di.section(.debug_str), &compile_unit);
+                            } else if (this_die_obj.getAttr(AT.name)) |_| {
                                 break :x try this_die_obj.getAttrString(di, endian, AT.name, di.section(.debug_str), &compile_unit);
                             } else if (this_die_obj.getAttr(AT.abstract_origin)) |_| {
                                 const after_die_offset = fr.seek;

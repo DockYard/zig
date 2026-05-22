@@ -3,6 +3,23 @@ symbols: []const Symbol,
 strings: []const u8,
 text_vmaddr: u64,
 
+/// An owned copy of the path the image was loaded from. Used to derive the
+/// sibling `.dSYM` bundle path for the `dsym_ofile` fallback below.
+exe_path: []const u8,
+
+/// Lazily-loaded `OFile` for the sibling `<exe_path>.dSYM` debug bundle, or
+/// `null` until first attempted. On macOS, `dsymutil` consolidates the
+/// per-translation-unit DWARF that lives in the original `.o` files (which
+/// the STABS `OSO` debug-map references) into a single dSYM Mach-O. When
+/// those `.o` files are unavailable at run time — e.g. a build system that
+/// compiles into a temporary directory and then deletes it, keeping only
+/// the final binary plus its dSYM — the per-symbol `OSO` lookup in
+/// `getDwarfForAddress` fails. In that case we fall back to the dSYM, which
+/// carries the same `__DWARF` sections and a symbol table keyed by symbol
+/// name, so the existing name → vaddr resolution works against it unchanged.
+/// This is the canonical debug-info container `atos`/`lldb` consult.
+dsym_ofile: ?(Error!OFile) = null,
+
 /// Key is index into `strings` of the file path.
 ofiles: std.AutoArrayHashMapUnmanaged(u32, Error!OFile),
 
@@ -23,6 +40,14 @@ pub fn deinit(mf: *MachOFile, gpa: Allocator) void {
         of.symbols_by_name.deinit(gpa);
     }
     mf.ofiles.deinit(gpa);
+    if (mf.dsym_ofile) |*maybe_of| {
+        if (maybe_of.*) |*of| {
+            posix.munmap(of.mapped_memory);
+            of.dwarf.deinit(gpa);
+            of.symbols_by_name.deinit(gpa);
+        } else |_| {}
+    }
+    gpa.free(mf.exe_path);
     gpa.free(mf.symbols);
     posix.munmap(mf.mapped_memory);
 }
@@ -32,6 +57,11 @@ pub fn load(gpa: Allocator, io: Io, path: []const u8, arch: std.Target.Cpu.Arch)
         .x86_64, .aarch64 => {},
         else => unreachable,
     }
+
+    // Keep our own copy of the load path so a later `getDwarfForAddress`
+    // can derive the sibling `.dSYM` bundle path on demand.
+    const exe_path = try gpa.dupe(u8, path);
+    errdefer gpa.free(exe_path);
 
     const all_mapped_memory = try mapDebugInfoFile(io, path);
     errdefer posix.munmap(all_mapped_memory);
@@ -257,33 +287,49 @@ pub fn load(gpa: Allocator, io: Io, path: []const u8, arch: std.Target.Cpu.Arch)
         .mapped_memory = all_mapped_memory,
         .symbols = symbols_slice,
         .strings = strings,
+        .exe_path = exe_path,
         .ofiles = .empty,
         .text_vmaddr = text_vmaddr,
     };
 }
-pub fn getDwarfForAddress(mf: *MachOFile, gpa: Allocator, io: Io, vaddr: u64) !struct { *Dwarf, u64 } {
-    const symbol = Symbol.find(mf.symbols, vaddr) orelse return error.MissingDebugInfo;
 
-    if (symbol.ofile == Symbol.unknown_ofile) return error.MissingDebugInfo;
-
-    // offset of `address` from start of `symbol`
-    const address_symbol_offset = vaddr - symbol.addr;
-
-    // Take the symbol name from the N_FUN STAB entry, we're going to
-    // use it if we fail to find the DWARF infos
-    const stab_symbol = mem.sliceTo(mf.strings[symbol.strx..], 0);
-
-    const gop = try mf.ofiles.getOrPut(gpa, symbol.ofile);
-    if (!gop.found_existing) {
-        const name = mem.sliceTo(mf.strings[symbol.ofile..], 0);
-        gop.value_ptr.* = loadOFile(gpa, io, name);
+/// Resolve, mapping and caching on first use, the sibling dSYM bundle's
+/// DWARF `OFile` for this image. Returns `error.MissingDebugInfo` when no
+/// dSYM is present next to the executable. The dSYM Mach-O is loaded with
+/// the same `loadOFile` path the OSO `.o` files use — it has identical
+/// `__DWARF` sections and a name-keyed symbol table — so the caller's
+/// symbol-name → vaddr lookup works against it unchanged.
+fn getDsymOFile(mf: *MachOFile, gpa: Allocator, io: Io) Error!*OFile {
+    if (mf.dsym_ofile == null) {
+        mf.dsym_ofile = loadDsymOFile(gpa, io, mf.exe_path);
     }
-    const of = &(gop.value_ptr.* catch |err| return err);
+    return if (mf.dsym_ofile.?) |*of| of else |err| err;
+}
 
+/// Build the conventional dSYM DWARF path
+/// `<exe>.dSYM/Contents/Resources/DWARF/<basename>` and load it as an
+/// `OFile`. The basename is the executable's own file name (dsymutil names
+/// the inner Mach-O after the product). Returns `error.MissingDebugInfo`
+/// when the bundle is absent.
+fn loadDsymOFile(gpa: Allocator, io: Io, exe_path: []const u8) Error!OFile {
+    const basename = std.fs.path.basename(exe_path);
+    const dwarf_path = std.fmt.allocPrint(
+        gpa,
+        "{s}.dSYM/Contents/Resources/DWARF/{s}",
+        .{ exe_path, basename },
+    ) catch return error.OutOfMemory;
+    defer gpa.free(dwarf_path);
+    return loadOFile(gpa, io, dwarf_path);
+}
+
+/// Resolve `stab_symbol` within a single debug `OFile` (an OSO `.o` or the
+/// dSYM), returning its DWARF plus the address translated into that file's
+/// vaddr space, or `null` when the file does not contain the symbol.
+fn resolveInOFile(of: *OFile, stab_symbol: []const u8, address_symbol_offset: u64) ?struct { *Dwarf, u64 } {
     const symbol_index = of.symbols_by_name.getKeyAdapted(
         @as([]const u8, stab_symbol),
         @as(OFile.SymbolAdapter, .{ .strtab = of.strtab, .symtab_raw = of.symtab_raw }),
-    ) orelse return error.MissingDebugInfo;
+    ) orelse return null;
 
     const symbol_ofile_vaddr = vaddr: {
         var sym = of.symtab_raw[symbol_index];
@@ -292,6 +338,45 @@ pub fn getDwarfForAddress(mf: *MachOFile, gpa: Allocator, io: Io, vaddr: u64) !s
     };
 
     return .{ &of.dwarf, symbol_ofile_vaddr + address_symbol_offset };
+}
+
+pub fn getDwarfForAddress(mf: *MachOFile, gpa: Allocator, io: Io, vaddr: u64) !struct { *Dwarf, u64 } {
+    const symbol = Symbol.find(mf.symbols, vaddr) orelse return error.MissingDebugInfo;
+
+    if (symbol.ofile == Symbol.unknown_ofile) return error.MissingDebugInfo;
+
+    // offset of `address` from start of `symbol`
+    const address_symbol_offset = vaddr - symbol.addr;
+
+    // Take the symbol name from the N_FUN STAB entry; it keys both the OSO
+    // `.o` symbol table and the dSYM symbol table.
+    const stab_symbol = mem.sliceTo(mf.strings[symbol.strx..], 0);
+
+    // Primary path: the per-translation-unit OSO `.o` file the debug-map
+    // points at. This is the fast path when the build tree is intact.
+    const oso_result: ?(Error!*OFile) = oso: {
+        const gop = mf.ofiles.getOrPut(gpa, symbol.ofile) catch |err| break :oso err;
+        if (!gop.found_existing) {
+            const name = mem.sliceTo(mf.strings[symbol.ofile..], 0);
+            gop.value_ptr.* = loadOFile(gpa, io, name);
+        }
+        break :oso if (gop.value_ptr.*) |*of| of else |err| err;
+    };
+    if (oso_result) |maybe_of| {
+        if (maybe_of) |of| {
+            if (resolveInOFile(of, stab_symbol, address_symbol_offset)) |hit| return hit;
+        } else |_| {}
+    }
+
+    // Fallback: the sibling `.dSYM` bundle, which `dsymutil` populated with
+    // the consolidated DWARF from those same `.o` files. This rescues the
+    // common case where the `.o` files were transient (e.g. compiled into a
+    // temporary directory that has since been removed) but the dSYM was
+    // retained next to the binary.
+    const dsym_of = mf.getDsymOFile(gpa, io) catch return error.MissingDebugInfo;
+    if (resolveInOFile(dsym_of, stab_symbol, address_symbol_offset)) |hit| return hit;
+
+    return error.MissingDebugInfo;
 }
 pub fn lookupSymbolName(mf: *MachOFile, vaddr: u64) error{MissingDebugInfo}![]const u8 {
     const symbol = Symbol.find(mf.symbols, vaddr) orelse return error.MissingDebugInfo;
@@ -493,7 +578,17 @@ fn loadOFile(gpa: Allocator, io: Io, o_file_name: []const u8) !OFile {
             @as([]const u8, sym_name),
             @as(OFile.SymbolAdapter, .{ .strtab = strtab, .symtab_raw = symtab_raw }),
         );
-        if (gop.found_existing) return error.InvalidMachO;
+        // Duplicate symbol names are NOT an error here: while a per-translation-unit
+        // OSO `.o` has unique defined names, a fully-linked image (a sibling `.dSYM`
+        // bundle, which this same loader maps for the dSYM fallback in
+        // `getDwarfForAddress`) legitimately carries duplicate names — e.g.
+        // `__mh_execute_header`, `_builtin.target`, and weak/linkonce generic
+        // instantiations emitted into more than one TU. Those weak duplicates are
+        // coalesced by the linker to a single final address, so keeping the first
+        // occurrence yields the correct vaddr for name→DWARF resolution. Failing the
+        // whole load on the first collision (as this previously did) defeated the
+        // dSYM fallback entirely. Keep the first; skip the rest.
+        if (gop.found_existing) continue;
         gop.key_ptr.* = @intCast(sym_index);
     }
 
