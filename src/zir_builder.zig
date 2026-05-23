@@ -3815,30 +3815,88 @@ pub const FuncBody = struct {
     }
 
     /// Mark this function as returning an error union type: `error{name}!T`
-    /// where T is the current ret_type. Emits instructions for the error set
-    /// and error union type, and stores them as a ret_ty body.
+    /// where `T` is the payload return type ALREADY established by a prior
+    /// `set*ReturnType` call (or the scalar `ret_type` for primitives).
     ///
-    /// Must be called after beginFunction but before any body instructions
-    /// that depend on the return type.
+    /// The error union must COMPOSE with the payload type, including complex
+    /// payloads (`List(T)`, `Map(K,V)`, named structs, unions, tuples,
+    /// optionals). The previous implementation snapshotted only the scalar
+    /// `ret_type` Ref and ignored the complex-payload return-type
+    /// instructions, so a raising function with a complex return type
+    /// (`fn(...) -> [T] raises E`) emitted a bare `error{ZapRaise}!<default>`
+    /// that dropped the real payload — the for-comprehension helper
+    /// (`__for_N -> [mapped]`) and effect-polymorphic combinators all hit
+    /// this. The fix resolves the payload to a single ZIR Ref (reusing the
+    /// payload's own ret_ty body instructions when it is a complex type),
+    /// builds `error_union_type{ anyerror, payload }`, and re-expresses the
+    /// whole thing through the general custom-return-type body so
+    /// `endFunction` emits `[<payload body...>, error_union_type,
+    /// break_inline]` for every payload kind uniformly.
+    ///
+    /// Must be called AFTER the payload return type is set (the Zap ZIR
+    /// driver reorders `emitComplexReturnType` before this call) but before
+    /// the function body's `endFunction`.
     pub fn setErrorUnionReturnType(self: *FuncBody, _: []const u8) !void {
-        self.clearReturnTypeState();
         const b = self.builder;
         const gpa = b.gpa;
 
-        // Make the ret_ty body produce `anyerror!T` using anyerror_type Ref
-        // and an error_union_type instruction. Zig will infer the specific
-        // error set from the error_value returns in the function body.
-        const payload_type_ref: Zir.Inst.Ref = @enumFromInt(@intFromEnum(self.ret_type));
+        // Resolve the payload type to a single result instruction plus the
+        // body instructions that produce it. Each payload kind stores its
+        // resolved type instruction (and, for import/custom, the supporting
+        // instructions that must live in the same ret_ty body) in a distinct
+        // field; collapse them into one (result_inst, body[]) pair.
+        var payload_body: std.ArrayListUnmanaged(u32) = .empty;
+        defer payload_body.deinit(gpa);
+
+        const payload_ref: Zir.Inst.Ref = blk: {
+            if (self.custom_ret_type_result) |result_idx| {
+                try payload_body.appendSlice(gpa, self.custom_ret_type_body.items);
+                break :blk Builder.instRef(result_idx);
+            } else if (self.imported_ret_type_inst) |imported_idx| {
+                if (self.imported_ret_import_inst) |import_idx| {
+                    try payload_body.append(gpa, import_idx);
+                }
+                try payload_body.append(gpa, imported_idx);
+                break :blk Builder.instRef(imported_idx);
+            } else if (self.decl_val_ret_type_inst) |decl_val_idx| {
+                try payload_body.append(gpa, decl_val_idx);
+                break :blk Builder.instRef(decl_val_idx);
+            } else if (self.union_ret_type_inst) |union_idx| {
+                try payload_body.append(gpa, union_idx);
+                break :blk Builder.instRef(union_idx);
+            } else if (self.tuple_ret_type_inst) |tuple_idx| {
+                try payload_body.append(gpa, tuple_idx);
+                break :blk Builder.instRef(tuple_idx);
+            } else if (self.optional_ret_type_inst) |opt_idx| {
+                try payload_body.append(gpa, opt_idx);
+                break :blk Builder.instRef(opt_idx);
+            } else {
+                // Primitive / well-known payload carried by the scalar
+                // ret_type Ref — no supporting body instructions needed.
+                break :blk @as(Zir.Inst.Ref, @enumFromInt(@intFromEnum(self.ret_type)));
+            }
+        };
+
+        // Now that the payload is captured, clear the per-kind state so the
+        // combined custom-return-type body below is the single source of
+        // truth for `endFunction`.
+        self.clearReturnTypeState();
+
+        // Build `error_union_type{ lhs: anyerror, rhs: payload }`. Zig infers
+        // the concrete error set from the `error_value` returns in the body.
         const anyerror_ref = Zir.Inst.Ref.anyerror_type;
+        const eu_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @intFromEnum(anyerror_ref));
+        try b.extra.append(gpa, @intFromEnum(payload_ref));
+        const error_union_inst = try b.addInst(.error_union_type, Builder.encodePlNode(.zero, eu_payload_idx));
 
-        // Build the error_union_type: pl_node with Bin payload {lhs: error_set, rhs: payload_type}
-        const payload_idx: u32 = @intCast(b.extra.items.len);
-        try b.extra.append(gpa, @intFromEnum(anyerror_ref)); // lhs = anyerror
-        try b.extra.append(gpa, @intFromEnum(payload_type_ref)); // rhs = payload type
-        const error_union_inst = try b.addInst(.error_union_type, Builder.encodePlNode(.zero, payload_idx));
-
-        // Store for endFunction to use in ret_ty body
-        self.error_union_ret_type_inst = error_union_inst;
+        // Express the composed return type through the general custom body:
+        // [<payload-producing instructions...>, error_union_type]. The
+        // result instruction is the error_union_type; `endFunction` appends
+        // the break_inline targeting it.
+        try self.custom_ret_type_body.appendSlice(gpa, payload_body.items);
+        try self.custom_ret_type_body.append(gpa, error_union_inst);
+        self.custom_ret_type_result = error_union_inst;
     }
 
     /// Emit a short-circuit boolean AND: if `lhs` is true, evaluate the rhs
