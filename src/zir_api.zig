@@ -4269,6 +4269,8 @@ pub export fn zir_builder_emit_if_else_bodies(
     else_insts_ptr: [*]const u32,
     else_insts_len: u32,
     else_result: u32,
+    then_is_noreturn: u32,
+    else_is_noreturn: u32,
 ) callconv(.c) u32 {
     const b = getBuilder(handle) orelse return 0xFFFFFFFF;
     const body = b.active_body orelse return 0xFFFFFFFF;
@@ -4281,6 +4283,8 @@ pub export fn zir_builder_emit_if_else_bodies(
         then_ref,
         else_insts_ptr[0..else_insts_len],
         else_ref,
+        then_is_noreturn != 0,
+        else_is_noreturn != 0,
     ) catch return 0xFFFFFFFF;
     return @intFromEnum(ref);
 }

@@ -2931,14 +2931,31 @@ pub const FuncBody = struct {
         then_result: Zir.Inst.Ref,
         else_insts: []const u32,
         else_result: Zir.Inst.Ref,
+        then_is_noreturn: bool,
+        else_is_noreturn: bool,
     ) !Zir.Inst.Ref {
         const b = self.builder;
         const gpa = b.gpa;
 
-        // then body = then_insts... + break_inline(block, then_result)
-        // else body = else_insts... + break_inline(block, else_result)
-        const then_body_len: u32 = @intCast(then_insts.len + 1);
-        const else_body_len: u32 = @intCast(else_insts.len + 1);
+        // A branch body that already self-terminates with a `noreturn`
+        // instruction (e.g. a trailing `ret`/`unreachable`, or a body whose
+        // last instruction is a call to a `noreturn` function — a Zap
+        // `do_raise` re-raise) is already terminal. It gets NO synthesized
+        // trailing `break`: the body is the branch's noreturn terminator, so
+        // an appended `break` would be dead code whose `br` target dangles
+        // and trips AIR Liveness (`analyzeInstBr`'s `block_scopes.get(...).?`
+        // null-unwrap — the block scope of a noreturn-terminated branch is
+        // never registered for a trailing break). This mirrors
+        // `addSwitchBlock`'s per-prong `body_is_noreturn` handling for the
+        // `if`/`condbr` form. `then_result`/`else_result` are ignored for a
+        // noreturn branch.
+        //
+        // then body = then_insts... [+ break_inline(block, then_result)]
+        // else body = else_insts... [+ break_inline(block, else_result)]
+        const then_break_count: u32 = @intFromBool(!then_is_noreturn);
+        const else_break_count: u32 = @intFromBool(!else_is_noreturn);
+        const then_body_len: u32 = @intCast(then_insts.len + then_break_count);
+        const else_body_len: u32 = @intCast(else_insts.len + else_break_count);
 
         // 1. Emit block with placeholder payload.
         // Using non-inline block+condbr+break so conditions can be runtime values.
@@ -2958,33 +2975,41 @@ pub const FuncBody = struct {
             try capture.append(gpa, block_idx);
         }
 
-        // 2. Emit break for then branch (NOT a body instruction).
-        const break_then_payload_idx: u32 = @intCast(b.extra.items.len);
-        try b.extra.append(gpa, @bitCast(@as(i32, std.math.maxInt(i32)))); // operand_src_node = none
-        try b.extra.append(gpa, block_idx); // block_inst
-        const break_then_idx = try b.addInst(.@"break", Builder.encodeBreak(then_result, break_then_payload_idx));
+        // 2. Emit break for then branch (NOT a body instruction). Skipped for
+        //    a noreturn branch, whose body is already terminal.
+        var break_then_idx: u32 = undefined;
+        if (!then_is_noreturn) {
+            const break_then_payload_idx: u32 = @intCast(b.extra.items.len);
+            try b.extra.append(gpa, @bitCast(@as(i32, std.math.maxInt(i32)))); // operand_src_node = none
+            try b.extra.append(gpa, block_idx); // block_inst
+            break_then_idx = try b.addInst(.@"break", Builder.encodeBreak(then_result, break_then_payload_idx));
+        }
 
-        // 3. Emit break for else branch (NOT a body instruction).
-        const break_else_payload_idx: u32 = @intCast(b.extra.items.len);
-        try b.extra.append(gpa, @bitCast(@as(i32, std.math.maxInt(i32)))); // operand_src_node = none
-        try b.extra.append(gpa, block_idx); // block_inst
-        const break_else_idx = try b.addInst(.@"break", Builder.encodeBreak(else_result, break_else_payload_idx));
+        // 3. Emit break for else branch (NOT a body instruction). Skipped for
+        //    a noreturn branch.
+        var break_else_idx: u32 = undefined;
+        if (!else_is_noreturn) {
+            const break_else_payload_idx: u32 = @intCast(b.extra.items.len);
+            try b.extra.append(gpa, @bitCast(@as(i32, std.math.maxInt(i32)))); // operand_src_node = none
+            try b.extra.append(gpa, block_idx); // block_inst
+            break_else_idx = try b.addInst(.@"break", Builder.encodeBreak(else_result, break_else_payload_idx));
+        }
 
         // 4. Emit condbr with full branch bodies.
         const condbr_payload_idx: u32 = @intCast(b.extra.items.len);
         try b.extra.append(gpa, @intFromEnum(condition)); // condition
         try b.extra.append(gpa, then_body_len); // then_body_len
         try b.extra.append(gpa, else_body_len); // else_body_len
-        // then body: branch instructions + break
+        // then body: branch instructions [+ break]
         for (then_insts) |idx| {
             try b.extra.append(gpa, idx);
         }
-        try b.extra.append(gpa, break_then_idx);
-        // else body: branch instructions + break
+        if (!then_is_noreturn) try b.extra.append(gpa, break_then_idx);
+        // else body: branch instructions [+ break]
         for (else_insts) |idx| {
             try b.extra.append(gpa, idx);
         }
-        try b.extra.append(gpa, break_else_idx);
+        if (!else_is_noreturn) try b.extra.append(gpa, break_else_idx);
         const condbr_idx = try b.addInst(.condbr, Builder.encodePlNode(.zero, condbr_payload_idx));
 
         // 5. Fix up block's body to point to condbr.
