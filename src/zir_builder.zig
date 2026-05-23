@@ -3578,15 +3578,26 @@ pub const FuncBody = struct {
         const b = self.builder;
         const gpa = b.gpa;
 
-        // Emit unreachable instruction for the error body (NOT a body instruction).
-        // The .@"unreachable" tag uses .@"unreachable" data: { src_node: Node.Offset }
-        const unreachable_idx = try b.addInst(.@"unreachable", .{ .@"unreachable" = .{ .src_node = .zero } });
+        // `try operand` PROPAGATES the error: on the error branch, extract the
+        // error code from the operand and `return` it from the enclosing
+        // function (which builds the error return trace). The error body is
+        // therefore `[err_union_code(operand), ret_node(err_code)]` — exactly
+        // what the canonical AstGen `tryExpr` emits. (The previous
+        // implementation used a bare `unreachable` error body, which is
+        // `orelse unreachable` / assert-no-error semantics, NOT propagation —
+        // a real propagated error hit that `unreachable` and crashed.)
+        //
+        // These two instructions are NON-body instructions of the enclosing
+        // block; they are referenced only from the try's trailing body array.
+        const err_code_idx = try b.addInst(.err_union_code, Builder.encodeUnNode(.zero, operand));
+        const ret_idx = try b.addInst(.ret_node, Builder.encodeUnNode(.zero, Builder.instRef(err_code_idx)));
 
         // Try payload in extra: { operand: Ref, body_len: u32 }, trailing: [body_len] inst indices
         const payload_idx: u32 = @intCast(b.extra.items.len);
         try b.extra.append(gpa, @intFromEnum(operand)); // operand
-        try b.extra.append(gpa, 1); // body_len = 1
-        try b.extra.append(gpa, unreachable_idx); // body[0] = unreachable
+        try b.extra.append(gpa, 2); // body_len = 2
+        try b.extra.append(gpa, err_code_idx); // body[0] = err_union_code
+        try b.extra.append(gpa, ret_idx); // body[1] = ret_node(err_code)
 
         return self.emitBodyInst(.@"try", Builder.encodePlNode(.zero, payload_idx));
     }
