@@ -31,7 +31,6 @@ pub fn getSymbols(
     resolve_inline_callers: bool,
     symbols: *std.ArrayList(std.debug.Symbol),
 ) Error!void {
-    _ = resolve_inline_callers;
     const gpa = std.debug.getDebugInfoAllocator();
 
     const module = try si.findModule(gpa, io, address);
@@ -68,6 +67,39 @@ pub fn getSymbols(
             .source_location = null,
         });
     };
+
+    // On the cold report path (`resolve_inline_callers`), expand the address
+    // into its full DWARF inline-frame chain via the shared `Dwarf.getSymbols`
+    // (one `Symbol` per inlined source frame, innermost first, ending at the
+    // concrete function). Without this a fully-inlined leaf — where the entire
+    // alloc/capture plumbing is inlined into one physical PC — symbolizes to
+    // only the *innermost* inlined frame (the runtime plumbing), hiding the
+    // user's enclosing function. After expansion the chain ends at the real
+    // user frame.
+    if (resolve_inline_callers) {
+        const before = symbols.items.len;
+        ofile_dwarf.getSymbols(
+            symbol_allocator,
+            text_arena,
+            native_endian,
+            ofile_vaddr,
+            true,
+            symbols,
+        ) catch |err| switch (err) {
+            error.MissingDebugInfo, error.InvalidDebugInfo, error.UnsupportedDebugInfo => {},
+            else => |e| return e,
+        };
+        if (symbols.items.len > before) {
+            // The outermost (last) frame is the concrete function. When DWARF
+            // gave it no name, recover it from the Mach-O symbol table — the
+            // same fallback the single-frame path uses.
+            const last = &symbols.items[symbols.items.len - 1];
+            if (last.name == null) last.name = file.lookupSymbolName(vaddr) catch null;
+            return;
+        }
+        // Expansion produced nothing usable; fall through to the single-frame
+        // resolution so a resolvable address still yields a symbol.
+    }
 
     try symbols.append(symbol_allocator, .{
         .name = ofile_dwarf.getSymbolName(ofile_vaddr) orelse

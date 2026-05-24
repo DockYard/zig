@@ -1565,7 +1565,6 @@ pub fn getSymbols(
     resolve_inline_callers: bool,
     symbols: *std.ArrayList(std.debug.Symbol),
 ) std.debug.SelfInfoError!void {
-    _ = resolve_inline_callers;
     const gpa = std.debug.getDebugInfoAllocator();
 
     const compile_unit = di.findCompileUnit(endian, address) catch |err| switch (err) {
@@ -1573,21 +1572,406 @@ pub fn getSymbols(
         error.Overflow => return error.InvalidDebugInfo,
         error.ReadFailed, error.InvalidDebugInfo, error.MissingDebugInfo => |e| return e,
     };
-    try symbols.append(symbol_allocator, .{
-        .name = di.getSymbolName(address),
-        .compile_unit_name = compile_unit.die.getAttrString(di, endian, std.dwarf.AT.name, di.section(.debug_str), compile_unit) catch |err| switch (err) {
-            error.MissingDebugInfo, error.InvalidDebugInfo => null,
-        },
-        .source_location = di.getLineNumberInfo(gpa, text_arena, endian, compile_unit, address) catch |err| switch (err) {
-            error.MissingDebugInfo, error.InvalidDebugInfo => null,
+
+    // The physical-frame source location is the line-program entry for
+    // `address`: the source line of the deepest *inlined* body the address
+    // lives in (when the address is inside an inlined region) or of the
+    // concrete function itself (when it is not).
+    const physical_source_location: ?std.debug.SourceLocation = di.getLineNumberInfo(gpa, text_arena, endian, compile_unit, address) catch |err| switch (err) {
+        error.MissingDebugInfo, error.InvalidDebugInfo => null,
+        error.ReadFailed,
+        error.EndOfStream,
+        error.Overflow,
+        error.StreamTooLong,
+        => return error.InvalidDebugInfo,
+        else => |e| return e,
+    };
+    const compile_unit_name: ?[]const u8 = compile_unit.die.getAttrString(di, endian, std.dwarf.AT.name, di.section(.debug_str), compile_unit) catch |err| switch (err) {
+        error.MissingDebugInfo, error.InvalidDebugInfo => null,
+    };
+
+    if (resolve_inline_callers) {
+        // Expand `address` into its full DWARF inline-frame chain — one
+        // `Symbol` per source frame, innermost (the deepest inlined body)
+        // first, ending at the concrete (`DW_TAG_subprogram`) function. This
+        // is the standard inlined-frame model: a frame's *name* is its own
+        // function, but its *source location* is the call site of the frame
+        // immediately below it (the place that "called" the inlinee). The
+        // innermost frame uses the physical line-program location; the
+        // concrete function at the bottom of the chain uses the call site of
+        // the outermost inlined subroutine. Per Zig's `getSymbols` contract,
+        // multiple appended symbols ARE this inline chain; consumers iterate
+        // them in order.
+        //
+        // On any failure to reconstruct the chain we fall through to the
+        // single-symbol path below, so callers never get an empty result for
+        // a resolvable address.
+        if (di.appendInlineFrames(
+            gpa,
+            symbol_allocator,
+            text_arena,
+            endian,
+            compile_unit,
+            address,
+            physical_source_location,
+            compile_unit_name,
+            symbols,
+        )) |appended_chain| {
+            if (appended_chain) return;
+        } else |err| switch (err) {
+            error.MissingDebugInfo, error.InvalidDebugInfo => {},
             error.ReadFailed,
             error.EndOfStream,
             error.Overflow,
             error.StreamTooLong,
-            => return error.InvalidDebugInfo,
+            => {},
             else => |e| return e,
-        },
+        }
+    }
+
+    try symbols.append(symbol_allocator, .{
+        .name = di.getSymbolName(address),
+        .compile_unit_name = compile_unit_name,
+        .source_location = physical_source_location,
     });
+}
+
+/// A single resolved DWARF inline frame: the inlined (or concrete) function's
+/// name plus the call site at which the frame *below* it (its inlinee) was
+/// expanded. The chain is assembled outermost→innermost during the DIE walk,
+/// then emitted innermost→outermost so the deepest body prints first.
+const InlineFrameLink = struct {
+    /// `DW_AT_linkage_name` (preferred) or `DW_AT_name` of this frame's
+    /// function, resolved through `DW_AT_abstract_origin`/`DW_AT_specification`
+    /// exactly like `scanAllFunctions`.
+    name: ?[]const u8,
+    /// The call-site file index recorded on the inlined subroutine nested
+    /// directly inside this frame (`DW_AT_call_file`), or `null` for the
+    /// innermost frame (which uses the physical line-program location).
+    call_file: ?u64,
+    /// The call-site line on the inlined subroutine nested directly inside
+    /// this frame (`DW_AT_call_line`), or `null` for the innermost frame.
+    call_line: ?u64,
+    /// The call-site column, when present.
+    call_column: ?u64,
+};
+
+/// Walk the DIE subtree of the concrete function covering `address`, collecting
+/// the nesting chain of `DW_TAG_inlined_subroutine` DIEs whose ranges also
+/// cover `address`, and append one `std.debug.Symbol` per source frame to
+/// `symbols` (innermost first). Returns `true` when at least one symbol was
+/// appended (the address resolved to a function), `false` when no covering
+/// subprogram was found (so the caller can fall back to the flat lookup).
+///
+/// The walk is a focused, depth-tracked descent through the compile unit's
+/// `.debug_info`: it reuses `parseDie` (a `null` DIE marks end-of-children, so
+/// `has_children` + null terminators give reliable structural depth) and the
+/// same `DW_AT_low_pc`/`DW_AT_high_pc`/`DW_AT_ranges` containment test
+/// `scanAllFunctions` uses. It only runs on the cold report path
+/// (`resolve_inline_callers == true`), so the per-call CU rescan never touches
+/// the normal single-frame symbolization.
+fn appendInlineFrames(
+    di: *Dwarf,
+    gpa: Allocator,
+    symbol_allocator: Allocator,
+    text_arena: Allocator,
+    endian: Endian,
+    compile_unit: *CompileUnit,
+    address: u64,
+    physical_source_location: ?std.debug.SourceLocation,
+    compile_unit_name: ?[]const u8,
+    symbols: *std.ArrayList(std.debug.Symbol),
+) !bool {
+    // The call-site file index on an inlined subroutine indexes the SAME file
+    // table the line program uses, so resolving it needs the per-CU source
+    // location cache populated. Populating it here (idempotent) lets every
+    // frame's call site resolve to a real `file:line`.
+    di.populateSrcLocCache(gpa, endian, compile_unit) catch |err| switch (err) {
+        error.MissingDebugInfo, error.InvalidDebugInfo => {},
+        else => return err,
+    };
+
+    var fr: Reader = .fixed(di.section(.debug_info) orelse return error.MissingDebugInfo);
+    var this_unit_offset: u64 = 0;
+
+    // Re-find the unit header for `compile_unit` so the focused walk parses
+    // DIEs with the correct abbrev table / address size. We locate it by the
+    // unit whose top DIE range covers `address`, mirroring `findCompileUnit`.
+    while (this_unit_offset < fr.buffer.len) {
+        fr.seek = @intCast(this_unit_offset);
+
+        const unit_header = try readUnitHeader(&fr, endian);
+        if (unit_header.unit_length == 0) return false;
+        const next_offset = unit_header.header_length + unit_header.unit_length;
+        const next_unit_pos = this_unit_offset + next_offset;
+
+        const version = try fr.takeInt(u16, endian);
+        if (version < 2 or version > 5) return false;
+
+        var address_size: u8 = undefined;
+        var debug_abbrev_offset: u64 = undefined;
+        if (version >= 5) {
+            const unit_type = try fr.takeByte();
+            if (unit_type != DW.UT.compile) {
+                this_unit_offset += next_offset;
+                continue;
+            }
+            address_size = try fr.takeByte();
+            debug_abbrev_offset = try readFormatSizedInt(&fr, unit_header.format, endian);
+        } else {
+            debug_abbrev_offset = try readFormatSizedInt(&fr, unit_header.format, endian);
+            address_size = try fr.takeByte();
+        }
+
+        const abbrev_table = try di.getAbbrevTable(gpa, debug_abbrev_offset);
+
+        var max_attrs: usize = 0;
+        for (abbrev_table.abbrevs) |abbrev| max_attrs = @max(max_attrs, abbrev.attrs.len);
+        // Two scratch buffers: one for the DIE being inspected, one for the
+        // `abstract_origin`/`specification` target chased during name lookup.
+        const attrs_buf = try gpa.alloc(Die.Attr, @max(max_attrs, 1) * 2);
+        defer gpa.free(attrs_buf);
+        const attrs_main = attrs_buf[0..@max(max_attrs, 1)];
+        const attrs_ref = attrs_buf[@max(max_attrs, 1) ..][0..@max(max_attrs, 1)];
+
+        // Parse the unit's top DIE (the compile unit) so we can check whether
+        // this is the unit containing `address` before descending.
+        const top_die = (try parseDie(&fr, attrs_main, abbrev_table, unit_header.format, endian, address_size)) orelse {
+            this_unit_offset += next_offset;
+            continue;
+        };
+        if (top_die.tag_id != DW.TAG.compile_unit) {
+            this_unit_offset += next_offset;
+            continue;
+        }
+        if (!dieCoversAddress(di, endian, &top_die, compile_unit, address)) {
+            // Not the unit we want; skip to the next unit without descending.
+            this_unit_offset += next_offset;
+            continue;
+        }
+
+        // Descend the children of this compile unit, tracking depth via the
+        // null-DIE terminators. We build the chain of covering function frames
+        // (`subprogram` at depth 1, then nested `inlined_subroutine`s) keyed by
+        // depth, so a deeper covering frame supersedes a shallower sibling.
+        var chain: std.ArrayList(InlineFrameLink) = .empty;
+        defer chain.deinit(gpa);
+
+        // The top DIE has children (a compile unit always does when non-empty);
+        // if it somehow does not, there is nothing to descend.
+        if (!top_die.has_children) return false;
+
+        // SELECTIVE descent: follow ONLY the single chain of DIEs that cover
+        // `address`. We descend into a DIE's children exactly when that DIE
+        // covers the address (a covering subprogram, then its covering
+        // `lexical_block`s, then its covering `inlined_subroutine`s); any DIE
+        // that does NOT cover the address has its entire subtree skipped via a
+        // balanced DIE skip. This keeps `chain` monotonically growing along the
+        // covering path so that when the covering subprogram's subtree closes,
+        // the chain IS the complete inline stack — no spurious pop/replace
+        // bookkeeping, and the walk stops as soon as the answer is known
+        // instead of scanning the rest of the unit.
+        //
+        // `depth` is the open-child nesting we are inside; the CU root opened
+        // depth 1. We only ever increase `depth` along the covering path.
+        var depth: usize = 1;
+
+        descend: while (depth >= 1 and fr.seek < next_unit_pos) {
+            // A null DIE closes the innermost open child level. Returning to
+            // depth 1 (back among the CU's direct children) after having
+            // recorded any covering frame means we just finished the covering
+            // subprogram's subtree — the chain is complete.
+            const die = (try parseDie(&fr, attrs_main, abbrev_table, unit_header.format, endian, address_size)) orelse {
+                depth -= 1;
+                if (depth <= 1 and chain.items.len > 0) break :descend;
+                if (depth == 0) break :descend;
+                continue;
+            };
+
+            const covers = dieCoversAddress(di, endian, &die, compile_unit, address);
+
+            if (covers) {
+                const is_func = switch (die.tag_id) {
+                    DW.TAG.subprogram, DW.TAG.inlined_subroutine, DW.TAG.subroutine, DW.TAG.entry_point => true,
+                    else => false,
+                };
+                if (is_func) {
+                    const name = resolveDieFunctionName(di, &fr, attrs_ref, abbrev_table, unit_header.format, endian, address_size, this_unit_offset, next_offset, compile_unit, &die) catch null;
+                    const call_file: ?u64 = blk: {
+                        const fv = die.getAttr(AT.call_file) orelse break :blk null;
+                        break :blk fv.getUInt(u64) catch null;
+                    };
+                    const call_line: ?u64 = blk: {
+                        const fv = die.getAttr(AT.call_line) orelse break :blk null;
+                        break :blk fv.getUInt(u64) catch null;
+                    };
+                    const call_column: ?u64 = blk: {
+                        const fv = die.getAttr(AT.call_column) orelse break :blk null;
+                        break :blk fv.getUInt(u64) catch null;
+                    };
+                    try chain.append(gpa, .{
+                        .name = name,
+                        .call_file = call_file,
+                        .call_line = call_line,
+                        .call_column = call_column,
+                    });
+                }
+                // Descend into the covering DIE's children to find the next,
+                // deeper covering frame (an `inlined_subroutine` nested inside
+                // a covering `lexical_block`/`subprogram`).
+                if (die.has_children) depth += 1;
+            } else if (die.has_children) {
+                // Non-covering subtree: skip it wholesale so the walk stays on
+                // the covering path. `skipDieSubtree` consumes the balanced
+                // child DIEs (tracking nested null terminators) without
+                // recording anything.
+                try skipDieSubtree(&fr, attrs_main, abbrev_table, unit_header.format, endian, address_size);
+            }
+        }
+
+        if (chain.items.len == 0) return false;
+
+        // Emit the chain innermost→outermost. A frame's source location is the
+        // call site recorded on the frame BELOW it (its inlinee); the innermost
+        // frame uses the physical line-program location.
+        var i: usize = chain.items.len;
+        var inner_source: ?std.debug.SourceLocation = physical_source_location;
+        while (i > 0) {
+            i -= 1;
+            const frame = chain.items[i];
+            try symbols.append(symbol_allocator, .{
+                .name = frame.name,
+                .compile_unit_name = compile_unit_name,
+                .source_location = inner_source,
+            });
+            // The frame above this one (its caller) is sourced at THIS frame's
+            // call site (where this inlinee was expanded into its caller).
+            inner_source = if (frame.call_file != null and frame.call_line != null)
+                resolveCallSite(di, text_arena, compile_unit, frame.call_file.?, frame.call_line.?, frame.call_column orelse 0) catch null
+            else
+                null;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+/// Consume the balanced child-DIE subtree of a DIE whose `has_children` is
+/// set and which was just parsed by the caller (so the reader is positioned at
+/// the first child). Tracks nested `has_children`/null-terminator depth and
+/// returns with the reader positioned just past the subtree's closing null
+/// DIE. Used by `appendInlineFrames` to skip a non-covering subtree wholesale
+/// while staying on the address's covering path.
+fn skipDieSubtree(
+    fr: *Reader,
+    attrs_buf: []Die.Attr,
+    abbrev_table: *const Abbrev.Table,
+    format: Format,
+    endian: Endian,
+    address_size: u8,
+) !void {
+    var nested: usize = 1;
+    while (nested > 0) {
+        const die = (try parseDie(fr, attrs_buf, abbrev_table, format, endian, address_size)) orelse {
+            nested -= 1;
+            continue;
+        };
+        if (die.has_children) nested += 1;
+    }
+}
+
+/// True when `die`'s `DW_AT_low_pc`/`DW_AT_high_pc` or `DW_AT_ranges` cover
+/// `address`. Mirrors the containment test in `scanAllFunctions` /
+/// `findCompileUnit` so inline-frame selection agrees with flat symbolization.
+fn dieCoversAddress(di: *const Dwarf, endian: Endian, die: *const Die, compile_unit: *const CompileUnit, address: u64) bool {
+    if (die.getAttrAddr(di, endian, AT.low_pc, compile_unit)) |low_pc| {
+        if (die.getAttr(AT.high_pc)) |high_pc_value| {
+            const pc_end: ?u64 = switch (high_pc_value.*) {
+                .addr => |value| value,
+                .udata => |offset| low_pc + offset,
+                else => null,
+            };
+            if (pc_end) |end| {
+                if (address >= low_pc and address < end) return true;
+            }
+        }
+    } else |_| {}
+
+    if (die.getAttr(AT.ranges)) |ranges_value| {
+        var iter = DebugRangeIterator.init(ranges_value, di, endian, compile_unit) catch return false;
+        while (iter.next() catch return false) |range| {
+            if (address >= range.start and address < range.end) return true;
+        }
+    }
+    return false;
+}
+
+/// Resolve a function DIE's reportable name, following
+/// `DW_AT_abstract_origin`/`DW_AT_specification` across DIEs (and preferring
+/// `DW_AT_linkage_name` over `DW_AT_name`) exactly like `scanAllFunctions`'s
+/// inline name resolution, so an inlined frame reports the same fully-qualified
+/// linkage name the flat lookup would.
+fn resolveDieFunctionName(
+    di: *Dwarf,
+    fr: *Reader,
+    attrs_ref: []Die.Attr,
+    abbrev_table: *const Abbrev.Table,
+    format: Format,
+    endian: Endian,
+    address_size: u8,
+    this_unit_offset: u64,
+    next_offset: u64,
+    compile_unit: *const CompileUnit,
+    die: *const Die,
+) !?[]const u8 {
+    var this_die = die.*;
+    const saved_seek = fr.seek;
+    defer fr.seek = saved_seek;
+    for (0..3) |_| {
+        if (this_die.getAttr(AT.linkage_name)) |_| {
+            return try this_die.getAttrString(di, endian, AT.linkage_name, di.section(.debug_str), compile_unit);
+        } else if (this_die.getAttr(AT.name)) |_| {
+            return try this_die.getAttrString(di, endian, AT.name, di.section(.debug_str), compile_unit);
+        } else if (this_die.getAttr(AT.abstract_origin)) |_| {
+            const ref_offset = try this_die.getAttrRef(AT.abstract_origin, this_unit_offset, next_offset);
+            fr.seek = @intCast(ref_offset);
+            this_die = (try parseDie(fr, attrs_ref, abbrev_table, format, endian, address_size)) orelse return null;
+        } else if (this_die.getAttr(AT.specification)) |_| {
+            const ref_offset = try this_die.getAttrRef(AT.specification, this_unit_offset, next_offset);
+            fr.seek = @intCast(ref_offset);
+            this_die = (try parseDie(fr, attrs_ref, abbrev_table, format, endian, address_size)) orelse return null;
+        } else {
+            return null;
+        }
+    }
+    return null;
+}
+
+/// Resolve a `DW_AT_call_file`/`DW_AT_call_line` pair to a `SourceLocation`,
+/// using the compile unit's already-populated source location cache (the same
+/// file/dir tables the line program uses).
+fn resolveCallSite(
+    di: *Dwarf,
+    text_arena: Allocator,
+    compile_unit: *CompileUnit,
+    call_file: u64,
+    call_line: u64,
+    call_column: u64,
+) !std.debug.SourceLocation {
+    _ = di;
+    const slc = &(compile_unit.src_loc_cache orelse return missing());
+    const file_index = call_file - @intFromBool(slc.version < 5);
+    if (file_index >= slc.files.len) return bad();
+    const file_entry = &slc.files[@intCast(file_index)];
+    if (file_entry.dir_index >= slc.directories.len) return bad();
+    const dir_name = slc.directories[file_entry.dir_index].path;
+    const file_name = try std.fs.path.join(text_arena, &.{ dir_name, file_entry.path });
+    return .{
+        .line = @intCast(call_line),
+        .column = @intCast(call_column),
+        .file_name = file_name,
+    };
 }
 
 /// DWARF5 7.4: "In the 32-bit DWARF format, all values that represent lengths of DWARF sections and
