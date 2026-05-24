@@ -5189,6 +5189,34 @@ pub export fn zir_builder_emit_single_const_ptr_type(
     return @intFromEnum(ref);
 }
 
+/// Emit `*const fn(P0, P1, ...) Ret` — a pointer to a bare function TYPE.
+/// `param_type_refs_ptr` / `param_type_refs_len` give the parameter type
+/// Refs (each a `@intFromEnum(Zir.Inst.Ref)`); `ret_type` is the return
+/// type Ref. This is the runtime representation of a non-capturing Zap
+/// closure value; the Zap ZIR backend uses it to render a closure type at
+/// concrete-type positions (struct field, function return type, tuple
+/// element). Returns `@intFromEnum(Ref)` of the pointer type, or
+/// `0xFFFFFFFF` on error. See `FuncBody.addFuncPtrType`.
+pub export fn zir_builder_emit_func_ptr_type(
+    handle: ?*ZirBuilderHandle,
+    param_type_refs_ptr: [*]const u32,
+    param_type_refs_len: u32,
+    ret_type: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    var param_refs: std.ArrayListUnmanaged(Zir.Inst.Ref) = .empty;
+    defer param_refs.deinit(b.gpa);
+    param_refs.ensureTotalCapacity(b.gpa, param_type_refs_len) catch return 0xFFFFFFFF;
+    var i: u32 = 0;
+    while (i < param_type_refs_len) : (i += 1) {
+        param_refs.appendAssumeCapacity(@enumFromInt(param_type_refs_ptr[i]));
+    }
+    const ret_ref: Zir.Inst.Ref = @enumFromInt(ret_type);
+    const ref = body.addFuncPtrType(param_refs.items, ret_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
 /// Set the return type from arbitrary ZIR instruction indices.
 /// The instructions compute the type (e.g., via generic container instantiation).
 /// `result_inst` is the instruction index whose ref is the final type.

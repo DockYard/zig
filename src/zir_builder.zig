@@ -2303,6 +2303,143 @@ pub const FuncBody = struct {
         } });
     }
 
+    /// Emit `*const fn(P0, P1, ...) Ret` — a single-element, immutable
+    /// pointer to a bare (auto-calling-convention, non-error-set,
+    /// non-generic) function TYPE. This is the runtime representation of a
+    /// non-capturing (0-capture) Zap closure value, so the Zap ZIR backend
+    /// uses this to render a closure type (`( -> i64)`) at every
+    /// concrete-type position — struct field, function return type, tuple
+    /// element — where the param-position `anytype` lowering cannot be
+    /// used. (Closure-typed *parameters* stay `anytype` so the existing
+    /// `Kernel.callCallableN` dynamic dispatch keeps accepting both bare
+    /// function pointers and capturing closure structs; this helper is only
+    /// for positions that demand a single concrete type.)
+    ///
+    /// The emitted ZIR mirrors exactly what AstGen produces for the source
+    /// type expression `*const fn(P...) Ret`:
+    ///
+    ///   %blk = block_inline({
+    ///     %p0  = param("", { break_inline(%p0, P0) })   // one per param
+    ///     ...
+    ///     %fn  = func(ret_ty = Ret, param_block = %blk, body_len = 0)
+    ///     %brk = break_inline(%blk, %fn)
+    ///   })
+    ///   %ptr = ptr_type(%blk, const, one)
+    ///
+    /// A function *type* (as opposed to a function *declaration*) is a
+    /// `func` instruction whose `body_len` is 0; with `body_len == 0` the
+    /// trailing `SrcLocs` and `proto_hash` are omitted (per the `Zir.Inst.Func`
+    /// trailing layout). `ret_ty` is encoded as a simple `Ref` (packed
+    /// `body_len = 1`, `is_generic = false`). `param_block` points at the
+    /// enclosing `block_inline`, whose body holds the param instructions
+    /// followed by the `func` and its `break_inline`. The pointer wrapper
+    /// is a plain `*const` (no sentinel/alignment/addrspace), identical to
+    /// `addSingleConstPtrType`.
+    pub fn addFuncPtrType(
+        self: *FuncBody,
+        param_types: []const Zir.Inst.Ref,
+        ret_type: Zir.Inst.Ref,
+    ) !Zir.Inst.Ref {
+        const b = self.builder;
+        const gpa = b.gpa;
+
+        // The `block_inline` body holds: N param insts, then the `func`
+        // inst, then its `break_inline`.
+        const block_body_len: u32 = @intCast(param_types.len + 2);
+
+        // Reserve the block_inline payload with placeholder body slots; we
+        // back-patch the slot values once the inner instructions exist.
+        const block_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, block_body_len);
+        const first_body_slot: u32 = @intCast(b.extra.items.len);
+        var slot_i: u32 = 0;
+        while (slot_i < block_body_len) : (slot_i += 1) {
+            try b.extra.append(gpa, 0);
+        }
+
+        const block_idx = try b.addInst(.block_inline, Builder.encodePlNode(.zero, block_payload_idx));
+        // The pointer type below is the value this helper yields; record
+        // it (not the inner block) in the outer body. The block_inline and
+        // its inner instructions live INSIDE the ptr_type's pointee body,
+        // reached via the block index, so they must NOT also be appended to
+        // the outer body / non-body capture.
+        const block_ref = Builder.instRef(block_idx);
+
+        // Emit one `param("", { break_inline(param, Pi) })` per parameter.
+        // The param body is a single `break_inline` whose operand is the
+        // parameter type Ref (a well-known primitive Ref or a previously
+        // emitted type instruction's Ref). The empty `_` name matches
+        // AstGen's anonymous function-type parameters.
+        var param_inst_indices = try std.ArrayListUnmanaged(u32).initCapacity(gpa, param_types.len);
+        defer param_inst_indices.deinit(gpa);
+        for (param_types) |param_type_ref| {
+            const param_inst_idx: u32 = @intCast(b.tags.items.len + 1);
+
+            const break_payload_idx: u32 = @intCast(b.extra.items.len);
+            try b.extra.append(gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+            try b.extra.append(gpa, param_inst_idx);
+            const break_idx = try b.addInst(.break_inline, Builder.encodeBreak(param_type_ref, break_payload_idx));
+
+            const param_payload_idx: u32 = @intCast(b.extra.items.len);
+            try b.extra.append(gpa, 0); // empty param name (NullTerminatedString 0 = "")
+            try b.extra.append(gpa, 1); // body_len = 1 (just the break_inline)
+            try b.extra.append(gpa, break_idx);
+
+            const param_idx = try b.addInst(.param, Builder.encodePlTok(.zero, param_payload_idx));
+            std.debug.assert(param_idx == param_inst_idx);
+            param_inst_indices.appendAssumeCapacity(param_idx);
+        }
+
+        // Build the `func` (function TYPE: body_len = 0) payload in extra:
+        //   ret_ty (packed RetTy), param_block (Index), body_len (u32),
+        //   then the trailing simple-Ref return type.
+        const func_payload_idx: u32 = @intCast(b.extra.items.len);
+        // ret_ty: body_len = 1 (a simple Ref), is_generic = false → u32 1.
+        try b.extra.append(gpa, 1);
+        // param_block: the enclosing block_inline instruction.
+        try b.extra.append(gpa, block_idx);
+        // body_len = 0 → this is a function TYPE, not a declaration; the
+        // SrcLocs and proto_hash trailing fields are omitted.
+        try b.extra.append(gpa, 0);
+        // Trailing simple-Ref return type.
+        try b.extra.append(gpa, @intFromEnum(ret_type));
+        const func_idx = try b.addInst(.func, Builder.encodePlNode(.zero, func_payload_idx));
+        const func_ref = Builder.instRef(func_idx);
+
+        // `break_inline(block_inline, func)` — the block's result is the
+        // function type.
+        const func_break_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+        try b.extra.append(gpa, block_idx);
+        const func_break_idx = try b.addInst(.break_inline, Builder.encodeBreak(func_ref, func_break_payload_idx));
+
+        // Back-patch the block_inline body slots:
+        //   [param0, ..., paramN-1, func, break_inline]
+        for (param_inst_indices.items, 0..) |param_idx, i| {
+            b.extra.items[first_body_slot + i] = param_idx;
+        }
+        b.extra.items[first_body_slot + param_types.len] = func_idx;
+        b.extra.items[first_body_slot + param_types.len + 1] = func_break_idx;
+
+        // `*const <func type>` — recorded in the outer body as the value
+        // this helper produces.
+        const ptr_payload_idx: u32 = @intCast(b.extra.items.len);
+        try b.extra.append(gpa, @intFromEnum(block_ref));
+        return self.emitBodyInst(.ptr_type, .{ .ptr_type = .{
+            .flags = .{
+                .is_allowzero = false,
+                .is_mutable = false,
+                .is_volatile = false,
+                .has_sentinel = false,
+                .has_align = false,
+                .has_addrspace = false,
+                .has_bit_range = false,
+            },
+            .size = .one,
+            .payload_index = ptr_payload_idx,
+        } });
+    }
+
     /// Emit `@as(dest_type, operand)`. Returns a Ref to the coerced value.
     pub fn addAs(self: *FuncBody, dest_type: Zir.Inst.Ref, operand: Zir.Inst.Ref) !Zir.Inst.Ref {
         const payload_idx: u32 = @intCast(self.builder.extra.items.len);
