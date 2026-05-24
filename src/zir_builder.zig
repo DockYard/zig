@@ -2358,11 +2358,24 @@ pub const FuncBody = struct {
         }
 
         const block_idx = try b.addInst(.block_inline, Builder.encodePlNode(.zero, block_payload_idx));
-        // The pointer type below is the value this helper yields; record
-        // it (not the inner block) in the outer body. The block_inline and
-        // its inner instructions live INSIDE the ptr_type's pointee body,
-        // reached via the block index, so they must NOT also be appended to
-        // the outer body / non-body capture.
+        // The `block_inline` is an ENCLOSING-body instruction (like the
+        // `ptr_type` below): in AstGen's lowering of `*const fn(P...) Ret`
+        // the `block_inline` precedes the `ptr_type` in the enclosing body,
+        // and the `ptr_type`'s `elem_type` references it. So it MUST be
+        // recorded in the active body's tracking — otherwise Sema's
+        // `analyzeBodyInner` never evaluates it before reaching the
+        // `ptr_type`, and the body-capture path Zap uses for ret_ty /
+        // struct-field type bodies (`captureBodyInsts`) omits it, leaving a
+        // dangling `elem_type` reference that fails `analyzeAsType` and
+        // crashes `zirPtrType`. The param / func / break_inline instructions
+        // below, by contrast, live INSIDE the block's own body (reached via
+        // the block index), so they stay RAW (not recorded in the enclosing
+        // body / capture).
+        if (self.body_tracking) {
+            try self.body_inst_indices.append(gpa, block_idx);
+        } else if (self.non_body_capture) |capture| {
+            try capture.append(gpa, block_idx);
+        }
         const block_ref = Builder.instRef(block_idx);
 
         // Emit one `param("", { break_inline(param, Pi) })` per parameter.
@@ -2422,9 +2435,16 @@ pub const FuncBody = struct {
         b.extra.items[first_body_slot + param_types.len + 1] = func_break_idx;
 
         // `*const <func type>` — recorded in the outer body as the value
-        // this helper produces.
+        // this helper produces. The `ptr_type` instruction's payload is a
+        // full `Zir.Inst.PtrType` struct: `{ elem_type, src_node }`. BOTH
+        // words must be written — `Sema.zirPtrType` reads `src_node` for
+        // error/source locations via `extraData(Zir.Inst.PtrType)`, so
+        // omitting it makes that field alias the next instruction's extra
+        // (and shifts/garbles type resolution). `src_node = 0` is the
+        // synthetic-ZIR node offset used everywhere else.
         const ptr_payload_idx: u32 = @intCast(b.extra.items.len);
-        try b.extra.append(gpa, @intFromEnum(block_ref));
+        try b.extra.append(gpa, @intFromEnum(block_ref)); // elem_type
+        try b.extra.append(gpa, 0); // src_node (Ast.Node.Offset, synthetic)
         return self.emitBodyInst(.ptr_type, .{ .ptr_type = .{
             .flags = .{
                 .is_allowzero = false,
@@ -4786,6 +4806,63 @@ test "Builder: addInt returns valid Ref" {
     // extended, declaration, restore_err_ret, int(10), int(20), add, ret_implicit, func, break_inline
     try std.testing.expectEqual(@as(u32, 9), result.instructions_len);
     try std.testing.expectEqual(@intFromEnum(Zir.Inst.Tag.add), result.instructions_tags[5]);
+}
+
+test "Builder: addFuncPtrType emits *const fn(P) Ret structure matching AstGen" {
+    // Gap E enabler. A non-capturing closure value lowers to `*const
+    // fn(P...) Ret`; this builds that type inside a function body. The
+    // emitted ZIR must match exactly what AstGen produces for the source
+    // expression `*const fn (i64) i64`:
+    //   %blk = block_inline({ param("",{break_inline(param,i64)}), func, break_inline(blk,func) })
+    //   %ptr = ptr_type(%blk, const, one)
+    var builder = try Builder.init(std.testing.allocator);
+    defer builder.deinit();
+
+    const body = try builder.beginFunction("get_fp", .void);
+    const fp = try body.addFuncPtrType(&.{.i64_type}, .i64_type);
+    try body.addRetNode(fp);
+    try builder.endFunction(body);
+
+    const result = try builder.finalize();
+    const datas: []const Zir.Inst.Data = @alignCast(std.mem.bytesAsSlice(Zir.Inst.Data, result.instructions_data));
+
+    // Instruction stream: extended, declaration, restore_err_ret,
+    // block_inline, break_inline (param type), param, func (the function
+    // TYPE), break_inline (block result), ptr_type, ret_node, func (decl),
+    // break_inline (decl).
+    try std.testing.expectEqual(@as(u32, 12), result.instructions_len);
+    const block_idx: usize = 3;
+    const param_idx: usize = 5;
+    const func_idx: usize = 6;
+    const ptr_idx: usize = 8;
+    try std.testing.expectEqual(Zir.Inst.Tag.block_inline, @as(Zir.Inst.Tag, @enumFromInt(result.instructions_tags[block_idx])));
+    try std.testing.expectEqual(Zir.Inst.Tag.param, @as(Zir.Inst.Tag, @enumFromInt(result.instructions_tags[param_idx])));
+    try std.testing.expectEqual(Zir.Inst.Tag.func, @as(Zir.Inst.Tag, @enumFromInt(result.instructions_tags[func_idx])));
+    try std.testing.expectEqual(Zir.Inst.Tag.ptr_type, @as(Zir.Inst.Tag, @enumFromInt(result.instructions_tags[ptr_idx])));
+
+    // The block_inline body holds [param, func, break_inline].
+    const block_pli = datas[block_idx].pl_node.payload_index;
+    try std.testing.expectEqual(@as(u32, 3), result.extra[block_pli]); // body_len
+    try std.testing.expectEqual(@as(u32, param_idx), result.extra[block_pli + 1]);
+    try std.testing.expectEqual(@as(u32, func_idx), result.extra[block_pli + 2]);
+
+    // The func is a function TYPE: ret_ty = simple Ref (packed 1),
+    // param_block = the block_inline, body_len = 0, trailing ret Ref.
+    const func_pli = datas[func_idx].pl_node.payload_index;
+    try std.testing.expectEqual(@as(u32, 1), result.extra[func_pli]); // ret_ty: body_len=1, is_generic=false
+    try std.testing.expectEqual(@as(u32, block_idx), result.extra[func_pli + 1]); // param_block
+    try std.testing.expectEqual(@as(u32, 0), result.extra[func_pli + 2]); // body_len = 0 → function type
+    try std.testing.expectEqual(@intFromEnum(Zir.Inst.Ref.i64_type), result.extra[func_pli + 3]);
+
+    // The ptr_type carries BOTH `Zir.Inst.PtrType` words: elem_type (the
+    // block_inline ref) and src_node. Omitting src_node is the bug that
+    // crashed Sema's `zirPtrType`.
+    const ptr_pli = datas[ptr_idx].ptr_type.payload_index;
+    try std.testing.expectEqual(
+        @intFromEnum(Zir.Inst.Index.toRef(@enumFromInt(block_idx))),
+        result.extra[ptr_pli],
+    );
+    try std.testing.expectEqual(@as(u32, 0), result.extra[ptr_pli + 1]); // src_node (synthetic)
 }
 
 test "Builder: addFloat" {
