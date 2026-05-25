@@ -4603,6 +4603,25 @@ pub export fn zir_builder_emit_struct_init_typed(
     return @intFromEnum(ref);
 }
 
+/// Emit a `struct_init_empty` instruction — the canonical lowering of a
+/// zero-field aggregate construction `T{}` (e.g. `zap_runtime.EmptyTuple{}`,
+/// the zero-argument closure's `Callable` `args` value). This is a distinct
+/// ZIR tag from `struct_init`: Sema's `zirStructInit` indexes the first
+/// field to read its type and panics on a zero-field `struct_init`, whereas
+/// `zirStructInitEmpty` resolves the operand as the result type and builds an
+/// empty aggregate value of it. `struct_init_empty` is a `.un_node` whose
+/// operand is the (already-emitted) struct type Ref.
+pub export fn zir_builder_emit_struct_init_empty(
+    handle: ?*ZirBuilderHandle,
+    struct_type: u32,
+) callconv(.c) u32 {
+    const b = getBuilder(handle) orelse return 0xFFFFFFFF;
+    const body = b.active_body orelse return 0xFFFFFFFF;
+    const struct_type_ref: Zir.Inst.Ref = @enumFromInt(struct_type);
+    const ref = body.addStructInitEmpty(struct_type_ref) catch return 0xFFFFFFFF;
+    return @intFromEnum(ref);
+}
+
 /// Emit a tuple_decl instruction (as a param-like instruction in the declaration body)
 /// and return its Ref. Used to build nested tuple types.
 pub export fn zir_builder_emit_tuple_decl(

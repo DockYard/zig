@@ -3304,6 +3304,18 @@ pub const FuncBody = struct {
         return self.emitBodyInst(.struct_init, Builder.encodePlNode(.zero, payload_idx));
     }
 
+    /// Emit `struct_init_empty` for a zero-field aggregate construction
+    /// `T{}` (the zero-argument closure's `Callable` `args` value, typed
+    /// `zap_runtime.EmptyTuple`). A `.un_node` whose operand is the
+    /// already-emitted struct type Ref; Sema's `zirStructInitEmpty`
+    /// resolves the operand as the result type and yields an empty value of
+    /// it. Distinct from `addStructInitTyped` with zero fields, which would
+    /// emit a `struct_init` that Sema's `zirStructInit` cannot handle (it
+    /// indexes the first — absent — field).
+    pub fn addStructInitEmpty(self: *FuncBody, struct_type: Zir.Inst.Ref) !Zir.Inst.Ref {
+        return self.emitBodyInst(.struct_init_empty, Builder.encodeUnNode(.zero, struct_type));
+    }
+
     /// Set a tuple return type from element type Refs.
     /// Emits a `tuple_decl` extended instruction in the declaration value body
     /// and stores its Ref for use by `endFunction`.
