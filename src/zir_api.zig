@@ -3480,6 +3480,80 @@ pub export fn zir_builder_end_root_field_body(
     return 0;
 }
 
+/// Begin a streaming NAMED struct-decl `pub const <name> = struct { … };` at
+/// the current namespace scope. Fields are added via
+/// `zir_builder_named_struct_field_static` (primitive) or the
+/// `zir_builder_begin_named_struct_field_body` /
+/// `zir_builder_end_named_struct_field_body` pair (compound type body).
+/// Finish with `zir_builder_end_named_struct_decl`.
+///
+/// The NAMED, non-root analogue of `zir_builder_begin_root_field_body`:
+/// emits a top-level-namespace type-decl whose fields may carry
+/// multi-instruction (compound) type bodies — used for a synthesized
+/// `__ClosureEnv_N` capturing-environment struct holding a captured
+/// `ProtocolBox` / `List` / `Map` / nominal struct / fn-ptr field, which the
+/// bulk `zir_builder_add_struct_type` (static-Ref field types only) cannot
+/// express. Returns 0 on success, -1 on error.
+pub export fn zir_builder_begin_named_struct_decl(
+    handle: ?*ZirBuilderHandle,
+    name_ptr: [*]const u8,
+    name_len: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    b.beginNamedStructDecl(name_ptr[0..name_len]) catch return -1;
+    return 0;
+}
+
+/// Add a primitive-typed field (a static type Ref) to the open named struct
+/// decl. Returns 0 on success, -1 on error.
+pub export fn zir_builder_named_struct_field_static(
+    handle: ?*ZirBuilderHandle,
+    name_ptr: [*]const u8,
+    name_len: u32,
+    type_ref: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    b.namedStructFieldStatic(name_ptr[0..name_len], @enumFromInt(type_ref)) catch return -1;
+    return 0;
+}
+
+/// Begin recording one compound field's type body for the open named struct
+/// decl. Subsequent `zir_builder_emit_*` calls capture into this field's type
+/// body. Finish with `zir_builder_end_named_struct_field_body`. Returns 0 on
+/// success, -1 on error.
+pub export fn zir_builder_begin_named_struct_field_body(
+    handle: ?*ZirBuilderHandle,
+    name_ptr: [*]const u8,
+    name_len: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    _ = b.beginNamedStructFieldBody(name_ptr[0..name_len]) catch return -1;
+    return 0;
+}
+
+/// Finish recording a compound named-struct field's type body. `final_ref` is
+/// the Ref the body produces (the resolved field type). Returns 0 on success,
+/// -1 on error.
+pub export fn zir_builder_end_named_struct_field_body(
+    handle: ?*ZirBuilderHandle,
+    final_ref: u32,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    const body = b.active_body orelse return -1;
+    b.endNamedStructFieldBody(body, @enumFromInt(final_ref)) catch return -1;
+    return 0;
+}
+
+/// Emit the accumulated named struct decl and register it in the current
+/// scope. Returns 0 on success, -1 on error.
+pub export fn zir_builder_end_named_struct_decl(
+    handle: ?*ZirBuilderHandle,
+) callconv(.c) i32 {
+    const b = getBuilder(handle) orelse return -1;
+    b.endNamedStructDecl() catch return -1;
+    return 0;
+}
+
 /// Begin recording the value body of a named comptime constant
 /// declaration `pub const <name> = <expr>;` at the current namespace scope.
 /// Pushes a transient `FuncBody` so subsequent `zir_builder_emit_*` calls

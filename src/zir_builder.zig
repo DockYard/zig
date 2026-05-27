@@ -204,6 +204,24 @@ pub const Builder = struct {
     struct_scope_names: [8]?[]const u8 = [_]?[]const u8{null} ** 8,
     struct_scope_depth: u32 = 0,
 
+    /// Accumulator for the streaming NAMED struct-decl API
+    /// (`beginNamedStructDecl` … `endNamedStructDecl`). Unlike the bulk
+    /// `addStructTypeDecl` (whose field type bodies are a single
+    /// `break_inline` of a static Ref — primitives only), each field here
+    /// carries a `RootField.Body` that may be `.recorded`: a multi-instruction
+    /// type body captured between `beginNamedStructFieldBody` and
+    /// `endNamedStructFieldBody`. This is the NAMED, non-root analogue of the
+    /// `root_fields` + `beginRootFieldBody`/`endRootFieldBody` mechanism, and
+    /// is what lets a synthesized `__ClosureEnv_N` struct (a devirtualized
+    /// closure's captured-environment type) hold compound capture fields —
+    /// `ProtocolBox` (a captured boxed `Callable`), `List`/`Map`, a nominal
+    /// struct, or a bare-fn-ptr closure — instead of degrading to a
+    /// primitives-only field set. Only one named struct may be open at a time
+    /// (`named_struct_name != null`); closure-env decls are emitted one at a
+    /// time at file scope, never nested.
+    named_struct_name: ?[]const u8 = null,
+    named_struct_fields: std.ArrayListUnmanaged(RootField) = .empty,
+
     /// Field information for the file's root struct_decl.
     /// When `root_fields.items.len > 0`, finalize() emits the root struct_decl
     /// with both decls and fields (small = has_decls_len | has_fields_len).
@@ -278,6 +296,15 @@ pub const Builder = struct {
             }
         }
         self.root_fields.deinit(self.gpa);
+        if (self.named_struct_name) |n| self.gpa.free(n);
+        for (self.named_struct_fields.items) |field| {
+            self.gpa.free(field.name);
+            switch (field.body) {
+                .static_ref => {},
+                .recorded => |rec| self.gpa.free(rec.instructions),
+            }
+        }
+        self.named_struct_fields.deinit(self.gpa);
         if (self.active_body) |body| {
             body.body_inst_indices.deinit(self.gpa);
             body.param_inst_indices.deinit(self.gpa);
@@ -1433,6 +1460,232 @@ pub const Builder = struct {
         // Free the struct's decl_indices list (we've consumed it)
         var struct_decls_mut = struct_decl_indices;
         struct_decls_mut.deinit(self.gpa);
+    }
+
+    /// Begin a streaming NAMED struct-decl `pub const <name> = struct { … };`
+    /// at the current namespace scope. Fields are then added one at a time via
+    /// `namedStructFieldStatic` (primitive Ref) or the
+    /// `beginNamedStructFieldBody`/`endNamedStructFieldBody` pair (a compound
+    /// type whose body is more than a single static Ref). Finish with
+    /// `endNamedStructDecl`.
+    ///
+    /// This is the NAMED, non-root analogue of `setRootFieldStatic` +
+    /// `beginRootFieldBody`/`endRootFieldBody` (which target the file's root
+    /// struct_decl). Use it for a named type-decl whose fields include
+    /// compound types — e.g. a synthesized closure-environment struct holding
+    /// a captured `ProtocolBox`, `List`, `Map`, nominal struct, or fn-ptr.
+    /// The bulk `addStructTypeDecl` cannot express those (its field type
+    /// bodies are pinned to a single static-Ref `break_inline`).
+    pub fn beginNamedStructDecl(self: *Builder, name: []const u8) !void {
+        std.debug.assert(self.named_struct_name == null);
+        std.debug.assert(self.named_struct_fields.items.len == 0);
+        self.named_struct_name = try self.gpa.dupe(u8, name);
+    }
+
+    /// Add a primitive-typed field (a well-known static type Ref) to the open
+    /// named struct decl.
+    pub fn namedStructFieldStatic(
+        self: *Builder,
+        field_name: []const u8,
+        type_ref: Zir.Inst.Ref,
+    ) !void {
+        std.debug.assert(self.named_struct_name != null);
+        const name_copy = try self.gpa.dupe(u8, field_name);
+        errdefer self.gpa.free(name_copy);
+        try self.named_struct_fields.append(self.gpa, .{
+            .name = name_copy,
+            .body = .{ .static_ref = type_ref },
+        });
+    }
+
+    /// Begin recording the type body of one compound field of the open named
+    /// struct decl. Reuses the transient-`FuncBody` recording machinery
+    /// (identical to `beginRootFieldBody`), so subsequent `zir_builder_emit_*`
+    /// calls capture into this field's type body. Finish with
+    /// `endNamedStructFieldBody`.
+    pub fn beginNamedStructFieldBody(self: *Builder, field_name: []const u8) !*FuncBody {
+        std.debug.assert(self.named_struct_name != null);
+        std.debug.assert(self.active_body == null);
+
+        const name_copy = try self.gpa.dupe(u8, field_name);
+        errdefer self.gpa.free(name_copy);
+
+        const body = try self.gpa.create(FuncBody);
+        errdefer self.gpa.destroy(body);
+
+        body.* = FuncBody{
+            .builder = self,
+            .body_inst_indices = .empty,
+            .param_inst_indices = .empty,
+            .name = name_copy,
+            .decl_inst = 0, // unused for a transient field-type body
+            .restore_inst = 0,
+            .has_explicit_return = true,
+            .ret_type = .void,
+        };
+
+        self.active_body = body;
+        return body;
+    }
+
+    /// Finish recording a compound named-struct field's type body. `final_ref`
+    /// is the Ref the body produces (the resolved field type). Takes ownership
+    /// of the recorded instruction indices and stores them as a `.recorded`
+    /// field, mirroring `endRootFieldBody`.
+    pub fn endNamedStructFieldBody(self: *Builder, body: *FuncBody, final_ref: Zir.Inst.Ref) !void {
+        std.debug.assert(self.active_body == body);
+        std.debug.assert(self.named_struct_name != null);
+
+        const recorded_instructions = try body.body_inst_indices.toOwnedSlice(self.gpa);
+        errdefer self.gpa.free(recorded_instructions);
+
+        try self.named_struct_fields.append(self.gpa, .{
+            .name = body.name, // ownership transferred into named_struct_fields
+            .body = .{ .recorded = .{
+                .instructions = recorded_instructions,
+                .final_ref = final_ref,
+            } },
+        });
+
+        body.body_inst_indices.deinit(self.gpa);
+        body.param_inst_indices.deinit(self.gpa);
+        self.active_body = null;
+        self.gpa.destroy(body);
+    }
+
+    /// Emit the accumulated named struct decl `pub const <name> = struct { … };`
+    /// and register it in the current scope's `decl_indices`. Each field's type
+    /// body is emitted with the correct length: 1 for a `.static_ref` field
+    /// (the lone `break_inline`), or `instructions.len + 1` for a `.recorded`
+    /// field (its recorded type-body instructions followed by the trailing
+    /// `break_inline`) — the same per-field-body shape `finalize` produces for
+    /// the root struct. Mirrors `addStructTypeDecl` for the declaration
+    /// scaffolding; differs only in supporting variable-length field bodies.
+    pub fn endNamedStructDecl(self: *Builder) !void {
+        std.debug.assert(self.named_struct_name != null);
+        const name = self.named_struct_name.?;
+        defer {
+            self.gpa.free(name);
+            self.named_struct_name = null;
+            for (self.named_struct_fields.items) |field| {
+                self.gpa.free(field.name);
+                switch (field.body) {
+                    .static_ref => {},
+                    .recorded => |rec| self.gpa.free(rec.instructions),
+                }
+            }
+            self.named_struct_fields.clearRetainingCapacity();
+        }
+
+        const fields = self.named_struct_fields.items;
+        const fields_len: u32 = @intCast(fields.len);
+
+        // Declaration placeholder (fixed up below), as in addStructTypeDecl.
+        const decl_inst = try self.addInst(.declaration, encodeDeclaration(0, 0));
+
+        // Per-field bodies: emit each field's trailing break_inline now, and
+        // record the per-field body length + the flat body-instruction list.
+        var per_field_body_lens: std.ArrayListUnmanaged(u32) = .empty;
+        defer per_field_body_lens.deinit(self.gpa);
+        var per_field_body_insts: std.ArrayListUnmanaged(u32) = .empty;
+        defer per_field_body_insts.deinit(self.gpa);
+        try per_field_body_lens.ensureTotalCapacity(self.gpa, fields_len);
+
+        for (fields) |field| {
+            const final_ref: Zir.Inst.Ref = switch (field.body) {
+                .static_ref => |r| r,
+                .recorded => |rec| rec.final_ref,
+            };
+            const brk_payload_idx: u32 = @intCast(self.extra.items.len);
+            try self.extra.append(self.gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+            try self.extra.append(self.gpa, 0); // placeholder; fixed to struct_decl below
+            const brk_inst = try self.addInst(.break_inline, encodeBreak(final_ref, brk_payload_idx));
+
+            switch (field.body) {
+                .static_ref => {
+                    per_field_body_lens.appendAssumeCapacity(1);
+                    try per_field_body_insts.append(self.gpa, brk_inst);
+                },
+                .recorded => |rec| {
+                    per_field_body_lens.appendAssumeCapacity(@intCast(rec.instructions.len + 1));
+                    try per_field_body_insts.appendSlice(self.gpa, rec.instructions);
+                    try per_field_body_insts.append(self.gpa, brk_inst);
+                },
+            }
+        }
+
+        // struct_decl extended instruction payload.
+        const struct_payload_idx: u32 = @intCast(self.extra.items.len);
+        const fields_hash = self.syntheticRootStructFieldsHash(
+            per_field_body_lens.items,
+            per_field_body_insts.items,
+        );
+
+        try appendSrcHash(&self.extra, self.gpa, fields_hash);
+        try self.extra.append(self.gpa, 0); // src_line
+        try self.extra.append(self.gpa, 0); // src_node
+
+        // No own decls (this synthesized type has only fields). Trailing
+        // lengths follow StructDecl.Small bit order: has_fields_len (bit 2).
+        try self.extra.append(self.gpa, fields_len);
+
+        // field names
+        for (fields) |field| {
+            const name_idx = try self.internString(field.name);
+            try self.extra.append(self.gpa, name_idx);
+        }
+
+        // field type body lengths (per field — 1 or instructions.len + 1)
+        for (per_field_body_lens.items) |body_len| {
+            try self.extra.append(self.gpa, body_len);
+        }
+
+        // field bodies — flat concatenation. Each recorded break payload was
+        // written with block_inst = 0 above; fix every field break's target to
+        // the struct_decl index now.
+        const struct_decl_idx: u32 = @intCast(self.tags.items.len);
+        for (per_field_body_insts.items) |inst| {
+            try self.extra.append(self.gpa, inst);
+        }
+        // Fix each break_inline's block_inst (the LAST instruction of each
+        // field body) to target this struct_decl. A field body's terminating
+        // break is the only `.break_inline` in it; locate them via the lengths.
+        {
+            var cursor: usize = 0;
+            for (per_field_body_lens.items) |body_len| {
+                cursor += body_len;
+                const break_inst = per_field_body_insts.items[cursor - 1];
+                const break_data = self.data.items[break_inst];
+                self.extra.items[break_data.@"break".payload_index + 1] = struct_decl_idx;
+            }
+        }
+
+        // Small flags: has_fields_len (bit 2). No has_decls_len.
+        const small: u16 = 0x0004;
+        _ = try self.addInst(
+            .extended,
+            encodeExtended(@intFromEnum(Zir.Inst.Extended.struct_decl), small, struct_payload_idx),
+        );
+
+        // Declaration value body: struct_decl + break_inline (as addStructTypeDecl).
+        const struct_decl_ref = instRef(struct_decl_idx);
+        const decl_break_payload_idx: u32 = @intCast(self.extra.items.len);
+        try self.extra.append(self.gpa, @bitCast(@as(i32, std.math.maxInt(i32))));
+        try self.extra.append(self.gpa, decl_inst);
+        const decl_break_inst = try self.addInst(.break_inline, encodeBreak(struct_decl_ref, decl_break_payload_idx));
+
+        const decl_payload_idx: u32 = @intCast(self.extra.items.len);
+        try appendSrcHash(&self.extra, self.gpa, fields_hash);
+        try self.extra.append(self.gpa, 0);
+        try self.extra.append(self.gpa, 0x38000000); // pub_const_simple
+        const decl_name_idx = try self.internString(name);
+        try self.extra.append(self.gpa, decl_name_idx);
+        try self.extra.append(self.gpa, 2); // value_body_len
+        try self.extra.append(self.gpa, struct_decl_idx);
+        try self.extra.append(self.gpa, decl_break_inst);
+
+        self.data.items[decl_inst] = encodeDeclaration(0, decl_payload_idx);
+        try self.decl_indices.append(self.gpa, decl_inst);
     }
 
     /// Add a named struct type declaration to the struct.
