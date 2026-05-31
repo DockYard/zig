@@ -1561,6 +1561,11 @@ fn isSupportedTriple(
             .freestanding => true,
             else => false,
         },
+        // WebAssembly: only the WASI system interface is supported (the
+        // Zap runtime's wasm backend targets wasi preview1). wasi-libc
+        // is musl-based; `.musl` and `.none` are both accepted (Zig
+        // bundles wasi-libc, so no external toolchain is needed).
+        .wasm32 => os_tag == .wasi and (abi_tag == .musl or abi_tag == .none),
         else => false,
     };
 }
@@ -1705,7 +1710,7 @@ pub export fn zap_fork_compile_zig_to_object(
         // triple.
         if (!isSupportedTriple(arch, os_tag, abi_tag)) {
             diag.write(
-                "zap_fork: unsupported target triple {s}-{s}-{s} (v1.0 supports x86_64-linux-gnu, x86_64-macos-none, aarch64-linux-gnu, aarch64-macos-none, x86_64-windows-msvc)",
+                "zap_fork: unsupported target triple {s}-{s}-{s} (supports x86_64/aarch64 linux-gnu/musl, macos-none, windows-msvc/gnu, plus wasm32-wasi)",
                 .{ @tagName(arch), @tagName(os_tag), @tagName(abi_tag) },
             );
             return .TargetUnsupported;
