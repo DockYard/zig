@@ -2221,7 +2221,25 @@ fn compileToObjectImpl(
     // are unchanged either way — `linksection`, `zap_memory_section`,
     // and the vtable function pointers are all opaque to the libc
     // toggle).
-    const target_requires_libc = resolved_target.result.requiresLibC();
+    //
+    // Windows carve-out: `std.Target.requiresLibC` returns `false` for
+    // `.windows` because a freestanding Windows program *can* link with
+    // only kernel32/ntdll. But Zig's `std` for Windows declares its
+    // C-runtime externs (`std/c.zig`) against libc-named import libraries
+    // (`msvcrt`/`mingwex`/`mingw32` for `-gnu`, the UCRT/MSVC libs for
+    // `-msvc`). `Sema.handleExternLibName` rejects any libc-named extern
+    // when `link_libc == false`, so compiling a manager source that pulls
+    // in `std` (every backend does — `std.mem`, `std.atomic`, `std.Thread`)
+    // fails before codegen with "dependency on libc must be explicitly
+    // specified" the moment it touches a `std/c.zig` extern. The manager
+    // `.o` must also agree with the final binary's libc state, and the
+    // final Windows binary always links a C runtime (Zig bundles mingw for
+    // `-gnu`); so libc is required for the object compile on every Windows
+    // target regardless of `requiresLibC()`. This is the real capability
+    // boundary, not a workaround: a Windows manager object with
+    // `link_libc = false` is not a valid input to a Windows link.
+    const target_requires_libc = resolved_target.result.requiresLibC() or
+        resolved_target.result.os.tag == .windows;
     // LTO note: ThinLTO would let the host-binary link step inline through
     // the manager's vtable across the `.o` boundary, recovering the per-
     // allocation overhead that retain/release/allocate pay today on every
