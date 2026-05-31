@@ -2953,8 +2953,14 @@ fn createImpl(
         else => .ReleaseSafe,
     };
 
-    // For WASM targets, disable libc linking (WASI provides its own).
-    const effective_link_libc = if (resolved_result.os.tag == .wasi or resolved_result.os.tag == .freestanding)
+    // Freestanding has no libc at all, so libc linking is impossible
+    // there regardless of the request. WASI, however, ships a real
+    // libc (wasi-libc, which Zig bundles): a hosted Zap binary's runtime
+    // references libc symbols (`std.c.getenv`, the crash/exit `_exit`
+    // path, etc.), so on WASI we HONOUR the caller's `link_libc` rather
+    // than forcing it off. The manager object compiled for the same
+    // target links the same wasi-libc, so the final link agrees.
+    const effective_link_libc = if (resolved_result.os.tag == .freestanding)
         false
     else
         do_link_libc;
