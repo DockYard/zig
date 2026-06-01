@@ -157,6 +157,46 @@ pub const ResolveError = error{
     NewLinkerIncompatibleObjectFormat,
 };
 
+/// The default in-binary debug format for a target, used when the caller
+/// did not pin one explicitly and debug info is being kept (`root_strip`
+/// is false, or there are non-stripped modules). The choice is the
+/// toolchain-native debugger format for the object format and platform:
+///
+///   * ELF / Mach-O / Wasm     -> DWARF (`.dwarf = .@"32"`).
+///   * COFF on the GNU ABI      -> DWARF. This is the mingw case
+///     (`*-windows-gnu`): the GNU/Clang Windows toolchains embed DWARF
+///     `.debug_*` sections in the PE (`--target=...-windows-gnu -gdwarf`),
+///     and the runtime self-debug reader plus offline `llvm-dwarfdump` /
+///     `objdump --dwarf` resolve `file:line:function` from them. Keying
+///     the COFF default on object format alone (the historical
+///     `.coff => .code_view`) wrongly produced a CodeView-only PE for
+///     mingw — no PDB, no DWARF — so crash backtraces degraded to raw
+///     addresses.
+///   * COFF on any other ABI    -> CodeView. MSVC and the Windows Itanium
+///     C++ ABI use the CodeView/PDB toolchain, so they keep CodeView.
+///   * `.c` (C-source backend)  -> match the platform's C compiler:
+///     CodeView under Windows/UEFI, DWARF elsewhere.
+///   * SPIR-V / hex / raw / Plan9 -> no in-binary debug format (`.strip`).
+fn defaultDebugFormat(
+    ofmt: std.Target.ObjectFormat,
+    os_tag: std.Target.Os.Tag,
+    abi: std.Target.Abi,
+) DebugFormat {
+    return switch (ofmt) {
+        .elf, .macho, .wasm => .{ .dwarf = .@"32" },
+        // mingw (`*-windows-gnu`) is DWARF-in-PE; MSVC/Itanium are CodeView.
+        .coff => if (os_tag == .windows and abi.isGnu())
+            .{ .dwarf = .@"32" }
+        else
+            .code_view,
+        .c => switch (os_tag) {
+            .windows, .uefi => .code_view,
+            else => .{ .dwarf = .@"32" },
+        },
+        .spirv, .hex, .raw, .plan9 => .strip,
+    };
+}
+
 pub fn resolve(options: Options) ResolveError!Config {
     const target = &options.resolved_target.result;
 
@@ -499,15 +539,7 @@ pub fn resolve(options: Options) ResolveError!Config {
     const debug_format: DebugFormat = b: {
         if (root_strip and !options.any_non_stripped) break :b .strip;
         if (options.debug_format) |x| break :b x;
-        break :b switch (target.ofmt) {
-            .elf, .macho, .wasm => .{ .dwarf = .@"32" },
-            .coff => .code_view,
-            .c => switch (target.os.tag) {
-                .windows, .uefi => .code_view,
-                else => .{ .dwarf = .@"32" },
-            },
-            .spirv, .hex, .raw, .plan9 => .strip,
-        };
+        break :b defaultDebugFormat(target.ofmt, target.os.tag, target.abi);
     };
 
     const backend_supports_error_tracing = target_util.backendSupportsFeature(backend, .error_return_trace);
@@ -584,3 +616,43 @@ const Module = @import("../Package.zig").Module;
 const Config = @This();
 const target_util = @import("../target.zig");
 const build_options = @import("build_options");
+
+test "defaultDebugFormat: windows-gnu (mingw) is DWARF, windows-msvc is CodeView" {
+    // mingw (the `.gnu` ABI on Windows/COFF) embeds DWARF in the PE,
+    // exactly like GCC/Clang/LLD `--target=x86_64-windows-gnu -gdwarf`.
+    // The self-debug reader (`std.debug.SelfInfo` Windows path) and
+    // offline `llvm-dwarfdump`/`objdump --dwarf` then resolve
+    // `file:line:function` from those `.debug_*` sections. Picking
+    // CodeView for mingw (the historical `.coff => .code_view` default,
+    // keyed on object format alone) produced a PE with no DWARF and no
+    // PDB, so symbolization degraded to raw addresses.
+    try std.testing.expectEqual(
+        DebugFormat{ .dwarf = .@"32" },
+        defaultDebugFormat(.coff, .windows, .gnu),
+    );
+    // MSVC (and the Itanium C++ ABI on Windows) keep CodeView — the
+    // PDB/CodeView toolchain the historical default targeted.
+    try std.testing.expectEqual(
+        DebugFormat.code_view,
+        defaultDebugFormat(.coff, .windows, .msvc),
+    );
+    try std.testing.expectEqual(
+        DebugFormat.code_view,
+        defaultDebugFormat(.coff, .windows, .itanium),
+    );
+    // Non-Windows object formats are unaffected: ELF / Mach-O / Wasm
+    // stay DWARF; a bare COFF target with no OS (e.g. UEFI tooling)
+    // keeps the CodeView default.
+    try std.testing.expectEqual(
+        DebugFormat{ .dwarf = .@"32" },
+        defaultDebugFormat(.elf, .linux, .gnu),
+    );
+    try std.testing.expectEqual(
+        DebugFormat{ .dwarf = .@"32" },
+        defaultDebugFormat(.macho, .macos, .none),
+    );
+    try std.testing.expectEqual(
+        DebugFormat.code_view,
+        defaultDebugFormat(.coff, .uefi, .msvc),
+    );
+}
